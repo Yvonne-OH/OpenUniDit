@@ -1,0 +1,140 @@
+# Giga-Exp Image stage_1_2: 512p 分辨率递进训练 (承接 stage_1_1 256p), flow matching.
+# 512p activation 显存约 7x (192p), batch 4 x grad-accum 2 保持 global batch 64 不变.
+stage: stage_1_2
+output_dir: /home/jovyan/pfs/users/zhanqian.wu/exp/giga_exp_image/stage_1_2
+seed: 42
+
+distributed:
+  backend: deepspeed
+  config: configs/zero2.json
+  world_size: 8
+  timeout_seconds: 7200
+
+model:
+  in_channels: 48
+  out_channels: 48
+  text_dim: 2560                 # Qwen3-VL-4B-Instruct hidden_size
+  dim: 1792
+  ffn_dim: 4864
+  heads: 14
+  layers: 16
+  rope_theta: 10000.0
+  # 4D RoPE: (time, height, width, text_position).
+  rope_axes_dims: [16, 48, 48, 16]
+
+components:
+  text_encoder:
+    type: qwen3_vl
+    pretrained_path: /mnt/nfs/models/huggingface/Qwen/Qwen3-VL-4B-Instruct
+    tokenizer_path: /mnt/nfs/models/huggingface/Qwen/Qwen3-VL-4B-Instruct
+    local_files_only: true
+    layer: -2                     # 取倒数第二层 hidden states (对齐 gigaworld stage1 约定)
+    max_length: 512
+  wan_vae:
+    type: AutoencoderKLWan
+    pretrained_path: /mnt/nfs/models/huggingface/models--Wan-AI--Wan2.2-TI2V-5B-Diffusers
+    subfolder: vae
+    local_files_only: true
+
+scheduler:
+  type: flow_matching
+  num_train_timesteps: 1000
+  shift: 3.0
+  timestep_sampling: uniform
+  validation_shift: 3.0
+
+dataset:
+  dataset_type: lmdb_parquet
+  image_training_enabled: true
+  edit_training_enabled: false
+  database_path: /home/jovyan/pfs/users/zhanqian.wu/pfs_data/unified_images_lmdb
+  image_database_path: /home/jovyan/pfs/users/zhanqian.wu/pfs_data/unified_images_lmdb
+  lmdb_root: /home/jovyan/pfs/users/zhanqian.wu/pfs_data/unified_images_lmdb
+  image_root: /home/jovyan/pfs/users/zhanqian.wu/pfs_data/unified_images_lmdb
+  image_sources:
+    - 4KLSDB
+    - Aesthetic-4K
+    - HumanCaption-10M
+    - LAION_Aesthetics_1024
+    - Poster100K
+    - anime_captions
+    - bg_photo_concepts
+    - blip3o-long-caption-wds
+    - blip3o-long-caption
+    - caption3o-xl-v4
+    - ffhq_captioned_1024
+    - fine_t2i
+    - pexels-advertisement-photography
+    - pexels_aesth_2_1024
+    - qwen-synth-characters-fused
+    - sa1b_en
+    - anyword_3m
+    - pixelprose_cc12m
+    - pixelprose_commonpool
+    - pixelprose_redcaps
+    - monet_cc12m
+    - monet_commoncatalog_cc_by
+    - monet_coyo
+  contract: "[B,C,T,H,W]"
+  num_frames: 1
+  preprocess_style: resize_long_edge
+  resolution: 512
+  long_edge: 512
+  max_upscale_ratio: 1.2
+  max_retries: 16
+  refresh_index_cache: false   # 每个 stage 桶不同, 独立缓存于各自 output/dataset_index_cache
+  index_cache_dir: /home/jovyan/pfs/users/zhanqian.wu/exp/giga_exp_image/stage_1_2/dataset_index_cache
+  buckets:
+    - 512_square
+    - 512x384
+    - 384x512
+  bucket_sampling_weights:
+    512_square: 0.4
+    512x384: 0.3
+    384x512: 0.3
+
+validation:
+  enabled: true
+  every_n_steps: 1000
+  per_rank: true
+  use_next_batch: true
+  num_inference_steps: 20
+  seed: 42
+  guidance_scale: 3.0
+
+training:
+  enabled: true
+  t2v_only: true
+  cfg_dropout: 0.1
+  batch_size_per_device: 4
+  num_workers: 4
+  max_epochs: 10
+  mixed_precision: bf16
+  optimizer: muon+adam
+  muon:
+    enabled: true
+    momentum: 0.95
+  adam:
+    enabled: true
+    betas: [0.9, 0.95]
+    epsilon: 1.0e-8
+  learning_rate: 1.0e-4
+  weight_decay: 0.0
+  lr_scheduler: cosine
+  lr_warmup_steps: 200
+  gradient_accumulation_steps: 2
+  checkpointing_steps: 1000
+  state_checkpoints_keep: 2      # DeepSpeed 完整 state 只保留最近 2 个, 纯 weights 快照全部保留
+  # auto: 自动恢复 output_dir 下最新 state/weights；none: 不恢复；也可填 .safetensors/.pt 文件或 weights 目录路径，强制从指定纯权重恢复。
+  resume_mode: auto
+  resume_optimizer: true
+  resume_lr_scheduler: true
+
+logging:
+  report_to: [console, wandb]
+  log_every_n_steps: 1
+  save_samples: true
+  wandb:
+    enabled: true
+    project: giga-exp-image
+    name: giga_exp_image_stage_1_2

@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+outputs/*
+!outputs/.gitkeep
+.venv/
+# 本地第三方依赖 (FA3 1.6G / diffusers fork)，不入库
+thirdparty/
+diffusers/
+wandb/
