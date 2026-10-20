@@ -40,14 +40,14 @@ def test_partitioned_muon_cpu():
     matrix = [nn.Parameter(torch.randn(5, 7)), nn.Parameter(torch.randn(3, 4))]
     reference = [nn.Parameter(p.detach().clone()) for p in matrix]
     optimizer = build_optimizer(nn.ParameterList(matrix), {"learning_rate": 1e-3, "muon": {"enabled": True}})
-    original = torch.optim.Muon(reference, lr=1e-3)
+    original = torch.optim.Muon(reference, lr=1e-3, weight_decay=0.0, adjust_lr_fn="match_rms_adamw")
     size = sum(p.numel() for p in matrix)
     shard_size = (size + world - 1) // world
     shard = nn.Parameter(torch.cat([p.detach().flatten() for p in matrix]).new_zeros(shard_size * world)[rank * shard_size:(rank + 1) * shard_size].clone())
     full = torch.cat([p.detach().flatten() for p in matrix])
     shard.data[:min(shard_size, size - rank * shard_size)].copy_(full[rank * shard_size:(rank + 1) * shard_size])
     optimizer.muon.param_groups[0]["params"] = [shard]
-    for i in range(3):
+    for _ in range(3):
         gradients = [torch.randn_like(p) for p in matrix]
         for p, grad in zip(reference, gradients):
             p.grad = grad.clone()

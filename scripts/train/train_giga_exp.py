@@ -42,16 +42,36 @@ def collate(batch):
     return result
 
 
+def parse_muon_lr(value, base_lr):
+    """muon.learning_rate 支持 '3x' 系数 (相对 AdamW base lr) 或绝对数值。"""
+    if isinstance(value, str):
+        s = value.strip().lower()
+        if s.endswith("x"):
+            return base_lr * float(s[:-1])
+        return float(s)
+    return float(value)
+
+
 class MuonAdamW(torch.optim.Optimizer):
-    """单优化器封装：2D 参数用 Muon，其余用 AdamW。"""
+    """单优化器封装：hidden 2D 矩阵用 Muon (match_rms_adamw), 输出头/1D 参数用 AdamW。
+
+    - Muon 只作用于 hidden Linear 权重; out 头/bias/norm 按 torch 官方建议走 AdamW
+    - match_rms_adamw 下 update RMS ≈ 0.2*lr, 实测需 3~5x AdamW lr (muon learning_rate 单独设置)
+    - 每个 group 记录 _lr_scale, set_lr 按 base lr × scale 写入, warmup/cosine 对两类参数同步生效
+    """
 
     def __init__(self, matrix_params, non_matrix_params, muon_cfg, adam_cfg, lr):
         self.muon = self.adam = None
         self.matrix_shapes = [tuple(p.shape) for p in matrix_params]
+        muon_lr = parse_muon_lr(muon_cfg.get("learning_rate", lr), lr)
         if matrix_params and muon_cfg.get("enabled", True) and hasattr(torch.optim, "Muon"):
             if any(p.ndim != 2 for p in matrix_params):
                 raise ValueError("Muon 只支持 2D 参数")
-            self.muon = torch.optim.Muon(matrix_params, lr=lr, momentum=float(muon_cfg.get("momentum", 0.95)))
+            self.muon = torch.optim.Muon(
+                matrix_params, lr=muon_lr,
+                momentum=float(muon_cfg.get("momentum", 0.95)),
+                weight_decay=float(muon_cfg.get("weight_decay", 0.0)),
+                adjust_lr_fn=muon_cfg.get("adjust_lr_fn", "match_rms_adamw"))
         elif matrix_params and muon_cfg.get("enabled", True):
             print("⚠️  torch.optim.Muon 不可用, matrix 参数回退 AdamW", flush=True)
         if self.muon is None and matrix_params:
@@ -65,6 +85,8 @@ class MuonAdamW(torch.optim.Optimizer):
                 betas=tuple(adam_cfg.get("betas", [0.9, 0.95])), eps=float(adam_cfg.get("epsilon", 1e-8)),
                 weight_decay=float(adam_cfg.get("weight_decay", 0.0)))
         groups = (self.muon.param_groups if self.muon else []) + (self.adam.param_groups if self.adam else [])
+        for group in groups:
+            group["_lr_scale"] = group["lr"] / lr  # muon group 可能是独立 lr, 记录相对 base lr 的比例
         params = [p for g in groups for p in g["params"]]
         super().__init__(params, {})
         self.param_groups = groups
@@ -141,16 +163,19 @@ class MuonAdamW(torch.optim.Optimizer):
 
 
 def build_optimizer(model, cfg):
+    """hidden 2D 矩阵 → Muon; 输出头 (out.*) 与 1D 参数 → AdamW。"""
     matrix, rest = [], []
-    for parameter in model.parameters():
-        if parameter.requires_grad:
-            (matrix if parameter.ndim == 2 else rest).append(parameter)
+    for name, parameter in model.named_parameters():
+        if not parameter.requires_grad:
+            continue
+        head = name.startswith("out.")
+        (rest if head or parameter.ndim != 2 else matrix).append(parameter)
     lr = float(cfg.get("learning_rate", 1e-4))
     return MuonAdamW(matrix, rest, cfg.get("muon", {}), cfg, lr)
 
 
 def set_lr(optimizer, engine_optimizer, step, training_cfg):
-    """Warmup + cosine; 同时写入 wrapper 与 DeepSpeed ZeroOptimizer 的 param_groups."""
+    """Warmup + cosine; 同时写入 wrapper 与 DeepSpeed ZeroOptimizer 的 param_groups, 按 group 的 _lr_scale 缩放."""
     import math
     base = float(training_cfg.get("learning_rate", 1e-4))
     warmup = int(training_cfg.get("lr_warmup_steps", 0))
@@ -161,9 +186,9 @@ def set_lr(optimizer, engine_optimizer, step, training_cfg):
         progress = min(1.0, (step - warmup) / max(1, total - warmup))
         lr = base * 0.5 * (1 + math.cos(math.pi * progress))
     for group in optimizer.param_groups:
-        group["lr"] = lr
+        group["lr"] = lr * float(group.get("_lr_scale", 1.0))
     for group in engine_optimizer.param_groups:
-        group["lr"] = lr
+        group["lr"] = lr * float(group.get("_lr_scale", 1.0))
     return lr
 
 
@@ -256,7 +281,7 @@ def load_pure_weights(engine, output_dir, checkpoint_path=None):
         if not candidates:
             return 0
         target = max(candidates, key=lambda path: int(path.name.split("-")[1].split(".")[0]))
-    step_match = re.search(r"step-(\\d+)", target.name)
+    step_match = re.search(r"step-(\d+)", target.name)
     step = int(step_match.group(1)) if step_match else 0
     if target.suffix == ".safetensors":
         from safetensors.torch import load_file
@@ -511,14 +536,19 @@ def main():
     max_epochs = int(cfg["training"]["max_epochs"])
     if max_epochs <= 0:
         raise ValueError("max_epochs 必须为正整数")
-    max_steps = steps_per_epoch * max_epochs
+    grad_accum = int(cfg["training"].get("gradient_accumulation_steps", 1))
+    if grad_accum <= 0:
+        raise ValueError("gradient_accumulation_steps 必须为正整数")
+    total_micro_steps = steps_per_epoch * max_epochs
+    max_steps = (total_micro_steps + grad_accum - 1) // grad_accum
     cfg["training"]["total_steps"] = max_steps
     if step > max_steps:
         raise ValueError(f"恢复 step={step} 超过 {max_epochs} epoch 的总步数 {max_steps}")
-    epoch, batch_offset = divmod(step, steps_per_epoch)
+    consumed_micro_steps = min(step * grad_accum, total_micro_steps)
+    epoch, batch_offset = divmod(consumed_micro_steps, steps_per_epoch)
     batch_sampler.set_start_batch(batch_offset, epoch=epoch)
     if rank == 0:
-        logger.info("📅 max_epochs=%d steps_per_epoch=%d total_steps=%d; 从 epoch=%d batch=%d step=%d 继续", max_epochs, steps_per_epoch, max_steps, epoch, batch_offset, step)
+        logger.info("📅 max_epochs=%d steps_per_epoch=%d total_steps=%d grad_accum=%d; 从 epoch=%d batch=%d step=%d 继续", max_epochs, steps_per_epoch, max_steps, grad_accum, epoch, batch_offset, step)
     loader = torch.utils.data.DataLoader(data, batch_sampler=batch_sampler, num_workers=cfg["training"].get("num_workers", 4), collate_fn=collate)
     iterator = iter(loader)
 
@@ -538,56 +568,71 @@ def main():
     progress = tqdm(total=max_steps, initial=step, disable=rank != 0, dynamic_ncols=True, desc="🚂 stage_1")
     while step < max_steps:
         step += 1
-        try:
-            batch = pending_batch if pending_batch is not None else next(iterator)
-        except StopIteration:
-            batch_sampler.set_epoch(batch_sampler.epoch + 1)
-            iterator = iter(loader)
-            batch = next(iterator)
-        pending_batch = None
-        pixels = batch["pixel_values"].to(device)
-        captions = batch["captions"]
-        with torch.no_grad():
-            # Wan 官方约定: encode 后标准化 z_norm = (z - mean) * latents_std_inv
-            latents = (vae.encode(pixels.float()).latent_dist.sample() - latents_mean) * latents_std_inv
-            prompts = [str(c).strip() or tokenizer.eos_token for c in captions]
-            cfg_dropout = float(cfg["training"].get("cfg_dropout", 0.0))
-            if cfg_dropout > 0:
-                drop = torch.rand(len(prompts), device=device) < cfg_dropout
-                empty_prompt = tokenizer.eos_token or " "  # Qwen3-VL tokenizer 对空串产出 0 长度序列, 会导致 attention reshape 崩溃
-                prompts = [empty_prompt if drop[i].item() else prompt for i, prompt in enumerate(prompts)]
-            inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=tc.get("max_length", 512)).to(device)
-            text, mask = encode_text(text_encoder, inputs, tc.get("layer")), inputs.attention_mask.bool()
-        sigma = torch.rand(latents.shape[0], device=device)
-        sigma = sigma * cfg["scheduler"]["shift"] / (1 + (cfg["scheduler"]["shift"] - 1) * sigma)
-        noise = torch.randn_like(latents)
-        xt = (1 - sigma[:, None, None, None, None]) * latents + sigma[:, None, None, None, None] * noise
-        lr_now = set_lr(client_optimizer, ds_optimizer, step, cfg["training"])
-        pred = engine(xt.to(dtype), sigma * 1000, text, mask)
-        diff_sq = (pred.float() - (noise - latents).float()).square()
-        loss = diff_sq.mean()
-        per_sample_loss = diff_sq.flatten(1).mean(1)  # [B] 每样本 loss, 用于 sigma 分桶
-        engine.backward(loss)
+        micro_losses = []
+        micro_sigmas = []
+        micro_bucket_sums = torch.zeros(SIGMA_BUCKETS, device=device)
+        micro_bucket_counts = torch.zeros(SIGMA_BUCKETS, device=device)
+        last_captions = None
+        for micro_idx in range(grad_accum):
+            try:
+                batch = pending_batch if pending_batch is not None else next(iterator)
+            except StopIteration:
+                batch_sampler.set_epoch(batch_sampler.epoch + 1)
+                iterator = iter(loader)
+                batch = next(iterator)
+            pending_batch = None
+            pixels = batch["pixel_values"].to(device)
+            captions = batch["captions"]
+            last_captions = captions
+            with torch.no_grad():
+                # Wan 官方约定: encode 后标准化 z_norm = (z - mean) * latents_std_inv
+                latents = (vae.encode(pixels.float()).latent_dist.sample() - latents_mean) * latents_std_inv
+                prompts = [str(c).strip() or tokenizer.eos_token for c in captions]
+                cfg_dropout = float(cfg["training"].get("cfg_dropout", 0.0))
+                if cfg_dropout > 0:
+                    drop = torch.rand(len(prompts), device=device) < cfg_dropout
+                    empty_prompt = tokenizer.eos_token or " "
+                    prompts = [empty_prompt if drop[i].item() else prompt for i, prompt in enumerate(prompts)]
+                inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=tc.get("max_length", 512)).to(device)
+                text, mask = encode_text(text_encoder, inputs, tc.get("layer")), inputs.attention_mask.bool()
+            sigma = torch.rand(latents.shape[0], device=device)
+            sigma = sigma * cfg["scheduler"]["shift"] / (1 + (cfg["scheduler"]["shift"] - 1) * sigma)
+            noise = torch.randn_like(latents)
+            xt = (1 - sigma[:, None, None, None, None]) * latents + sigma[:, None, None, None, None] * noise
+            lr_now = set_lr(client_optimizer, ds_optimizer, step, cfg["training"])
+            pred = engine(xt.to(dtype), sigma * 1000, text, mask)
+            diff_sq = (pred.float() - (noise - latents).float()).square()
+            # DeepSpeed 会在 gradient_accumulation_steps > 1 时自动缩放 backward loss；这里不要再次除以 grad_accum。
+            loss = diff_sq.mean()
+            per_sample_loss = diff_sq.flatten(1).mean(1)
+            engine.backward(loss)
+            micro_losses.append(diff_sq.mean().detach())
+            micro_sigmas.append(sigma.detach().sum())
+            bins = (sigma.detach() * SIGMA_BUCKETS).long().clamp_(0, SIGMA_BUCKETS - 1)
+            micro_bucket_sums.scatter_add_(0, bins, per_sample_loss.detach().float())
+            micro_bucket_counts += torch.bincount(bins, minlength=SIGMA_BUCKETS).float()
         engine.step()
+        loss_value = torch.stack(micro_losses).mean().item()
+        sigma_mean = torch.stack(micro_sigmas).sum().item() / (grad_accum * latents.shape[0])
         if rank == 0:
             progress.update(1)
-            progress.set_postfix(loss=f"{loss.item():.5f}", lr=f"{lr_now:.2e}", samples=step * cfg['training']['batch_size_per_device'] * dist.get_world_size())
+            progress.set_postfix(loss=f"{loss_value:.5f}", lr=f"{lr_now:.2e}", samples=step * grad_accum * cfg['training']['batch_size_per_device'] * dist.get_world_size())
         if step % log_every == 0:
-            data_hash = hashlib.md5("\x1f".join(captions).encode("utf-8")).hexdigest()[:8]  # 本 rank batch 数据指纹
-            logger.info("rank=%d step=%d loss=%.6f data=%s lr=%.3e time=%s sigma_mean=%.5f", rank, step, loss.item(), data_hash, lr_now, time.strftime("%H:%M:%S"), sigma.mean().item())
-            bucket_sums, bucket_counts = sigma_bucket_loss_stats(sigma, per_sample_loss)
-            if rank == 0:
-                if wandb_run:
-                    payload = {"train/loss": loss.item(), "train/lr": lr_now, "train/sigma_mean": sigma.mean().item(), "train/samples": step * cfg['training']['batch_size_per_device'] * dist.get_world_size()}
-                    for i in range(SIGMA_BUCKETS):
-                        if bucket_counts[i] <= 0:
-                            continue  # 本步该桶无样本, 不上报 (wandb 自动断点显示)
-                        bucket_loss = (bucket_sums[i] / bucket_counts[i]).item()
-                        if math.isfinite(bucket_loss):  # NaN/Inf 不污染 EMA
-                            prev = sigma_bucket_ema[i]
-                            sigma_bucket_ema[i] = bucket_loss if not math.isfinite(prev) else 0.9 * prev + 0.1 * bucket_loss
-                        payload[f"train/loss_sigma_{i / 10:.1f}-{(i + 1) / 10:.1f}"] = sigma_bucket_ema[i]
-                    wandb.log(payload, step=step)
+            stats = torch.stack([micro_bucket_sums, micro_bucket_counts])
+            dist.all_reduce(stats)
+            data_hash = hashlib.md5("\x1f".join(last_captions).encode("utf-8")).hexdigest()[:8]
+            logger.info("rank=%d step=%d loss=%.6f data=%s lr=%.3e time=%s sigma_mean=%.5f", rank, step, loss_value, data_hash, lr_now, time.strftime("%H:%M:%S"), sigma_mean)
+            if rank == 0 and wandb_run:
+                payload = {"train/loss": loss_value, "train/lr": lr_now, "train/sigma_mean": sigma_mean, "train/samples": step * grad_accum * cfg['training']['batch_size_per_device'] * dist.get_world_size()}
+                for i in range(SIGMA_BUCKETS):
+                    if stats[1, i] <= 0:
+                        continue
+                    bucket_loss = (stats[0, i] / stats[1, i]).item()
+                    if math.isfinite(bucket_loss):
+                        prev = sigma_bucket_ema[i]
+                        sigma_bucket_ema[i] = bucket_loss if not math.isfinite(prev) else 0.9 * prev + 0.1 * bucket_loss
+                    payload[f"train/loss_sigma_{i / 10:.1f}-{(i + 1) / 10:.1f}"] = sigma_bucket_ema[i]
+                wandb.log(payload, step=step)
         if cfg["validation"].get("enabled", True) and step % int(cfg["validation"].get("every_n_steps", 1000)) == 0:
             try:
                 pending_batch = next(iterator)

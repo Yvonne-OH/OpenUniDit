@@ -120,6 +120,11 @@ training:
   muon:
     enabled: true
     momentum: 0.95
+    # Muon 只作用于 hidden 2D 矩阵 (out 头/bias/norm 走 AdamW); match_rms_adamw 下 update RMS ≈ 0.2*lr,
+    # 实测同 lr 收敛偏慢, 设为 AdamW base lr 的 3 倍系数 ("3x", 也支持绝对值如 3.0e-4); 扫描 5.4e-4 更快但保守取 3x.
+    learning_rate: 3x
+    adjust_lr_fn: match_rms_adamw
+    weight_decay: 0.0
   adam:
     enabled: true
     betas: [0.9, 0.95]

@@ -114,6 +114,11 @@ training:
   muon:
     enabled: true
     momentum: 0.95
+    # Muon 只作用于 hidden 2D 矩阵 (out 头/bias/norm 走 AdamW); match_rms_adamw 下 update RMS ≈ 0.2*lr,
+    # 实测同 lr 收敛偏慢, 设为 AdamW base lr 的 3 倍系数 ("3x", 也支持绝对值如 3.0e-4); 扫描 5.4e-4 更快但保守取 3x.
+    learning_rate: 3x
+    adjust_lr_fn: match_rms_adamw
+    weight_decay: 0.0
   adam:
     enabled: true
     betas: [0.9, 0.95]
@@ -122,7 +127,7 @@ training:
   weight_decay: 0.0
   lr_scheduler: cosine
   lr_warmup_steps: 200
-  gradient_accumulation_steps: 2
+  gradient_accumulation_steps: 1
   checkpointing_steps: 1000
   state_checkpoints_keep: 2      # DeepSpeed 完整 state 只保留最近 2 个, 纯 weights 快照全部保留
   # auto: 自动恢复 output_dir 下最新 state/weights；none: 不恢复；也可填 .safetensors/.pt 文件或 weights 目录路径，强制从指定纯权重恢复。
