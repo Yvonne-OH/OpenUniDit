@@ -137,7 +137,8 @@ class MuonAdamW(torch.optim.Optimizer):
     def step(self, closure=None):
         loss = None
         if self.muon is not None:
-            if self.muon.param_groups[0]["params"][0].ndim == 1:
+            muon_param = self.muon.param_groups[0]["params"][0]
+            if muon_param.ndim == 1:
                 self._step_partitioned_muon()
             else:
                 loss = self.muon.step(closure)
@@ -259,6 +260,18 @@ def load_compatible_state_dict(model, state):
     current = model.state_dict()
     matched = {key: value for key, value in state.items()
                if key in current and current[key].shape == value.shape}
+    patch_volume = math.prod(model.patch_size)
+    if patch_volume > 1:
+        for key in ("patch_in.weight", "out.weight", "out.bias"):
+            if key not in state or key not in current or key in matched:
+                continue
+            value = state[key]
+            if key == "patch_in.weight" and value.ndim == 2 and current[key].shape == (value.shape[0], value.shape[1] * patch_volume):
+                matched[key] = value.repeat(1, patch_volume) / patch_volume
+            elif key == "out.weight" and value.ndim == 2 and current[key].shape == (value.shape[0] * patch_volume, value.shape[1]):
+                matched[key] = value.repeat(patch_volume, 1)
+            elif key == "out.bias" and value.ndim == 1 and current[key].shape == (value.shape[0] * patch_volume,):
+                matched[key] = value.repeat(patch_volume)
     result = model.load_state_dict(matched, strict=False)
     ignored = len(state) - len(matched)
     return len(matched), len(result.missing_keys), ignored
@@ -356,7 +369,8 @@ def sigma_bucket_loss_stats(sigma, per_sample_loss):
 
 @torch.no_grad()
 def run_next_batch_validation(engine, vae, tokenizer, text_encoder, device, dtype, batch, step, rank, cfg, output_dir, logger, wandb_run):
-    """每卡对 next batch 做真实推理: flow ODE 采样 → VAE 解码 → 保存 INPUT|GEN 对比图."""
+    """每卡对 next batch 做真实推理: flow ODE 采样 → VAE 解码 → 黑底黄字 prompt 对比图 + JSON 信息."""
+    import textwrap
     from PIL import Image, ImageDraw
     tc, val_cfg = cfg["components"]["text_encoder"], cfg["validation"]
     pixels = batch["pixel_values"].to(device)  # [B,C,T=1,H,W] in [-1,1]
@@ -398,17 +412,23 @@ def run_next_batch_validation(engine, vae, tokenizer, text_encoder, device, dtyp
         return ((frame + 1) * 127.5).round().astype("uint8")
 
     label_h, gap = 20, 8
+    black, yellow = (0, 0, 0), (255, 255, 0)
     rows = []
     for i in range(min(b, 8)):
         src, out = to_uint8(pixels[i]), to_uint8(gen[i])
-        row = Image.new("RGB", (src.shape[1] * 2 + gap, src.shape[0] + label_h), (245, 245, 245))
-        row.paste(Image.fromarray(src), (0, label_h))
-        row.paste(Image.fromarray(out), (src.shape[1] + gap, label_h))
+        lines = textwrap.wrap(prompts[i], width=60) or [""]  # 黑底顶部用黄色写 prompt, 自动换行
+        prompt_h = 14 * len(lines) + 8
+        row = Image.new("RGB", (src.shape[1] * 2 + gap, prompt_h + label_h + src.shape[0]), black)
         draw = ImageDraw.Draw(row)
-        draw.text((4, 3), "INPUT", fill=(180, 0, 0))
-        draw.text((src.shape[1] + gap + 4, 3), "GEN", fill=(0, 0, 180))
+        for li, line in enumerate(lines):
+            draw.text((4, 4 + li * 14), line, fill=yellow)
+        top = prompt_h
+        draw.text((4, top + 3), "INPUT", fill=(180, 0, 0))
+        draw.text((src.shape[1] + gap + 4, top + 3), "GEN", fill=(0, 0, 180))
+        row.paste(Image.fromarray(src), (0, top + label_h))
+        row.paste(Image.fromarray(out), (src.shape[1] + gap, top + label_h))
         rows.append(row)
-    grid = Image.new("RGB", (rows[0].width, sum(r.height + 4 for r in rows) - 4), (245, 245, 245))
+    grid = Image.new("RGB", (rows[0].width, sum(r.height + 4 for r in rows) - 4), black)
     y = 0
     for r in rows:
         grid.paste(r, (0, y))
@@ -416,6 +436,20 @@ def run_next_batch_validation(engine, vae, tokenizer, text_encoder, device, dtyp
     val_dir = output_dir / "validation" / f"step-{step:08d}"
     val_dir.mkdir(parents=True, exist_ok=True)
     grid.save(val_dir / f"rank{rank}.png")
+    info = {  # 验证信息落盘 JSON, 便于追溯每个样本的生成条件
+        "step": step,
+        "rank": rank,
+        "seed": int(val_cfg.get("seed", 42)) + step * 1000 + rank,
+        "num_inference_steps": num_steps,
+        "guidance_scale": float(val_cfg.get("guidance_scale", 3.0)),
+        "validation_shift": cfg["scheduler"].get("validation_shift"),
+        "pixel_size": [h, w],
+        "latent_size": [h // compress, w // compress],
+        "negative_prompt": tokenizer.eos_token,
+        "prompts": prompts,
+        "grid_image": f"rank{rank}.png",
+    }
+    (val_dir / f"rank{rank}.json").write_text(json.dumps(info, ensure_ascii=False, indent=2))
     logger.info("🖼️ step=%d rank=%d next-batch 推理完成: %d samples → %s", step, rank, b, val_dir / f"rank{rank}.png")
     if wandb_run and rank == 0:
         wandb.log({"val/grid": wandb.Image(grid)}, step=step)

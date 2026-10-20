@@ -105,22 +105,31 @@ class GigaExpTransformer(nn.Module):
     """~0.8B dense DiT: 1792 width, 16 blocks, 14 heads, temporal RoPE retained."""
     def __init__(self, in_channels=48, out_channels=48, text_dim=4096, dim=1792,
                  ffn_dim=4864, heads=14, layers=24, rope_theta=10000.0,
-                 rope_axes_dims=(32, 32, 32, 32)):
+                 rope_axes_dims=(32, 32, 32, 32), patch_size=(1, 1, 1)):
         super().__init__()
+        self.patch_size = tuple(patch_size)
+        if len(self.patch_size) != 3 or self.patch_size[0] != 1 or any(p < 1 for p in self.patch_size):
+            raise ValueError("patch_size 必须是时间维为 1 的三个正整数")
         self.in_channels, self.out_channels, self.dim, self.heads = in_channels, out_channels, dim, heads
-        self.patch_in = nn.Linear(in_channels, dim)
+        patch_volume = math.prod(self.patch_size)
+        self.patch_in = nn.Linear(in_channels * patch_volume, dim)
         self.text_in = nn.Linear(text_dim, dim)
         self.time_in = nn.Sequential(nn.Linear(256, dim), nn.SiLU(), nn.Linear(dim, dim))
         self.rope = SpacetimeRoPE(dim // heads, rope_theta, rope_axes_dims)
         self.blocks = nn.ModuleList([GigaBlock(dim, heads, ffn_dim) for _ in range(layers)])
         self.norm = RMSNorm(dim)
-        self.out = nn.Linear(dim, out_channels)
+        self.out = nn.Linear(dim, out_channels * patch_volume)
 
     def forward(self, x, timestep, text, text_mask=None):
         if x.ndim != 5:
             raise ValueError("x must be [B,C,T,H,W]")
         b, _, t, h, w = x.shape
-        image = self.patch_in(x.permute(0, 2, 3, 4, 1).reshape(b, t * h * w, -1))
+        pt, ph, pw = self.patch_size
+        if t % pt or h % ph or w % pw:
+            raise ValueError(f"latent 大小 {(t, h, w)} 必须能被 patch_size {self.patch_size} 整除")
+        t, h, w = t // pt, h // ph, w // pw
+        image = x.reshape(b, self.in_channels, t, pt, h, ph, w, pw)
+        image = self.patch_in(image.permute(0, 2, 4, 6, 3, 5, 7, 1).reshape(b, t * h * w, -1))
         text = self.text_in(text)
         attention_mask = None
         if text_mask is not None and not text_mask.bool().all().item():
@@ -137,4 +146,5 @@ class GigaExpTransformer(nn.Module):
         for block in self.blocks:
             x = block(x, cond, cos, sin, attention_mask)
         image = self.out(self.norm(x[:, :t * h * w]))
-        return image.reshape(b, t, h, w, self.out_channels).permute(0, 4, 1, 2, 3).contiguous()
+        image = image.reshape(b, t, h, w, pt, ph, pw, self.out_channels)
+        return image.permute(0, 7, 1, 4, 2, 5, 3, 6).reshape(b, self.out_channels, t * pt, h * ph, w * pw)

@@ -15,12 +15,13 @@ from scripts.train.train_giga_exp import build_optimizer
 class TinyModel(nn.Module):
     def __init__(self):
         super().__init__()
-        self.linear = nn.Linear(8, 8)
-        self.extra = nn.Linear(8, 8)
+        self.linear = nn.Linear(8, 7)
+        self.extra = nn.Linear(7, 5)
+        self.out = nn.Linear(5, 8)
         self.bias = nn.Parameter(torch.zeros(8))
 
     def forward(self, x):
-        return (self.extra(self.linear(x)) + self.bias).square().mean()
+        return (self.out(self.extra(self.linear(x))) + self.bias).square().mean()
 
 
 def make_engine(config):
@@ -75,6 +76,84 @@ def test_partitioned_muon_cpu():
     dist.destroy_process_group()
 
 
+def test_zero2_against_official(engine, steps=3):
+    """使用真实 ZeRO-2 的 FP32 分片梯度，对照未分片官方优化器。"""
+    zero = engine.optimizer
+    wrapper = zero.optimizer
+    groups = zero.bit16_groups
+    world = dist.get_world_size()
+    assert world == 2 and len(groups) == len(wrapper.param_groups) == 2
+    assert len(wrapper.muon.param_groups[0]["params"]) == 1
+    assert wrapper.muon.param_groups[0]["params"][0].ndim == 1
+    assert len(wrapper.adam.param_groups[0]["params"]) == 1
+    assert not zero.round_robin_gradients
+    assert [tuple(p.shape) for p in groups[0]] == wrapper.matrix_shapes
+
+    ref_groups = [[nn.Parameter(p.detach().float().clone()) for p in group] for group in groups]
+    muon_group, adam_group = wrapper.muon.param_groups[0], wrapper.adam.param_groups[0]
+    reference = [
+        torch.optim.Muon(ref_groups[0], lr=muon_group["lr"], momentum=muon_group["momentum"],
+                         nesterov=muon_group["nesterov"], weight_decay=muon_group["weight_decay"],
+                         ns_coefficients=muon_group["ns_coefficients"], ns_steps=muon_group["ns_steps"],
+                         eps=muon_group["eps"], adjust_lr_fn=muon_group["adjust_lr_fn"]),
+        torch.optim.AdamW(ref_groups[1], lr=adam_group["lr"], betas=adam_group["betas"],
+                          eps=adam_group["eps"], weight_decay=adam_group["weight_decay"]),
+    ]
+    calls = []
+    original_step = wrapper.step
+
+    def compare(step):
+        for i, group in enumerate(groups):
+            shard = zero.single_partition_of_fp32_groups[i]
+            pieces = [torch.empty_like(shard) for _ in range(world)]
+            dist.all_gather(pieces, shard.detach())
+            actual = torch.cat(pieces)
+            length = sum(p.numel() for p in group)
+            assert actual.numel() >= length
+            actual = actual[:length]
+            expected = torch.cat([p.detach().flatten() for p in ref_groups[i]])
+            diff = (actual - expected).abs().max().item()
+            print(f"rank={dist.get_rank()} step={step} group={i} FP32 max_abs_diff={diff:.3e}", flush=True)
+            torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6,
+                                       msg=lambda msg: f"step={step} group={i}: {msg}")
+            for model_param, fp32_param in zip(group, ref_groups[i]):
+                torch.testing.assert_close(model_param.detach(), fp32_param.detach().to(model_param.dtype),
+                                           rtol=0, atol=0)
+
+    def reference_step(closure=None):
+        active_param = wrapper.param_groups[0]["params"][0]
+        group_index = next(i for i, param in enumerate(zero.single_partition_of_fp32_groups)
+                           if active_param is param)
+        shard = zero.single_partition_of_fp32_groups[group_index]
+        assert shard.grad is not None and shard.ndim == 1
+        pieces = [torch.empty_like(shard.grad) for _ in range(world)]
+        dist.all_gather(pieces, shard.grad.contiguous())
+        gradient = torch.cat(pieces)
+        offset = 0
+        for param in ref_groups[group_index]:
+            param.grad = gradient.narrow(0, offset, param.numel()).view_as(param).clone()
+            offset += param.numel()
+        assert gradient.numel() >= offset
+        reference[group_index].step()
+        calls.append(group_index)
+        return original_step(closure)
+
+    wrapper.step = reference_step
+    try:
+        compare(0)
+        for step in range(1, steps + 1):
+            calls.clear()
+            x = torch.arange(16, device="cuda", dtype=torch.bfloat16).view(2, 8) / 16
+            engine.backward(engine(x))
+            engine.step()
+            assert calls == [0, 1], f"第 {step} 步优化器调用顺序异常: {calls}"
+            compare(step)
+    finally:
+        wrapper.step = original_step
+    if dist.get_rank() == 0:
+        print(f"真实 ZeRO-2 与未分片官方 Muon/AdamW 连续 {steps} 步数值等价", flush=True)
+
+
 def main():
     if os.environ.get("GIGA_CPU_TEST") == "1":
         test_partitioned_muon_cpu()
@@ -85,6 +164,7 @@ def main():
     config = json.loads((Path(__file__).resolve().parents[2] / "configs/zero2.json").read_text())
     config.update(train_batch_size=dist.get_world_size() * 2, train_micro_batch_size_per_gpu=2, gradient_accumulation_steps=1)
     engine = make_engine(config)
+    test_zero2_against_official(engine)
     path = Path(os.environ["GIGA_TEST_CKPT_DIR"])
     for step in range(2):
         x = torch.arange(16, device="cuda", dtype=torch.bfloat16).view(2, 8) / 16

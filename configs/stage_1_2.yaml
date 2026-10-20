@@ -21,6 +21,7 @@ model:
   rope_theta: 10000.0
   # 4D RoPE: (time, height, width, text_position).
   rope_axes_dims: [16, 48, 48, 16]
+  patch_size: [1, 2, 2]
 
 components:
   text_encoder:
