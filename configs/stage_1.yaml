@@ -117,7 +117,7 @@ training:
   cfg_dropout: 0.1
   batch_size_per_device: 2
   num_workers: 4
-  max_epochs: 1
+  max_epochs: 5
   mixed_precision: bf16
   optimizer: muon+adam
   muon:
@@ -132,12 +132,12 @@ training:
     enabled: true
     betas: [0.9, 0.95]
     epsilon: 1.0e-8
-  learning_rate: 1.0e-4
+  learning_rate: 8.0e-5
   weight_decay: 0.0
   lr_scheduler: cosine
   lr_warmup_steps: 200
   gradient_accumulation_steps: 1
-  checkpointing_steps: 3000
+  checkpointing_steps: 5000
   state_checkpoints_keep: 2      # DeepSpeed 完整 state 只保留最近 2 个, 纯 weights 快照全部保留
   # auto: 自动恢复 output_dir 下最新 state/weights；none: 不恢复；也可填 .safetensors/.pt 文件或 weights 目录路径，强制从指定纯权重恢复。
   resume_mode: auto
