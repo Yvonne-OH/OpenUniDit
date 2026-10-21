@@ -401,12 +401,13 @@ class ImageDatabaseDataset(Dataset):
         self._check_deadline(deadline, 'fromarray', context)
         return image
 
-    def _load_item(self, index, deadline=None, context=""):
+    def _load_item(self, index, deadline=None, context="", bucket_override=None):
         record = dict(self.records[index])
         context = f'{context} uri={record["image_path"]}'
         from data.datasets.video_decode import decode_isolated
         import numpy as np
-        bucket = record.get("bucket") or self._nearest_bucket(record.get("width"), record.get("height"))
+        # bucket_override: 高分桶借图时按目标低分桶分辨率加载 (纯降采样)
+        bucket = bucket_override or record.get("bucket") or self._nearest_bucket(record.get("width"), record.get("height"))
         width, height = parse_bucket(bucket)
 
         def source_path(path, kind):
@@ -444,6 +445,10 @@ class ImageDatabaseDataset(Dataset):
             DecodeBudget, MediaCandidatesExhausted, candidate_indices, is_resource_error,
         )
 
+        # BucketBatchSampler 高分桶借图时传入 (index, target_bucket): 按低分桶分辨率降采样加载
+        bucket_override = None
+        if isinstance(index, tuple):
+            index, bucket_override = index
         index = int(index)
         timeout = float(os.environ.get('YISU_IMAGE_TIMEOUT_SECONDS', '30'))
         if not math.isfinite(timeout) or timeout <= 0:
@@ -454,7 +459,7 @@ class ImageDatabaseDataset(Dataset):
                    f'worker={worker.id if worker else "main"} worker_pid={os.getpid()} '
                    f'index={index} request_timeout={timeout:g}s')
         record = self.records[index]
-        bucket = record.get("bucket") or self._nearest_bucket(record.get("width"), record.get("height"))
+        bucket = bucket_override or record.get("bucket") or self._nearest_bucket(record.get("width"), record.get("height"))
         mode = "edit" if record.get("is_edit") else "image"
         pool = self.mode_bucket_indices.get(f"{mode}:{bucket}") or [index]
         candidates = candidate_indices(index, pool, self.max_retries, random.Random(self.seed + index))
@@ -476,7 +481,7 @@ class ImageDatabaseDataset(Dataset):
                 print(f'[image] stage=sample_start {detail}', flush=True)
             try:
                 candidate_timeout = budget.timeout()
-                result = self._load_item(candidate, min(budget.deadline, time.monotonic() + candidate_timeout), detail)
+                result = self._load_item(candidate, min(budget.deadline, time.monotonic() + candidate_timeout), detail, bucket_override=bucket_override)
                 return result
             except Exception as exc:
                 if is_resource_error(exc):

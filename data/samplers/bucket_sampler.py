@@ -37,6 +37,8 @@ class BucketBatchSampler(Sampler[list[int]]):
         self.start_batch = 0
         self.epoch = 0
         self._start_epoch = 0
+        # 同比例高分桶 → 低分桶借图来源表 (向下兼容: 纯降采样, 无裁剪)
+        self.donor_buckets = self._compute_donor_buckets()
 
     def set_epoch(self, epoch: int) -> None:
         self.epoch = max(0, int(epoch))
@@ -169,7 +171,36 @@ class BucketBatchSampler(Sampler[list[int]]):
                 remainder -= 1
         return quotas
 
-    def __iter__(self) -> Iterator[list[int]]:
+    @staticmethod
+    def _bucket_geometry(bucket: str) -> tuple[int, int] | None:
+        """解析桶名像素几何: '128_square' → (128,128), '128x96' → (128,96); 无法解析返回 None。"""
+        try:
+            if bucket.endswith("_square"):
+                size = int(bucket.split("_", 1)[0])
+                return size, size
+            width, height = bucket.split("x", 1)
+            return int(width), int(height)
+        except (ValueError, AttributeError):
+            return None
+
+    def _compute_donor_buckets(self) -> dict[str, list[str]]:
+        """同一宽高比且更高的桶可作为低分桶的借图来源, 按面积升序 (优先最小的高分桶)。"""
+        geometries = {key: self._bucket_geometry(key) for key in self.bucket_indices}
+        donors: dict[str, list[str]] = {key: [] for key in self.bucket_indices}
+        for target, target_geometry in geometries.items():
+            if target_geometry is None:
+                continue
+            tw, th = target_geometry
+            for source, source_geometry in geometries.items():
+                if source == target or source_geometry is None:
+                    continue
+                sw, sh = source_geometry
+                if sw * th == tw * sh and sw > tw:  # 同比例且严格更大 → 纯降采样
+                    donors[target].append(source)
+            donors[target].sort(key=lambda key: geometries[key][0] * geometries[key][1])
+        return donors
+
+    def __iter__(self) -> Iterator[list]:
         # randomize_order_on_start=False 时 epoch 不参与 seed, 各 epoch 顺序完全相同
         rng_seed = self.seed + self.epoch if self.randomize_order_on_start else self.seed
         rng = random.Random(rng_seed)
@@ -177,21 +208,55 @@ class BucketBatchSampler(Sampler[list[int]]):
         for pool in pools.values():
             rng.shuffle(pool)
         offsets = {key: 0 for key in pools}
+
+        def remaining(key: str) -> int:
+            return len(pools[key]) - offsets[key]
+
+        def build_batch(target: str):
+            """按 target 桶分辨率凑一个完整 batch: 自身池耗尽即止 (不回绕重复), 不足时依次向
+            同比例高分桶借图, 借图条目记为 (idx, target) 由数据集加载时降采样;
+            自身+借图来源仍不够一个整 batch 时返回 None (不消耗任何池)。"""
+            size = self._batch_size_for_bucket(target)
+            need = size * self.world_size
+            sources = [target, *self.donor_buckets.get(target, [])]
+            if sum(remaining(source) for source in sources) < need:
+                return None
+            batch: list = []
+            missing = need
+            for source in sources:
+                if missing <= 0:
+                    break
+                pool, start = pools[source], offsets[source]
+                drawn = min(missing, len(pool) - start)
+                if drawn <= 0:
+                    continue
+                offsets[source] = start + drawn
+                chunk = pool[start:start + drawn]
+                batch.extend(chunk if source == target else [(idx, target) for idx in chunk])
+                missing -= drawn
+            return (batch, size) if missing <= 0 else None
+
         steps = self._total_steps()
         bucket_order = self._weighted_bucket_order(rng, steps)
-
         for step, bucket in enumerate(bucket_order):
-            batch_size = self._batch_size_for_bucket(bucket)
-            global_batch_size = batch_size * self.world_size
-            global_batch = []
-            while len(global_batch) < global_batch_size:
-                pool, start = pools[bucket], offsets[bucket]
-                take = min(global_batch_size - len(global_batch), len(pool) - start)
-                global_batch.extend(pool[start:start + take])
-                offsets[bucket] += take
-                if offsets[bucket] == len(pool):
-                    rng.shuffle(pool)
-                    offsets[bucket] = 0
+            result = build_batch(bucket)
+            if result is None:
+                # 自动切换: 换到剩余量 (含其高分借图来源) 仍够一个整 batch 的桶, 整批按源桶分辨率
+                for candidate in sorted(pools, key=lambda key: (-remaining(key), key)):
+                    if candidate == bucket:
+                        continue
+                    result = build_batch(candidate)
+                    if result is not None:
+                        break
+            if result is None:
+                # 兜底: 所有桶都凑不齐整 batch (总配额超出数据量), 回绕最大池保证 batch 完整
+                source = max(sorted(pools), key=lambda key: len(pools[key]))
+                size = self._batch_size_for_bucket(source)
+                need = size * self.world_size
+                pool, start = pools[source], offsets[source] % len(pool)
+                result = ([pool[(start + i) % len(pool)] for i in range(need)], size)
+                offsets[source] = (start + need) % len(pool)
+            global_batch, batch_size = result
             if step < self.start_batch:
                 continue
             start = self.rank * batch_size

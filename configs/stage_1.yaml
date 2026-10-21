@@ -92,6 +92,8 @@ dataset:
     - 192_square
     - 192x128
     - 128x192
+  # 桶耗尽后不再回绕重复: 不足的 batch 由同比例高分桶借图降采样补足 (192_square→128_square),
+  # 无同比例高分桶时整批自动切换到仍有余量的桶。
   bucket_sampling_weights:
     128_square: 0.25
     128x96: 0.15

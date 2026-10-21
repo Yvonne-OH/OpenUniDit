@@ -387,10 +387,17 @@ def run_next_batch_validation(engine, vae, tokenizer, text_encoder, device, dtyp
     generator = torch.Generator(device=device).manual_seed(int(val_cfg.get("seed", 42)) + step * 1000 + rank)
     x = torch.randn(b, vae.config.z_dim, 1, h // compress, w // compress, device=device, dtype=torch.float32, generator=generator)
     num_steps = int(val_cfg.get("num_inference_steps", 20))
+    # σ schedule 与训练分布一致: u 线性 1→0 经 shift 变换 σ = s·u/(1+(s-1)·u), Euler 步长取相邻 σ 差
+    shift = float(cfg["scheduler"].get("validation_shift") or cfg["scheduler"].get("shift") or 1.0)
+
+    def shift_sigma(u):
+        return shift * u / (1.0 + (shift - 1.0) * u)
+
     engine.eval()
     try:
         for i in range(num_steps):  # σ: 1(噪声) → 0(数据), v = noise - data
-            sigma = 1.0 - i / num_steps
+            sigma = shift_sigma(1.0 - i / num_steps)
+            next_sigma = shift_sigma(1.0 - (i + 1) / num_steps)
             model_input = x.to(dtype)
             timestep = torch.full((b,), sigma * 1000.0, device=device)
             v_all = engine(
@@ -402,7 +409,7 @@ def run_next_batch_validation(engine, vae, tokenizer, text_encoder, device, dtyp
             v_uncond, v_cond = v_all.chunk(2, 0)
             guidance_scale = float(val_cfg.get("guidance_scale", 3.0))
             v = v_uncond + guidance_scale * (v_cond - v_uncond)
-            x = x - v / num_steps
+            x = x - v * (sigma - next_sigma)
     finally:
         engine.train()
     gen = vae.decode(x / std_inv + mean).sample
@@ -442,7 +449,7 @@ def run_next_batch_validation(engine, vae, tokenizer, text_encoder, device, dtyp
         "seed": int(val_cfg.get("seed", 42)) + step * 1000 + rank,
         "num_inference_steps": num_steps,
         "guidance_scale": float(val_cfg.get("guidance_scale", 3.0)),
-        "validation_shift": cfg["scheduler"].get("validation_shift"),
+        "validation_shift": shift,
         "pixel_size": [h, w],
         "latent_size": [h // compress, w // compress],
         "negative_prompt": tokenizer.eos_token,
