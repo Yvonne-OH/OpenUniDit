@@ -442,7 +442,7 @@ class ImageDatabaseDataset(Dataset):
         import math
         import socket
         from data.datasets.video_decode import (
-            DecodeBudget, MediaCandidatesExhausted, candidate_indices, is_resource_error,
+            DecodeBudget, MediaCandidatesExhausted, candidate_indices, media_error_category,
         )
 
         # BucketBatchSampler 高分桶借图时传入 (index, target_bucket): 按低分桶分辨率降采样加载
@@ -484,7 +484,9 @@ class ImageDatabaseDataset(Dataset):
                 result = self._load_item(candidate, min(budget.deadline, time.monotonic() + candidate_timeout), detail, bucket_override=bucket_override)
                 return result
             except Exception as exc:
-                if is_resource_error(exc):
+                # capacity (解码子进程 MemoryError) 可能由单个超大图确定性触发, 属样本级错误:
+                # 换候选重试而非立即终止整个训练作业; executor_bug (真正代码/环境 bug) 仍快速失败。
+                if media_error_category(exc) == 'executor_bug':
                     raise
                 last_error = exc
                 if debug or isinstance(exc, TimeoutError):

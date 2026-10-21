@@ -10,8 +10,10 @@ import os
 import re
 import shutil
 import sys
+import threading
 import time
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -40,6 +42,72 @@ def collate(batch):
     # decode 输出每样本已是 [C,T=1,H,W], collate 后 [B,C,T,H,W], Wan VAE 与模型直接可用, 不再 unsqueeze
     result["pixel_values"] = torch.from_numpy(result["pixel_values"])
     return result
+
+
+def _data_error_category(exc):
+    """DataLoader 异常归类: MediaError 自带 category; 其余走 video_decode 的分类兜底。
+
+    corrupt/invalid_input/capacity/transient_io/deadline 视为可跳过的数据级错误,
+    executor_bug (未知代码/环境 bug) 必须终止训练。
+    """
+    category = getattr(exc, "category", None)
+    if category:
+        return category
+    try:
+        from data.datasets.video_decode import media_error_category
+        return media_error_category(exc)
+    except Exception:
+        return "executor_bug"
+
+
+def _blue_print(message):
+    """蓝色高亮提示: 只走 stdout (终端/console 可见), 不进 train.log, 文件日志保持纯文本。"""
+    print(f"\033[1;34m{message}\033[0m", flush=True)
+
+
+def _ckpt_dir_size_gib(tag_dir):
+    """恢复前快速统计 checkpoint 目录大小 (只读元数据), 用于体量与耗时预估。"""
+    try:
+        total = 0
+        for root, _, files in os.walk(tag_dir):
+            for name in files:
+                total += os.path.getsize(os.path.join(root, name))
+        return total / 1024 ** 3
+    except OSError:
+        return 0.0
+
+
+@contextmanager
+def _loud_phase(rank, logger, title, hint="", every_s=60):
+    """长时间静默阶段 (DeepSpeed 初始化 / checkpoint 恢复) 的蓝色高亮 + 心跳进度。
+
+    仅 rank0 向 stdout 打蓝色提示, 心跳每分钟播报一次已等待时长;
+    全部 rank 通过 logger 记纯文本; 心跳线程只做播报, 不参与任何集合通信。
+    """
+    start = time.time()
+    logger.info("%s 开始 %s", title, hint)
+    if rank == 0:
+        _blue_print(f"▶️ {title} 开始 {hint}")
+    stop = threading.Event()
+
+    def heartbeat():
+        waited = every_s
+        while not stop.wait(every_s):
+            _blue_print(f"⏳ {title} 仍在进行: 已等待 {waited // 60} 分 {waited % 60:02d} 秒")
+            waited += every_s
+
+    thread = threading.Thread(target=heartbeat, daemon=True)
+    if rank == 0:
+        thread.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        elapsed = time.time() - start
+        logger.info("%s 完成, 耗时 %.0f 秒", title, elapsed)
+        if rank == 0:
+            thread.join(timeout=5)
+            _blue_print(f"✅ {title} 完成, 耗时 {elapsed / 60:.1f} 分钟")
 
 
 def parse_muon_lr(value, base_lr):
@@ -534,41 +602,60 @@ def main():
     ds_config["train_micro_batch_size_per_gpu"] = int(cfg["training"]["batch_size_per_device"])
     ds_config["gradient_accumulation_steps"] = int(cfg["training"].get("gradient_accumulation_steps", 1))
     ds_config["train_batch_size"] = ds_config["train_micro_batch_size_per_gpu"] * ds_config["gradient_accumulation_steps"] * dist.get_world_size()
-    engine, ds_optimizer, _, _ = deepspeed.initialize(
-        model=model, model_parameters=model.parameters(), optimizer=client_optimizer,
-        config=ds_config,
-    )
+    with _loud_phase(rank, logger, f"⚙️ DeepSpeed 引擎初始化 (world_size={dist.get_world_size()}, ZeRO 权重分片)",
+                     hint="(静默数分钟属正常)"):
+        engine, ds_optimizer, _, _ = deepspeed.initialize(
+            model=model, model_parameters=model.parameters(), optimizer=client_optimizer,
+            config=ds_config,
+        )
     # 断点恢复三级策略: 完整 DeepSpeed state (含 optimizer) → 纯权重快照 (step 保留) → 从 0 开始。
     # resume_mode 为文件/目录路径时，跳过自动发现，强制从指定纯权重恢复。
     resume_mode = cfg["training"].get("resume_mode", "auto")
     resume_tag = latest_state_tag(checkpoint_dir) if resume_mode == "auto" else None
     step = 0
     if isinstance(resume_mode, str) and resume_mode not in {"auto", "none", "false", "off"}:
-        step = load_pure_weights(engine, output_dir, resume_mode)
+        with _loud_phase(rank, logger, f"🔄 从指定路径恢复纯权重 {resume_mode}"):
+            step = load_pure_weights(engine, output_dir, resume_mode)
         if rank == 0:
+            _blue_print(f"🔁 已从指定纯权重 {resume_mode} 恢复: 从 step={step} 继续训练 (optimizer 状态已重置)")
             logger.info("🔁 已从指定纯权重恢复: %s, 从 step=%d 继续训练 (optimizer 状态已重置)", resume_mode, step)
         dist.barrier()
     elif resume_tag:
+        size_gib = _ckpt_dir_size_gib(checkpoint_dir / resume_tag)
+        hint = (f"(checkpoint 目录 ≈{size_gib:.0f} GiB, {dist.get_world_size()} rank 并行读取分片, "
+                "并发恢复时可达 10~20 分钟, 静默期间每分钟播报一次进度)")
         try:
-            load_path, client_state = engine.load_checkpoint(str(checkpoint_dir), tag=resume_tag, load_optimizer_states=True, load_lr_scheduler_states=True)
-            if not load_path:
-                raise RuntimeError("load_checkpoint 返回空路径")
-            step = int(client_state.get("step", int(resume_tag.removeprefix("step-"))))
+            with _loud_phase(rank, logger, f"🔄 恢复 DeepSpeed checkpoint {resume_tag} (含 optimizer)", hint=hint):
+                load_path, client_state = engine.load_checkpoint(str(checkpoint_dir), tag=resume_tag, load_optimizer_states=True, load_lr_scheduler_states=True)
+                if not load_path:
+                    raise RuntimeError("load_checkpoint 返回空路径")
+                step = int(client_state.get("step", int(resume_tag.removeprefix("step-"))))
+            if rank == 0:
+                _blue_print(f"🔁 checkpoint {resume_tag} 恢复完成: 从 step={step} 继续训练")
             logger.info("🔁 已恢复完整 DeepSpeed checkpoint %s (含 optimizer), 从 step=%d 继续训练", resume_tag, step)
         except Exception as exc:
-            step = load_pure_weights(engine, output_dir)
+            with _loud_phase(rank, logger, "🔄 完整恢复失败, 降级为纯权重恢复"):
+                step = load_pure_weights(engine, output_dir)
+            if rank == 0:
+                _blue_print(f"⚠️ 完整 checkpoint 恢复失败, 已降级为纯权重恢复: step={step} (optimizer 状态已重置)")
             logger.warning("⚠️ 完整 checkpoint 恢复失败 (%s), 降级为纯权重恢复: step=%d (optimizer 状态已重置)", exc, step)
         dist.barrier()
     elif resume_mode == "auto":
-        step = load_pure_weights(engine, output_dir)
+        with _loud_phase(rank, logger, "🔄 扫描并恢复纯权重快照"):
+            step = load_pure_weights(engine, output_dir)
         if rank == 0:
             if step:
+                _blue_print(f"🔁 已恢复纯权重: 从 step={step} 继续训练 (optimizer 状态已重置)")
                 logger.info("🔁 已恢复纯权重，从 step=%d 继续训练 (optimizer 状态已重置)", step)
             else:
+                _blue_print("🆕 未发现 checkpoint, 从 step=0 开始训练")
                 logger.info("🆕 未发现 checkpoint, 从 step=0 开始训练")
 
-    data = GigaLMDBDataset(cfg["dataset"], seed=int(cfg.get("seed", 42)), index_cache_dir=str(output_dir / "dataset_index_cache"))
+    with _loud_phase(rank, logger, "📦 数据集索引加载",
+                     hint="(每 rank 独立构建, 34M 记录级别索引首次扫描约数分钟, 命中缓存约 1 分钟)"):
+        data = GigaLMDBDataset(cfg["dataset"], seed=int(cfg.get("seed", 42)), index_cache_dir=str(output_dir / "dataset_index_cache"))
     if rank == 0:
+        _blue_print(f"📦 dataset ready: records={len(data.records)}")
         logger.info("dataset ready: records=%d buckets=%s", len(data.records), {key: len(value) for key, value in data.bucket_indices.items()})
     batch_sampler = BucketBatchSampler(data.bucket_indices, cfg["training"]["batch_size_per_device"], weights=cfg["dataset"].get("bucket_sampling_weights"), seed=int(cfg.get("seed", 42)), rank=rank, world_size=dist.get_world_size(), randomize_order_on_start=True, drop_last=True)
     steps_per_epoch = len(batch_sampler)
@@ -606,6 +693,8 @@ def main():
     sigma_bucket_ema = [float("nan")] * SIGMA_BUCKETS  # rank0: 各 sigma 桶 loss 的 EMA (α=0.1)
     log_every = int(cfg["logging"].get("log_every_n_steps", 1))
     pending_batch = None
+    consecutive_batch_skips = 0
+    max_consecutive_batch_skips = int(os.environ.get("GIGA_MAX_CONSECUTIVE_BATCH_SKIPS", "64"))
     progress = tqdm(total=max_steps, initial=step, disable=rank != 0, dynamic_ncols=True, desc="🚂 stage_1")
     while step < max_steps:
         step += 1
@@ -616,11 +705,29 @@ def main():
         last_captions = None
         for micro_idx in range(grad_accum):
             try:
-                batch = pending_batch if pending_batch is not None else next(iterator)
-            except StopIteration:
-                batch_sampler.set_epoch(batch_sampler.epoch + 1)
-                iterator = iter(loader)
-                batch = next(iterator)
+                if pending_batch is not None:
+                    batch = pending_batch
+                else:
+                    try:
+                        batch = next(iterator)
+                    except StopIteration:
+                        batch_sampler.set_epoch(batch_sampler.epoch + 1)
+                        iterator = iter(loader)
+                        batch = next(iterator)
+            except Exception as exc:
+                # 数据级错误 (坏图/坏视频/解码子进程 MemoryError 等) 跳过该 micro batch,
+                # 不再炸掉整个多卡作业; executor_bug 或连续跳过超限仍然终止。
+                category = _data_error_category(exc)
+                consecutive_batch_skips += 1
+                if category == "executor_bug" or consecutive_batch_skips > max_consecutive_batch_skips:
+                    raise
+                logger.warning("⏭️ step=%d micro=%d 跳过坏数据 batch (category=%s, consecutive=%d/%d): %s",
+                               step, micro_idx, category, consecutive_batch_skips,
+                               max_consecutive_batch_skips, exc)
+                last_captions = [""]
+                lr_now = 0.0
+                continue
+            consecutive_batch_skips = 0
             pending_batch = None
             pixels = batch["pixel_values"].to(device)
             captions = batch["captions"]
@@ -652,6 +759,9 @@ def main():
             bins = (sigma.detach() * SIGMA_BUCKETS).long().clamp_(0, SIGMA_BUCKETS - 1)
             micro_bucket_sums.scatter_add_(0, bins, per_sample_loss.detach().float())
             micro_bucket_counts += torch.bincount(bins, minlength=SIGMA_BUCKETS).float()
+        if not micro_losses:
+            logger.warning("🚫 step=%d 本 step 的全部 micro batch 均因坏数据跳过, 跳过本 step 优化", step)
+            continue
         engine.step()
         loss_value = torch.stack(micro_losses).mean().item()
         sigma_mean = torch.stack(micro_sigmas).sum().item() / (grad_accum * latents.shape[0])
@@ -681,9 +791,13 @@ def main():
                 batch_sampler.set_epoch(batch_sampler.epoch + 1)
                 iterator = iter(loader)
                 pending_batch = next(iterator)
-            if rank == 0:
-                logger.info("🔍 step=%d 每卡对 next batch 推理", step)
-            run_next_batch_validation(engine, vae, tokenizer, text_encoder, device, dtype, pending_batch, step, rank, cfg, output_dir, logger, wandb_run)
+            except Exception as exc:
+                logger.warning("⏭️ step=%d 验证 batch 数据错误, 跳过本步验证 (category=%s): %s",
+                               step, _data_error_category(exc), exc)
+            else:
+                if rank == 0:
+                    logger.info("🔍 step=%d 每卡对 next batch 推理", step)
+                run_next_batch_validation(engine, vae, tokenizer, text_encoder, device, dtype, pending_batch, step, rank, cfg, output_dir, logger, wandb_run)
         if step % cfg["training"].get("checkpointing_steps", 1000) == 0 or step == max_steps:
             engine.save_checkpoint(str(checkpoint_dir), tag=f"step-{step}", client_state={"step": step})
             save_pure_weights(engine, output_dir, step)

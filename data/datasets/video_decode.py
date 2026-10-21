@@ -497,17 +497,37 @@ def decode_av_record(root, lmdb_path, sample_id, **decode_args):
     return pair
 
 
+def _bound_image(image, target_width, target_height):
+    """超大图在完整解码/转换前先降采样, 避免 4K/亿级像素图把解码子进程内存打爆。
+
+    draft() 对 JPEG 在解码阶段直接缩小 (解码峰值内存同步下降), 其余格式 no-op;
+    thumbnail() 兜底把面积压到目标 4 倍 (长宽各约 2x) 以内, 保持纵横比。
+    输出最终都会 resize_frames 到 bucket 分辨率, 提前降采样不改变训练语义。
+    """
+    if not target_width or not target_height:
+        return image
+    try:
+        image.draft('RGB', (int(target_width), int(target_height)))
+    except Exception:
+        pass
+    limit = 4.0 * target_width * target_height
+    if image.width * image.height > limit:
+        scale = math.sqrt(limit / (image.width * image.height))
+        image.thumbnail((max(1, int(image.width * scale)), max(1, int(image.height * scale))))
+    return image
+
+
 def read_images(path, width, height, condition_path=None):
     cache = {}
     result = []
     for source in (path, condition_path) if condition_path else (path,):
-        pixels = read_image(source, cache)
+        pixels = read_image(source, cache, target_width=width, target_height=height)
         h, w = pixels.shape[:2]
         result.append(resize_frames([pixels], width, height, w, h))
     return np.stack(result)
 
 
-def read_image(path, records=None):
+def read_image(path, records=None, target_width=None, target_height=None):
     import io
     from PIL import Image
     Image.MAX_IMAGE_PIXELS = 150_000_000
@@ -531,12 +551,14 @@ def read_image(path, records=None):
         with _stage_call('pil_open', Image.open, io.BytesIO(record[field])) as image:
             if image.width * image.height > 150_000_000:
                 raise ValueError('image exceeds pixel limit')
+            _stage_call('image_bound', _bound_image, image, target_width, target_height)
             rgb = _stage_call('pil_decode_rgb', image.convert, 'RGB')
             return _stage_call('image_array', np.asarray, rgb)
     _stage('image_stage_file')
     with staged_file(path) as local, _stage_call('pil_open', Image.open, local) as image:
         if image.width * image.height > 150_000_000:
             raise ValueError('image exceeds pixel limit')
+        _stage_call('image_bound', _bound_image, image, target_width, target_height)
         rgb = _stage_call('pil_decode_rgb', image.convert, 'RGB')
         return _stage_call('image_array', np.asarray, rgb)
 
