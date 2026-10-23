@@ -21,6 +21,7 @@ class GigaLMDBDataset(LmdbParquetDataset):
             refresh_index_cache=cfg.get("refresh_index_cache", False),
             index_cache_dir=index_cache_dir,
             bucket_sampling_weights=cfg.get("bucket_sampling_weights"),
+            preprocess_style=cfg.get("preprocess_style", "cover"),
         )
 
 __all__ = ["GigaLMDBDataset", "collate_image_batch"]

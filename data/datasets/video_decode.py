@@ -517,13 +517,13 @@ def _bound_image(image, target_width, target_height):
     return image
 
 
-def read_images(path, width, height, condition_path=None):
+def read_images(path, width, height, condition_path=None, style="cover"):
     cache = {}
     result = []
     for source in (path, condition_path) if condition_path else (path,):
         pixels = read_image(source, cache, target_width=width, target_height=height)
         h, w = pixels.shape[:2]
-        result.append(resize_frames([pixels], width, height, w, h))
+        result.append(resize_frames([pixels], width, height, w, h, style=style))
     return np.stack(result)
 
 
@@ -644,9 +644,24 @@ def decode_stagger_sleep():
     time.sleep(random.uniform(0, limit))
 
 
-def resize_frames(frames, out_w, out_h, src_w, src_h):
+def resize_frames(frames, out_w, out_h, src_w, src_h, style="cover"):
     from PIL import Image
 
+    if style == "resize_long_edge":
+        # 长边贴桶、保持纵横比不裁剪, 短边居中补黑: 避免中心裁剪切掉 caption 描述的主体
+        scale = min(out_w / src_w, out_h / src_h)
+        scaled_w = min(out_w, max(1, round(src_w * scale)))
+        scaled_h = min(out_h, max(1, round(src_h * scale)))
+        left, top = (out_w - scaled_w) // 2, (out_h - scaled_h) // 2
+        out = np.zeros((3, len(frames), out_h, out_w), dtype=np.uint8)
+        for i, frame in enumerate(frames):
+            img = Image.fromarray(frame)
+            if img.size != (scaled_w, scaled_h):
+                img = img.resize((scaled_w, scaled_h), Image.Resampling.BICUBIC)
+            out[:, i, top:top + scaled_h, left:left + scaled_w] = np.asarray(img).transpose(2, 0, 1)
+        return out
+
+    # 默认 cover: 短边贴桶 + 中心裁剪 (与旧行为完全一致)
     scale = max(out_w / src_w, out_h / src_h)
     scaled_w, scaled_h = round(src_w * scale), round(src_h * scale)
     left, top = (scaled_w - out_w) // 2, (scaled_h - out_h) // 2

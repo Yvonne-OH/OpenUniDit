@@ -39,7 +39,12 @@ elif (( WORLD_SIZE > 1 )); then
 else
   RUN_ID="$(date +%Y%m%d_%H%M%S)"
 fi
-RUN_LOG_DIR="$OUTPUT_DIR/logs/$RUN_ID"
+# 多机时每节点独立子目录 (node0..nodeN): 避免多机 tee 互相覆盖 command.txt/console.log
+if (( WORLD_SIZE > 1 )); then
+  RUN_LOG_DIR="$OUTPUT_DIR/logs/$RUN_ID/node${RANK}"
+else
+  RUN_LOG_DIR="$OUTPUT_DIR/logs/$RUN_ID"
+fi
 mkdir -p "$RUN_LOG_DIR"
 export GIGA_RUN_LOG_DIR="$RUN_LOG_DIR"
 export GIGA_NODE_RANK="$RANK"

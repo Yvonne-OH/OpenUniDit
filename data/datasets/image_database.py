@@ -139,6 +139,7 @@ class ImageDatabaseDataset(Dataset):
         for bucket in self.buckets:
             validate_bucket(bucket)
         self.transform = transform
+        self.preprocess_style = str(preprocess_style)
         records = self._load_records(self.database_path, self.sources, columns=_IMAGE_COLUMNS) if image_training_enabled else []
         edit_enabled = edit_training_enabled
         for record in records:
@@ -417,7 +418,8 @@ class ImageDatabaseDataset(Dataset):
             return str(self.image_root / path) if self.image_root and not Path(path).is_absolute() else path
 
         request = dict(kind='images', path=source_path(record['image_path'],
-                       'after' if record.get('is_edit') else 'single'), width=width, height=height)
+                       'after' if record.get('is_edit') else 'single'), width=width, height=height,
+                       style=getattr(self, 'preprocess_style', 'cover'))
         if record.get('is_edit'):
             request['condition_path'] = source_path(record['input_image_path'], 'before')
         self._check_deadline(deadline, 'decode_start', context)
@@ -508,7 +510,8 @@ class LmdbParquetDataset(ImageDatabaseDataset):
                  edit_ratio: float | str = 0.0, max_edit_samples: int | None = None,
                  image_training_enabled: bool = True, edit_training_enabled: bool = False,
                  index_cache_dir: str | None = None, refresh_index_cache: bool = False,
-                 bucket_sampling_weights: dict | None = None, max_decode_candidates: int = 3, **kwargs):
+                 bucket_sampling_weights: dict | None = None, max_decode_candidates: int = 3,
+                 preprocess_style: str = "cover", **kwargs):
         self.database_path = str(database_path)
         self.image_root = Path(image_root) if image_root else None
         self.transform = transform
@@ -520,6 +523,10 @@ class LmdbParquetDataset(ImageDatabaseDataset):
         self.max_retries, self.seed = max(1, int(max_retries)), int(seed)
         self.max_decode_candidates = max(1, int(max_decode_candidates))
         self.max_upscale_ratio = float(max_upscale_ratio)
+        # 预处理风格: cover=短边贴桶+中心裁剪 (旧行为); resize_long_edge=长边贴桶+短边补黑 (保主体完整)
+        self.preprocess_style = str(preprocess_style)
+        if self.preprocess_style not in ("cover", "resize_long_edge"):
+            raise ValueError(f"不支持的 preprocess_style: {self.preprocess_style!r} (可选: cover, resize_long_edge)")
         self.buckets = list(buckets)
         for bucket in self.buckets:
             validate_bucket(bucket)

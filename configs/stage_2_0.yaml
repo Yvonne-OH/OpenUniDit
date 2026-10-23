@@ -78,7 +78,7 @@ dataset:
     - monet_coyo
   contract: "[B,C,T,H,W]"
   num_frames: 1
-  preprocess_style: resize_long_edge
+  preprocess_style: cover   # 短边贴桶+中心裁剪, 无黑边 (实测 resize_long_edge 加权后 37% 样本补黑 >1%)
   resolution: 512
   long_edge: 512
   max_upscale_ratio: 1.2

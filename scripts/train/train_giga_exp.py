@@ -240,7 +240,7 @@ def build_optimizer(model, cfg):
         head = name.startswith("out.")
         (rest if head or parameter.ndim != 2 else matrix).append(parameter)
     lr = float(cfg.get("learning_rate", 1e-4))
-    return MuonAdamW(matrix, rest, cfg.get("muon", {}), cfg, lr)
+    return MuonAdamW(matrix, rest, cfg.get("muon", {}), cfg.get("adam", {}), lr)
 
 
 def set_lr(optimizer, engine_optimizer, step, training_cfg):
@@ -286,20 +286,72 @@ def setup_logging(output_dir, rank):
     return logger
 
 
+def _dist_rank():
+    return dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+
+
+def _semantic_metadata(model):
+    return model.semantic_metadata()
+
+
+def _warn_semantic_mismatch(model, metadata, source, logger=None):
+    if _dist_rank() != 0:
+        return
+    logger = logger or logging.getLogger("giga_exp")
+    current = _semantic_metadata(model)
+    if not isinstance(metadata, dict) or not metadata:
+        message = f"checkpoint semantic metadata missing/unknown: {source}"
+    else:
+        differences = []
+        for key in sorted(set(current) | set(metadata)):
+            if current.get(key) != metadata.get(key):
+                differences.append(f"{key}: old={metadata.get(key)!r}, current={current.get(key)!r}")
+        if not differences:
+            return
+        message = f"checkpoint semantic metadata mismatch ({source}): " + "; ".join(differences)
+    logger.warning(message)
+    print(f"\033[1;31m{message}\033[0m", flush=True)
+
+
+def _read_weight_metadata(path):
+    if path.suffix == ".safetensors":
+        from safetensors import safe_open
+        with safe_open(str(path), framework="pt", device="cpu") as handle:
+            raw = (handle.metadata() or {}).get("giga_semantic_metadata")
+        return json.loads(raw) if raw else None
+    sidecar = path.with_suffix(".json")
+    if not sidecar.is_file():
+        return None
+    return json.loads(sidecar.read_text(encoding="utf-8")).get("giga_semantic_metadata")
+
+
+def load_training_checkpoint(engine, checkpoint_dir, tag):
+    load_path, client_state = engine.load_checkpoint(
+        str(checkpoint_dir), tag=tag, load_optimizer_states=True, load_lr_scheduler_states=True)
+    if not load_path:
+        raise RuntimeError("load_checkpoint 返回空路径")
+    client_state = client_state or {}
+    _warn_semantic_mismatch(engine.module, client_state.get("giga_semantic_metadata"), f"DeepSpeed {tag}")
+    return load_path, client_state
+
+
 def save_pure_weights(engine, output_dir, step):
-    if dist.get_rank() != 0:
+    if _dist_rank() != 0:
         return
     weight_dir = output_dir / "checkpoints" / "weights"
     weight_dir.mkdir(parents=True, exist_ok=True)
     state = {key: value.detach().cpu() for key, value in engine.module.state_dict().items()}
+    semantic = _semantic_metadata(engine.module)
     target = weight_dir / f"step-{step:08d}.safetensors"
     try:
         from safetensors.torch import save_file
-        save_file(state, str(target), metadata={"format": "pt", "step": str(step)})
+        save_file(state, str(target), metadata={"format": "pt", "step": str(step), "giga_semantic_metadata": json.dumps(semantic, sort_keys=True)})
     except ImportError:
         target = target.with_suffix(".pt")
         torch.save(state, target)
+        target.with_suffix(".json").write_text(json.dumps({"giga_semantic_metadata": semantic}, sort_keys=True), encoding="utf-8")
     torch.save(state, weight_dir / "latest.pt")
+    (weight_dir / "latest.json").write_text(json.dumps({"giga_semantic_metadata": semantic}, sort_keys=True), encoding="utf-8")
 
 
 def prune_state_checkpoints(checkpoint_dir, keep):
@@ -364,13 +416,16 @@ def load_pure_weights(engine, output_dir, checkpoint_path=None):
         target = max(candidates, key=lambda path: int(path.name.split("-")[1].split(".")[0]))
     step_match = re.search(r"step-(\d+)", target.name)
     step = int(step_match.group(1)) if step_match else 0
+    _warn_semantic_mismatch(engine.module, _read_weight_metadata(target), str(target))
     if target.suffix == ".safetensors":
         from safetensors.torch import load_file
         state = load_file(str(target))
     else:
         state = torch.load(str(target), map_location="cpu")
     matched, missing, unexpected = load_compatible_state_dict(engine.module, state)
-    if dist.get_rank() == 0:
+    # ZeRO-2 的 FP32 主参数独立于模型权重；所有 rank 都必须同步自己的分片。
+    engine.optimizer.refresh_fp32_params()
+    if _dist_rank() == 0:
         logger = logging.getLogger("giga_exp")
         logger.info("兼容恢复权重: %s, matched=%d, reinitialized=%d, ignored=%d", target, matched, missing, unexpected)
     return step
@@ -386,6 +441,7 @@ def load_init_weights(model, init_path):
         if not candidates:
             raise FileNotFoundError(f"init_from 目录没有权重文件: {path}")
         path = max(candidates, key=lambda p: int(p.name.split("-")[1].split(".")[0]))
+    _warn_semantic_mismatch(model, _read_weight_metadata(path), str(path))
     if path.suffix == ".safetensors":
         from safetensors.torch import load_file
         state = load_file(str(path))
@@ -626,9 +682,7 @@ def main():
                 "并发恢复时可达 10~20 分钟, 静默期间每分钟播报一次进度)")
         try:
             with _loud_phase(rank, logger, f"🔄 恢复 DeepSpeed checkpoint {resume_tag} (含 optimizer)", hint=hint):
-                load_path, client_state = engine.load_checkpoint(str(checkpoint_dir), tag=resume_tag, load_optimizer_states=True, load_lr_scheduler_states=True)
-                if not load_path:
-                    raise RuntimeError("load_checkpoint 返回空路径")
+                load_path, client_state = load_training_checkpoint(engine, checkpoint_dir, resume_tag)
                 step = int(client_state.get("step", int(resume_tag.removeprefix("step-"))))
             if rank == 0:
                 _blue_print(f"🔁 checkpoint {resume_tag} 恢复完成: 从 step={step} 继续训练")
@@ -677,7 +731,9 @@ def main():
     batch_sampler.set_start_batch(batch_offset, epoch=epoch)
     if rank == 0:
         logger.info("📅 max_epochs=%d steps_per_epoch=%d total_steps=%d grad_accum=%d; 从 epoch=%d batch=%d step=%d 继续", max_epochs, steps_per_epoch, max_steps, grad_accum, epoch, batch_offset, step)
-    loader = torch.utils.data.DataLoader(data, batch_sampler=batch_sampler, num_workers=cfg["training"].get("num_workers", 4), collate_fn=collate)
+    loader = torch.utils.data.DataLoader(data, batch_sampler=batch_sampler,
+                                         num_workers=cfg["training"].get("num_workers", 4),
+                                         prefetch_factor=4, persistent_workers=True, collate_fn=collate)
     iterator = iter(loader)
 
     wandb_run = None
@@ -703,7 +759,9 @@ def main():
         micro_bucket_sums = torch.zeros(SIGMA_BUCKETS, device=device)
         micro_bucket_counts = torch.zeros(SIGMA_BUCKETS, device=device)
         last_captions = None
+        lr_now = set_lr(client_optimizer, ds_optimizer, step, cfg["training"])
         for micro_idx in range(grad_accum):
+            bad_local = 0
             try:
                 if pending_batch is not None:
                     batch = pending_batch
@@ -724,8 +782,12 @@ def main():
                 logger.warning("⏭️ step=%d micro=%d 跳过坏数据 batch (category=%s, consecutive=%d/%d): %s",
                                step, micro_idx, category, consecutive_batch_skips,
                                max_consecutive_batch_skips, exc)
-                last_captions = [""]
-                lr_now = 0.0
+                bad_local = 1
+            # 跨 rank 同步 skip 决策: 任一 rank 坏数据则全体跳过该 micro,
+            # 否则各 rank 的 backward/step 集合通信次数不一致会挂死整个作业。
+            skip_flag = torch.tensor([bad_local], device=device)
+            dist.all_reduce(skip_flag, op=dist.ReduceOp.MAX)
+            if skip_flag.item() > 0:
                 continue
             consecutive_batch_skips = 0
             pending_batch = None
@@ -747,7 +809,6 @@ def main():
             sigma = sigma * cfg["scheduler"]["shift"] / (1 + (cfg["scheduler"]["shift"] - 1) * sigma)
             noise = torch.randn_like(latents)
             xt = (1 - sigma[:, None, None, None, None]) * latents + sigma[:, None, None, None, None] * noise
-            lr_now = set_lr(client_optimizer, ds_optimizer, step, cfg["training"])
             pred = engine(xt.to(dtype), sigma * 1000, text, mask)
             diff_sq = (pred.float() - (noise - latents).float()).square()
             # DeepSpeed 会在 gradient_accumulation_steps > 1 时自动缩放 backward loss；这里不要再次除以 grad_accum。
@@ -797,9 +858,17 @@ def main():
             else:
                 if rank == 0:
                     logger.info("🔍 step=%d 每卡对 next batch 推理", step)
-                run_next_batch_validation(engine, vae, tokenizer, text_encoder, device, dtype, pending_batch, step, rank, cfg, output_dir, logger, wandb_run)
+                # 验证是纯前向、无集合通信, 单 rank 失败不影响其他 rank; 兜底避免 val OOM 带崩整个作业
+                try:
+                    run_next_batch_validation(engine, vae, tokenizer, text_encoder, device, dtype, pending_batch, step, rank, cfg, output_dir, logger, wandb_run)
+                except Exception as exc:
+                    logger.warning("⏭️ step=%d 验证异常, 跳过本步验证 (训练继续): %s", step, repr(exc))
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
         if step % cfg["training"].get("checkpointing_steps", 1000) == 0 or step == max_steps:
-            engine.save_checkpoint(str(checkpoint_dir), tag=f"step-{step}", client_state={"step": step})
+            engine.save_checkpoint(str(checkpoint_dir), tag=f"step-{step}", client_state={
+                "step": step, "giga_semantic_metadata": _semantic_metadata(engine.module),
+            })
             save_pure_weights(engine, output_dir, step)
             if rank == 0:
                 prune_state_checkpoints(checkpoint_dir, int(cfg["training"].get("state_checkpoints_keep", 2)))

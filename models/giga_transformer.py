@@ -34,10 +34,20 @@ class SpacetimeRoPE(nn.Module):
         if sum(axes_dims) != head_dim or any(d % 2 for d in axes_dims):
             raise ValueError("4D rope axes_dims must be even and sum to head_dim")
         self.axes_dims = tuple(axes_dims)
-        inv = []
-        for dim in axes_dims:
-            inv.append(1.0 / (theta ** (torch.arange(0, dim, 2).float() / dim)))
-        self.register_buffer("inv_freq", torch.cat(inv), persistent=False)
+        self.theta = float(theta)
+        self.register_buffer("inv_freq", self._make_inv_freq(), persistent=False)
+
+    def _make_inv_freq(self, device=None):
+        return torch.cat([
+            1.0 / (self.theta ** (torch.arange(0, dim, 2, device=device, dtype=torch.float32) / dim))
+            for dim in self.axes_dims
+        ])
+
+    def _apply(self, fn, recurse=True):
+        super()._apply(fn, recurse=recurse)
+        # dtype 转换后从公式重建，不能用 .float() 恢复已被 bf16/fp16 量化的频率。
+        self.inv_freq = self._make_inv_freq(self.inv_freq.device)
+        return self
 
     def forward(self, t, h, w, text_len, device, dtype):
         tt, yy, xx = torch.meshgrid(
@@ -56,11 +66,11 @@ class SpacetimeRoPE(nn.Module):
         start = 0
         for axis, dim in enumerate(self.axes_dims):
             freq = self.inv_freq[start:start + dim // 2]
-            phase = positions[:, axis:axis + 1] * freq
-            pieces.append(torch.cat((phase, phase), -1))
+            pieces.append(positions[:, axis:axis + 1] * freq)
             start += dim // 2
-        phase = torch.cat(pieces, -1)
-        return phase.cos().to(dtype), phase.sin().to(dtype)
+        phase = torch.cat(pieces, -1)          # [N, head_dim/2] 每轴唯一频率
+        phase = torch.cat((phase, phase), -1)  # i ↔ i+half 同频配对, 与 rotate_half 的 chunk(2) 对齐
+        return phase.cos(), phase.sin()        # 保持 fp32, 旋转在 block 内以 fp32 完成后再 cast
 
 
 class GigaBlock(nn.Module):
@@ -86,15 +96,19 @@ class GigaBlock(nn.Module):
             q = q.view(b, n, self.heads, -1)
             k = k.view(b, n, self.heads, -1)
             v = v.view(b, n, self.heads, -1)
-            q = q * cos + rotate_half(q) * sin
-            k = k * cos + rotate_half(k) * sin
+            # RoPE 旋转在 fp32 中完成, 避免 bf16 cos/sin 相位量化; FA3 要求原始 dtype
+            qf, kf = q.float(), k.float()
+            q = (qf * cos + rotate_half(qf) * sin).to(v.dtype)
+            k = (kf * cos + rotate_half(kf) * sin).to(v.dtype)
             a = _fa3_func(q, k, v, causal=False).reshape(b, n, -1)
         else:
             q = q.view(b, n, self.heads, -1).transpose(1, 2)
             k = k.view(b, n, self.heads, -1).transpose(1, 2)
             v = v.view(b, n, self.heads, -1).transpose(1, 2)
-            q = q * cos.unsqueeze(0).unsqueeze(0) + rotate_half(q) * sin.unsqueeze(0).unsqueeze(0)
-            k = k * cos.unsqueeze(0).unsqueeze(0) + rotate_half(k) * sin.unsqueeze(0).unsqueeze(0)
+            cos4, sin4 = cos[None, None], sin[None, None]
+            qf, kf = q.float(), k.float()
+            q = (qf * cos4 + rotate_half(qf) * sin4).to(v.dtype)
+            k = (kf * cos4 + rotate_half(kf) * sin4).to(v.dtype)
             a = F.scaled_dot_product_attention(q, k, v, attn_mask=attention_mask).transpose(1, 2).reshape(b, n, -1)
         x = x + self.out(a) * gate_a[:, None]
         y = self.norm2(x) * (1 + scale_f[:, None]) + shift_f[:, None]
@@ -111,6 +125,7 @@ class GigaExpTransformer(nn.Module):
         if len(self.patch_size) != 3 or self.patch_size[0] != 1 or any(p < 1 for p in self.patch_size):
             raise ValueError("patch_size 必须是时间维为 1 的三个正整数")
         self.in_channels, self.out_channels, self.dim, self.heads = in_channels, out_channels, dim, heads
+        self.text_dim, self.ffn_dim, self.layers = text_dim, ffn_dim, layers
         patch_volume = math.prod(self.patch_size)
         self.patch_in = nn.Linear(in_channels * patch_volume, dim)
         self.text_in = nn.Linear(text_dim, dim)
@@ -119,6 +134,24 @@ class GigaExpTransformer(nn.Module):
         self.blocks = nn.ModuleList([GigaBlock(dim, heads, ffn_dim) for _ in range(layers)])
         self.norm = RMSNorm(dim)
         self.out = nn.Linear(dim, out_channels * patch_volume)
+
+    def semantic_metadata(self):
+        return {
+            "channels": [int(self.in_channels), int(self.out_channels)],
+            "text_dim": int(self.text_dim),
+            "dim": int(self.dim),
+            "ffn": int(self.ffn_dim),
+            "heads": int(self.heads),
+            "layers": int(self.layers),
+            "patch_size": list(self.patch_size),
+            "rope_theta": self.rope.theta,
+            "rope_axes": list(self.rope.axes_dims),
+            "implementation": {
+                "version": "giga_semantics_v1",
+                "rope": "fp32_cos_sin_and_rotation",
+                "rotate_layout": "half_chunk",
+            },
+        }
 
     def forward(self, x, timestep, text, text_mask=None):
         if x.ndim != 5:
