@@ -23,6 +23,8 @@ export YISU_IMAGE_PERSISTENT_DECODER=1
 
 # NCCL 只在 WARN 及以上时输出: 平时静默, 通信异常(超时/降级/连接失败)时能看到原因
 export NCCL_DEBUG=WARN
+# 打印每次 dynamo 重编译的具体 guard 失败原因, 用于定位反复重编译的元凶
+export TORCH_LOGS=recompiles
 
 CONFIG="${CONFIG:-${1:-configs/stage_1.yaml}}"
 GPUS="${NPROC_PER_NODE:-${GPUS:-8}}"
@@ -63,6 +65,18 @@ RUN_LOG_DIR="$OUTPUT_DIR/logs/$RUN_ID"
 mkdir -p "$RUN_LOG_DIR"
 export GIGA_RUN_LOG_DIR="$RUN_LOG_DIR"
 export GIGA_NODE_RANK="$RANK"
+
+# torch.compile/Triton 编译缓存放共享存储 (OUTPUT_DIR 在 PFS 上, 所有机器可见):
+# 重启/换机零重编译。首次启用时把本机 /tmp 的 warm 缓存一次性搬入, 保留已完成的 warmup。
+COMPILE_CACHE_DIR="$OUTPUT_DIR/compile_cache"
+if [[ ! -e "$COMPILE_CACHE_DIR/.ready" ]]; then
+  mkdir -p "$COMPILE_CACHE_DIR/inductor" "$COMPILE_CACHE_DIR/triton"
+  [[ -d /tmp/torchinductor_root ]] && cp -a /tmp/torchinductor_root/. "$COMPILE_CACHE_DIR/inductor/" || true
+  [[ -d "$HOME/.triton/cache" ]] && cp -a "$HOME/.triton/cache/." "$COMPILE_CACHE_DIR/triton/" || true
+  touch "$COMPILE_CACHE_DIR/.ready"
+fi
+export TORCHINDUCTOR_CACHE_DIR="$COMPILE_CACHE_DIR/inductor"
+export TRITON_CACHE_DIR="$COMPILE_CACHE_DIR/triton"
 
 CMD=(torchrun \
   --nproc_per_node "$GPUS" \
