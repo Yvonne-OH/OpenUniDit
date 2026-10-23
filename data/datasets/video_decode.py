@@ -517,8 +517,8 @@ def _bound_image(image, target_width, target_height):
     return image
 
 
-def read_images(path, width, height, condition_path=None, style="cover"):
-    cache = {}
+def read_images(path, width, height, condition_path=None, style="cover", records=None):
+    cache = {} if records is None else records
     result = []
     for source in (path, condition_path) if condition_path else (path,):
         pixels = read_image(source, cache, target_width=width, target_height=height)
@@ -937,7 +937,27 @@ def _persistent_decode_request(request, timeout):
 
 def decode_isolated(request, timeout, context):
     """Use a resident LMDB decoder for metadata; isolate native media decoding."""
-    if (os.environ.get('YISU_MEDIA_PERSISTENT_DECODER', '0') == '1'
+    persistent_images = (os.environ.get('YISU_IMAGE_PERSISTENT_DECODER', '0') == '1'
+                         and request.get('kind') in ('image', 'images'))
+    if persistent_images:
+        # 常驻子进程解码图像: 省去每样本 fork + import + lmdb env open;
+        # 大数组经 /dev/shm npy 回传; 任何故障回退到一次性隔离路径, 保持候选重试语义。
+        request = dict(request)
+        request.pop('_trace_context', None)
+        output = tempfile.mkstemp(prefix='yisu-img-', suffix='.npy', dir='/dev/shm')[1]
+        try:
+            _persistent_decode_request(dict(request, _output_path=output), timeout)
+            pixels = np.load(output, allow_pickle=False)
+            return pixels
+        except Exception:
+            # 常驻通道故障或样本级解码失败 → 一次性路径给出权威的 categorized error
+            pass
+        finally:
+            try:
+                os.unlink(output)
+            except OSError:
+                pass
+    elif (os.environ.get('YISU_MEDIA_PERSISTENT_DECODER', '0') == '1'
             and request.get('kind') in ('record', 'video_record')):
         request = dict(request)
         request.pop('_trace_context', None)
@@ -1032,9 +1052,35 @@ def decode_isolated(request, timeout, context):
 
 
 def persistent_main():
+    import resource
+    # 与一次性 child 同源的资源护栏, 但 RLIMIT_AS 放宽: LMDB env 按 mdb 全尺寸 mmap,
+    # 虚拟地址空间不等于物理占用 (touched pages 才计数), 2GB 会立刻爆掉。
+    memory_limit = int(os.environ.get('YISU_MEDIA_PERSISTENT_MEMORY_BYTES', str(64 * 1024**3)))
+    if memory_limit > 0:
+        _, hard = resource.getrlimit(resource.RLIMIT_AS)
+        limit = min(memory_limit, hard) if hard != resource.RLIM_INFINITY else memory_limit
+        resource.setrlimit(resource.RLIMIT_AS, (limit, hard))
     decoder = PersistentDecoder(os.environ.get('YISU_MEDIA_LMDB_MAX_ENVS', '8'))
     global _PERSISTENT_DECODER
     _PERSISTENT_DECODER = decoder
+
+    class _LruRecords(dict):
+        """read_image 直接以 records[key]=record 写入; 插入即驱逐, 防止常驻子进程内存无界。"""
+        def __init__(self, max_entries):
+            super().__init__()
+            self._max = max(0, int(max_entries))
+            self._order = OrderedDict()
+
+        def __setitem__(self, key, value):
+            super().__setitem__(key, value)
+            self._order[key] = None
+            self._order.move_to_end(key)
+            while self._max and len(self._order) > self._max:
+                oldest, _ = self._order.popitem(last=False)
+                super().__delitem__(oldest)
+
+    # 图像 record LRU: 过采样桶的重复样本命中缓存跳过重复 LMDB 读; 含 img_bytes, 有界
+    record_cache = _LruRecords(os.environ.get('YISU_IMAGE_RECORD_CACHE', '64'))
     for line in sys.stdin:
         try:
             request = json.loads(line)
@@ -1044,6 +1090,13 @@ def persistent_main():
             elif kind == 'video_record':
                 request['root'] = request.pop('path')
                 result = read_video_record(**request)
+            elif kind in ('image', 'images'):
+                output_path = request.pop('_output_path')
+                request['records'] = record_cache
+                pixels = read_image(**request) if kind == 'image' else read_images(**request)
+                np.save(output_path, pixels, allow_pickle=False)
+                print(json.dumps({'ok': True, 'result': {'output': output_path}}), flush=True)
+                continue
             else:
                 raise ValueError(f'unsupported persistent kind: {kind}')
             print(json.dumps({'ok': True, 'result': result}), flush=True)

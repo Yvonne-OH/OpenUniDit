@@ -17,6 +17,8 @@ fi
 # 单次尝试有效超时 = min(YISU_IMAGE_TIMEOUT_SECONDS, 样本预算/剩余候选数)。
 export YISU_IMAGE_TIMEOUT_SECONDS=48
 export YISU_IMAGE_SAMPLE_TIMEOUT_SECONDS=48
+# 常驻图像解码子进程: 免每样本 fork+import+lmdb env open; 故障自动回退一次性隔离路径
+export YISU_IMAGE_PERSISTENT_DECODER=1
 
 CONFIG="${CONFIG:-${1:-configs/stage_1.yaml}}"
 GPUS="${NPROC_PER_NODE:-${GPUS:-8}}"
