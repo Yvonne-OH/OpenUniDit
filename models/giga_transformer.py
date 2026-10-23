@@ -81,6 +81,9 @@ class GigaBlock(nn.Module):
         self.norm1 = RMSNorm(dim)
         self.norm2 = RMSNorm(dim)
         self.qkv = nn.Linear(dim, dim * 3, bias=False)
+        head_dim = dim // heads
+        self.q_norm = RMSNorm(head_dim)
+        self.k_norm = RMSNorm(head_dim)
         self.out = nn.Linear(dim, dim, bias=False)
         self.ff = nn.Sequential(nn.Linear(dim, ffn_dim, bias=False), nn.SiLU(), nn.Linear(ffn_dim, dim, bias=False))
         self.mod = nn.Linear(dim, dim * 6)
@@ -90,6 +93,8 @@ class GigaBlock(nn.Module):
         y = self.norm1(x) * (1 + scale_a[:, None]) + shift_a[:, None]
         q, k, v = self.qkv(y).chunk(3, -1)
         b, n, _ = q.shape
+        q = self.q_norm(q.view(b, n, self.heads, -1)).view(b, n, -1)
+        k = self.k_norm(k.view(b, n, self.heads, -1)).view(b, n, -1)
         # pack 非 None 时表示右 padding 文本 → 走 varlen 只算有效前缀; 否则 mask=None 走 dense FA3
         if _FA3 and q.is_cuda and q.dtype in (torch.bfloat16, torch.float16) and (attention_mask is None or pack is not None):
             # FA3 layout [B, S, H, D]; cos/sin broadcast as [1, S, 1, D]
@@ -164,6 +169,7 @@ class GigaExpTransformer(nn.Module):
             "implementation": {
                 "version": "giga_semantics_v1",
                 "rope": "fp32_cos_sin_and_rotation",
+                "qk_norm": "per_head_rms_norm",
                 "rotate_layout": "half_chunk",
             },
         }
@@ -183,12 +189,13 @@ class GigaExpTransformer(nn.Module):
         n_total = n_img + text.shape[1]
         attention_mask = None
         pack = None
-        if text_mask is not None and not text_mask.bool().all().item():
+        if text_mask is not None:
             valid_text = text_mask.bool()
             attention_mask = torch.cat((torch.ones((b, n_img), device=x.device, dtype=torch.bool),
                                         valid_text), dim=1)[:, None, None, :]
             if _FA3:
-                # 每样本有效 token 是连续前缀 (image 全有效 + text 右侧 padding), varlen 跳过 padding 计算
+                # 每样本有效 token 是连续前缀 (image 全有效 + text 右侧 padding), varlen 跳过 padding 计算。
+                # 不调用 any/all/max().item(): 避免 torch.compile 下的 GPU→CPU 同步和 graph break。
                 lens = n_img + valid_text.sum(-1)  # [b] 每样本有效长度
                 cu_seqlens = torch.zeros(b + 1, device=x.device, dtype=torch.int32)
                 cu_seqlens[1:] = lens.cumsum(0).to(torch.int32)
@@ -196,8 +203,8 @@ class GigaExpTransformer(nn.Module):
                 valid2d = cols[None, :] < lens[:, None]  # [b, n_total] 有效前缀掩码
                 pack_idx = (torch.arange(b, device=x.device)[:, None] * n_total + cols[None, :])[valid2d]
                 pos_idx = cols[None, :].expand(b, -1)[valid2d]  # cos/sin 按 [n_total] 位置索引
-                # max_seqlen 向上取整到 128: 仅作 kernel 分块上界, 减少动态 shape 重编译次数
-                max_seqlen = (int(lens.max().item()) + 127) & ~127
+                # 使用静态总长度作为 kernel 上界，避免将动态 lens.max() 同步到 CPU。
+                max_seqlen = n_total
                 pack = (pack_idx, pos_idx, cu_seqlens, max_seqlen)
         x = torch.cat((image, text), 1)
         ts = timestep.float().reshape(-1).expand(b)

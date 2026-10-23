@@ -151,8 +151,8 @@ training:
   checkpointing_steps: 2500
   state_checkpoints_keep: 2      # DeepSpeed 完整 state 只保留最近 2 个, 纯 weights 快照全部保留
   # auto: 自动恢复 output_dir 下最新 state/weights；none: 不恢复；也可填 .safetensors/.pt 文件或 weights 目录路径，强制从指定纯权重恢复。
-  resume_mode: auto
-  resume_optimizer: true
+  resume_mode: /home/jovyan/pfs/users/zhanqian.wu/exp/giga_exp_image/stage_1_28layers/checkpoints/weights/step-00025000.safetensors #auto
+  resume_optimizer: false 
   resume_lr_scheduler: true
 
 logging:
@@ -162,4 +162,4 @@ logging:
   wandb:
     enabled: true
     project: giga-exp-image
-    name: giga_exp_image_stage_1_28layers
+    name: giga_exp_image_stage_1_28layers_1023

@@ -74,6 +74,26 @@ class ModelMathTests(unittest.TestCase):
                                  heads=2, ffn_dim=64, layers=2,
                                  rope_axes_dims=(4,4,4,4), patch_size=(1,2,2))
 
+    def test_qk_norm_is_per_head_and_active(self):
+        m = self.model()
+        self.assertEqual(tuple(m.blocks[0].q_norm.weight.shape), (16,))
+        self.assertEqual(tuple(m.blocks[0].k_norm.weight.shape), (16,))
+        with torch.no_grad():
+            m.blocks[0].q_norm.weight.fill_(2.0)
+            m.blocks[0].k_norm.weight.fill_(3.0)
+        x = torch.randn(1, 4, 1, 6, 8)
+        text = torch.randn(1, 3, 12)
+        captured = {}
+        m.blocks[0].q_norm.register_forward_hook(lambda _, __, output: captured.setdefault("q", output.detach()))
+        m.blocks[0].k_norm.register_forward_hook(lambda _, __, output: captured.setdefault("k", output.detach()))
+        m(x, torch.tensor([100.]), text, torch.ones(1, 3, dtype=torch.bool))
+        self.assertTrue(torch.isfinite(captured["q"]).all())
+        self.assertTrue(torch.isfinite(captured["k"]).all())
+        q_rms = captured["q"].square().mean(-1).sqrt()
+        k_rms = captured["k"].square().mean(-1).sqrt()
+        torch.testing.assert_close(q_rms, torch.full_like(q_rms, 2.0), atol=2e-5, rtol=2e-5)
+        torch.testing.assert_close(k_rms, torch.full_like(k_rms, 3.0), atol=2e-5, rtol=2e-5)
+
     def test_mask_gradient_and_batch_invariance(self):
         m = self.model()
         x = torch.randn(2,4,1,6,8, requires_grad=True)
@@ -162,8 +182,9 @@ class ModelMathTests(unittest.TestCase):
                               heads=2, ffn_dim=64, layers=2, rope_axes_dims=(4,4,4,4), patch_size=(1,2,2))
                 config.update(changes)
                 target = GigaExpTransformer(**config)
-                self.assertEqual({k: v.shape for k,v in model.state_dict().items()},
-                                 {k: v.shape for k,v in target.state_dict().items()})
+                if changes == {"rope_theta": 123.0}:
+                    self.assertEqual({k: v.shape for k,v in model.state_dict().items()},
+                                     {k: v.shape for k,v in target.state_dict().items()})
                 with self.assertLogs("giga_exp", level="WARNING") as logs, mock.patch("builtins.print") as console:
                     train_exp.load_init_weights(target, path)
                 self.assertIn("old=", logs.output[0])

@@ -39,10 +39,11 @@ import models.giga_transformer as _giga_transformer
 
 
 def collate(batch):
-    result = collate_image_batch(batch)
     # decode 输出每样本已是 [C,T=1,H,W], collate 后 [B,C,T,H,W], Wan VAE 与模型直接可用, 不再 unsqueeze
-    result["pixel_values"] = torch.from_numpy(result["pixel_values"])
-    return result
+    # 保持 numpy 传输 (collate_image_batch 的设计意图): torch tensor 经 mp queue 会写 /dev/shm
+    # (float32 batch≈12.6MB), 8卡×4worker×4prefetch 贴满 shm 上限后 DataLoader 卡死;
+    # numpy 走管道 pickle, 不触发 shm 分配。主进程侧再用 torch.from_numpy 转换。
+    return collate_image_batch(batch)
 
 
 def _data_error_category(exc):
@@ -498,7 +499,7 @@ def run_next_batch_validation(engine, vae, tokenizer, text_encoder, device, dtyp
     import textwrap
     from PIL import Image, ImageDraw
     tc, val_cfg = cfg["components"]["text_encoder"], cfg["validation"]
-    pixels = batch["pixel_values"].to(device)  # [B,C,T=1,H,W] in [-1,1]
+    pixels = torch.from_numpy(batch["pixel_values"]).to(device)  # [B,C,T=1,H,W] in [-1,1]
     prompts = [str(c).strip() or tokenizer.eos_token for c in batch["captions"]]
     negative_prompts = [tokenizer.eos_token] * len(prompts)
     inputs = tokenizer(prompts + negative_prompts, return_tensors="pt", padding=True, truncation=True, max_length=tc.get("max_length", 512)).to(device)
@@ -753,6 +754,11 @@ def main():
         wandb_dir = output_dir / "wandb"
         wandb_dir.mkdir(exist_ok=True)
         run_file = wandb_dir / "run.json"
+        # 策略: 同一 output 永远复用同一个 wandb run —— id 持久化在 run.json, 所有重启以
+        # resume="allow" 续写; 显式 step= 与云端曲线保持训练 step 对齐。
+        # 已知边界: 从 ckpt 回滚恢复时本地 step 可能小于服务端已记录 step, wandb 会按单调性
+        # 丢弃更早日志 (库的公开行为); 如需重建曲线, 删除 run.json 换新 run, 禁止改 wandb
+        # 内部状态 (_starting_step/_local_step) 或重定义指标轴。
         # 新版 wandb 移除了 wandb.util.generate_id, uuid4().hex (32位) 满足 wandb run id 要求
         run_id = json.loads(run_file.read_text())["id"] if run_file.exists() else uuid.uuid4().hex
         run_file.write_text(json.dumps({"id": run_id}))
@@ -803,7 +809,7 @@ def main():
                 continue
             consecutive_batch_skips = 0
             pending_batch = None
-            pixels = batch["pixel_values"].to(device)
+            pixels = torch.from_numpy(batch["pixel_values"]).to(device)
             captions = batch["captions"]
             last_captions = captions
             with torch.no_grad():
