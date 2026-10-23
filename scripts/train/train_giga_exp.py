@@ -35,6 +35,7 @@ from transformers import AutoModel, AutoTokenizer
 from data.lmdb_dataset import GigaLMDBDataset, collate_image_batch
 from data.samplers.bucket_sampler import BucketBatchSampler
 from models.giga_transformer import GigaExpTransformer
+import models.giga_transformer as _giga_transformer
 
 
 def collate(batch):
@@ -599,6 +600,7 @@ def print_banner(cfg, rank):
     print(f"{red}{'=' * 74}{reset}", flush=True)
     print("🧠 Giga-Exp stage_1 | T2V-only flow matching (T=1, video-ready)", flush=True)
     print(f"📐 DiT: dim={model['dim']} layers={model['layers']} heads={model['heads']} ffn={model['ffn_dim']} head_dim={model['dim'] // model['heads']}", flush=True)
+    print(f"⚡ 加速: torch.compile={'ON (dynamic)' if cfg['training'].get('torch_compile') else 'off'} | FA3={'READY (varlen 支持右 padding)' if _giga_transformer._FA3 else 'MISSING (SDPA 回退)'}", flush=True)
     print(f"🌀 RoPE: axes(t/h/w)={model['rope_axes_dims']} theta={model['rope_theta']} — time axis retained for video", flush=True)
     print(f"📝 Text encoder: {cfg['components']['text_encoder']['pretrained_path']}", flush=True)
     print(f"🎞️  VAE: {cfg['components']['wan_vae']['pretrained_path']} (48ch)", flush=True)
@@ -639,6 +641,16 @@ def main():
     text_encoder = build_text_encoder(tc, dtype, device)
     vae = AutoencoderKLWan.from_pretrained(dc["pretrained_path"], subfolder=dc.get("subfolder", "vae"), torch_dtype=torch.float32, local_files_only=True).eval().to(device)
     model = GigaExpTransformer(**cfg["model"]).to(device, dtype=dtype)
+    if cfg["training"].get("torch_compile"):
+        # nn.Module.compile 就地编译: 参数名/state_dict 结构不变, 与 DeepSpeed/优化器分组/断点恢复兼容。
+        # 注意: 此处不能写 "import torch._dynamo" —— 函数内 import torch.* 会把 torch 绑定为 main 的局部变量,
+        # 导致更早执行的 torch.device(...) 抛 UnboundLocalError; from-import 只绑定 dynamo_config, 无此问题。
+        from torch._dynamo import config as dynamo_config
+        dynamo_config.cache_size_limit = 64  # text 长度动态变化, 放宽 guard 缓存避免反复重编译
+        model.compile(dynamic=True)
+        if rank == 0:
+            _blue_print("⚡ torch.compile 已启用 (dynamic=True): 前几步为编译 warmup, step 耗时会先长后短, 属正常现象")
+            logging.getLogger("giga_exp").info("torch.compile enabled (dynamic=True), first steps are compile warmup")
     latents_mean, latents_std_inv = wan_latent_stats(vae, device)
     for parameter in (*text_encoder.parameters(), *vae.parameters()):
         parameter.requires_grad_(False)

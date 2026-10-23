@@ -7,6 +7,7 @@ import torch.nn.functional as F
 
 try:  # FA3 (FlashAttention 3), copied under model_exp/thirdparty
     from flash_attn_interface import flash_attn_func as _fa3_func
+    from flash_attn_interface import flash_attn_varlen_func as _fa3_varlen
     _FA3 = True
 except Exception:
     _FA3 = False
@@ -84,23 +85,37 @@ class GigaBlock(nn.Module):
         self.ff = nn.Sequential(nn.Linear(dim, ffn_dim, bias=False), nn.SiLU(), nn.Linear(ffn_dim, dim, bias=False))
         self.mod = nn.Linear(dim, dim * 6)
 
-    def forward(self, x, cond, cos, sin, attention_mask=None):
+    def forward(self, x, cond, cos, sin, attention_mask=None, pack=None):
         shift_a, scale_a, gate_a, shift_f, scale_f, gate_f = self.mod(cond).chunk(6, -1)
         y = self.norm1(x) * (1 + scale_a[:, None]) + shift_a[:, None]
         q, k, v = self.qkv(y).chunk(3, -1)
         b, n, _ = q.shape
-        if _FA3 and attention_mask is None and q.is_cuda and q.dtype in (torch.bfloat16, torch.float16):
+        # pack 非 None 时表示右 padding 文本 → 走 varlen 只算有效前缀; 否则 mask=None 走 dense FA3
+        if _FA3 and q.is_cuda and q.dtype in (torch.bfloat16, torch.float16) and (attention_mask is None or pack is not None):
             # FA3 layout [B, S, H, D]; cos/sin broadcast as [1, S, 1, D]
-            cos = cos[None, :, None, :]
-            sin = sin[None, :, None, :]
             q = q.view(b, n, self.heads, -1)
             k = k.view(b, n, self.heads, -1)
             v = v.view(b, n, self.heads, -1)
+            if pack is not None:
+                pack_idx, pos_idx, cu_seqlens, max_seqlen = pack
+                q = q.reshape(b * n, self.heads, -1).index_select(0, pack_idx)
+                k = k.reshape(b * n, self.heads, -1).index_select(0, pack_idx)
+                v = v.reshape(b * n, self.heads, -1).index_select(0, pack_idx)
+                cos = cos.index_select(0, pos_idx)[:, None, :]
+                sin = sin.index_select(0, pos_idx)[:, None, :]
+            else:
+                cos = cos[None, :, None, :]
+                sin = sin[None, :, None, :]
             # RoPE 旋转在 fp32 中完成, 避免 bf16 cos/sin 相位量化; FA3 要求原始 dtype
             qf, kf = q.float(), k.float()
             q = (qf * cos + rotate_half(qf) * sin).to(v.dtype)
             k = (kf * cos + rotate_half(kf) * sin).to(v.dtype)
-            a = _fa3_func(q, k, v, causal=False).reshape(b, n, -1)
+            if pack is not None:
+                a = _fa3_varlen(q, k, v, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen)
+                # pad 位置回填 0: out 无 bias, 0 输入得 0 输出, residual 流不受影响
+                a = q.new_zeros(b * n, self.heads, v.shape[-1]).index_copy(0, pack_idx, a).view(b, n, -1)
+            else:
+                a = _fa3_func(q, k, v, causal=False).reshape(b, n, -1)
         else:
             q = q.view(b, n, self.heads, -1).transpose(1, 2)
             k = k.view(b, n, self.heads, -1).transpose(1, 2)
@@ -164,11 +179,26 @@ class GigaExpTransformer(nn.Module):
         image = x.reshape(b, self.in_channels, t, pt, h, ph, w, pw)
         image = self.patch_in(image.permute(0, 2, 4, 6, 3, 5, 7, 1).reshape(b, t * h * w, -1))
         text = self.text_in(text)
+        n_img = image.shape[1]
+        n_total = n_img + text.shape[1]
         attention_mask = None
+        pack = None
         if text_mask is not None and not text_mask.bool().all().item():
-            valid_keys = torch.cat((torch.ones((b, image.shape[1]), device=x.device, dtype=torch.bool),
-                                    text_mask.bool()), dim=1)
-            attention_mask = valid_keys[:, None, None, :]
+            valid_text = text_mask.bool()
+            attention_mask = torch.cat((torch.ones((b, n_img), device=x.device, dtype=torch.bool),
+                                        valid_text), dim=1)[:, None, None, :]
+            if _FA3:
+                # 每样本有效 token 是连续前缀 (image 全有效 + text 右侧 padding), varlen 跳过 padding 计算
+                lens = n_img + valid_text.sum(-1)  # [b] 每样本有效长度
+                cu_seqlens = torch.zeros(b + 1, device=x.device, dtype=torch.int32)
+                cu_seqlens[1:] = lens.cumsum(0).to(torch.int32)
+                cols = torch.arange(n_total, device=x.device)
+                valid2d = cols[None, :] < lens[:, None]  # [b, n_total] 有效前缀掩码
+                pack_idx = (torch.arange(b, device=x.device)[:, None] * n_total + cols[None, :])[valid2d]
+                pos_idx = cols[None, :].expand(b, -1)[valid2d]  # cos/sin 按 [n_total] 位置索引
+                # max_seqlen 向上取整到 128: 仅作 kernel 分块上界, 减少动态 shape 重编译次数
+                max_seqlen = (int(lens.max().item()) + 127) & ~127
+                pack = (pack_idx, pos_idx, cu_seqlens, max_seqlen)
         x = torch.cat((image, text), 1)
         ts = timestep.float().reshape(-1).expand(b)
         half = 128
@@ -177,7 +207,7 @@ class GigaExpTransformer(nn.Module):
         cond = self.time_in(emb.to(self.time_in[0].weight.dtype))
         cos, sin = self.rope(t, h, w, text.shape[1], x.device, x.dtype)
         for block in self.blocks:
-            x = block(x, cond, cos, sin, attention_mask)
+            x = block(x, cond, cos, sin, attention_mask, pack)
         image = self.out(self.norm(x[:, :t * h * w]))
         image = image.reshape(b, t, h, w, pt, ph, pw, self.out_channels)
         return image.permute(0, 7, 1, 4, 2, 5, 3, 6).reshape(b, self.out_channels, t * pt, h * ph, w * pw)

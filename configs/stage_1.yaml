@@ -92,28 +92,22 @@ dataset:
   contract: "[B,C,T,H,W]"
   num_frames: 1
   preprocess_style: cover   # 短边贴桶+中心裁剪, 无黑边 (实测 resize_long_edge 加权后 37% 样本补黑 >1%)
-  resolution: 192
-  long_edge: 192
-  max_upscale_ratio: 1.2
+  resolution: 512
+  long_edge: 512
+  max_upscale_ratio: 1.2    # 512 桶要求源图短边 >= 427px (抽样: blip3o/fine_t2i/sa1b 等 92~100% 合格, 仅 HumanCaption-10M ~52%)
   max_retries: 16
-  refresh_index_cache: false   # 首次在 output/dataset_index_cache 构建后复用, 不重复加载
+  refresh_index_cache: false   # 索引指纹不含 buckets, 换桶复用缓存; 桶归属在加载后按 width/height 重算
   index_cache_dir: /home/jovyan/pfs/users/zhanqian.wu/exp/giga_exp_image/stage_1/dataset_index_cache
   buckets:
-    - 128_square
-    - 128x96
-    - 96x128
-    - 192_square
-    - 192x128
-    - 128x192
-  # 桶耗尽后不再回绕重复: 不足的 batch 由同比例高分桶借图降采样补足 (192_square→128_square),
-  # 无同比例高分桶时整批自动切换到仍有余量的桶。
+    - 512_square
+    - 512x384
+    - 384x512
+  # 桶耗尽后不再回绕重复: 不足的 batch 由同比例高分桶借图降采样补足,
+  # 单一分辨率层无同比例高分桶时, 整批自动切换到仍有余量的桶。
   bucket_sampling_weights:
-    128_square: 0.25
-    128x96: 0.15
-    96x128: 0.15
-    192_square: 0.20
-    192x128: 0.125
-    128x192: 0.125
+    512_square: 0.45
+    512x384: 0.275
+    384x512: 0.275
 
 validation:
   enabled: true
@@ -128,16 +122,20 @@ training:
   enabled: true
   t2v_only: true
   cfg_dropout: 0.1
-  batch_size_per_device: 2
+  batch_size_per_device: 4
   num_workers: 4
   max_epochs: 5
   mixed_precision: bf16
-  optimizer: muon+adam
+  optimizer: adamw
+  # 已从 muon+adam 切换回纯 AdamW: hidden 2D 矩阵与 out 头/1D 参数统一走 AdamW (base lr, Muon 3x 系数不再生效)。
+  # 注意: 优化器结构变化, 续训时旧 checkpoint 的 optimizer state 不匹配, 会自动降级为纯权重恢复
+  # (step 保留, optimizer 状态重置), 日志有 ⚠️ 提示, 属预期行为。
+  # 就地编译 DiT (nn.Module.compile, 数学等价): 融合每层 norm/adaLN/RoPE 小 kernel, 缓解 28 层 launch overhead;
+  # 前几步为编译 warmup, step 耗时先长后短属正常
+  torch_compile: true
   muon:
-    enabled: true
+    enabled: false               # 如需切回 muon+adam: enabled 改 true, optimizer 改 muon+adam
     momentum: 0.95
-    # Muon 只作用于 hidden 2D 矩阵 (out 头/bias/norm 走 AdamW); match_rms_adamw 下 update RMS ≈ 0.2*lr,
-    # 实测同 lr 收敛偏慢, 设为 AdamW base lr 的 3 倍系数 ("3x", 也支持绝对值如 3.0e-4); 扫描 5.4e-4 更快但保守取 3x.
     learning_rate: 3x
     adjust_lr_fn: match_rms_adamw
     weight_decay: 0.0
@@ -150,7 +148,7 @@ training:
   lr_scheduler: cosine
   lr_warmup_steps: 200
   gradient_accumulation_steps: 1
-  checkpointing_steps: 5000
+  checkpointing_steps: 2500
   state_checkpoints_keep: 2      # DeepSpeed 完整 state 只保留最近 2 个, 纯 weights 快照全部保留
   # auto: 自动恢复 output_dir 下最新 state/weights；none: 不恢复；也可填 .safetensors/.pt 文件或 weights 目录路径，强制从指定纯权重恢复。
   resume_mode: auto

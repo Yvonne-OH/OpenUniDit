@@ -4,6 +4,20 @@ set -euo pipefail
 ROOT="/home/jovyan/pfs/users/zhanqian.wu/code/model_exp"
 cd "$ROOT"
 
+# 修复 CUDA Error 803: ldconfig 优先命中 cuda-12.8/compat 的旧版 libcuda (570.86.10),
+# 与驱动 (nvidia-smi 所报版本) 不匹配; 预加载 /usr/lib 下与驱动同版本的 libcuda。
+DRIVER_VER="$(nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -1)"
+LIBCUDA="/usr/lib/x86_64-linux-gnu/libcuda.so.${DRIVER_VER}"
+if [[ -f "$LIBCUDA" && ":${LD_PRELOAD:-}:" != *":$(basename "$LIBCUDA"):*" ]]; then
+  export LD_PRELOAD="${LD_PRELOAD:+${LD_PRELOAD}:}${LIBCUDA}"
+fi
+
+# 图像样本加载超时预算: DecodeBudget 将样本预算均分给最多 3 个候选 (48/3=16s/次),
+# 避免多机 192 路并发冷缓存启动时, Lustre 首读 ~11s 的样本被判超时换图。
+# 单次尝试有效超时 = min(YISU_IMAGE_TIMEOUT_SECONDS, 样本预算/剩余候选数)。
+export YISU_IMAGE_TIMEOUT_SECONDS=48
+export YISU_IMAGE_SAMPLE_TIMEOUT_SECONDS=48
+
 CONFIG="${CONFIG:-${1:-configs/stage_1.yaml}}"
 GPUS="${NPROC_PER_NODE:-${GPUS:-8}}"
 
