@@ -12,6 +12,12 @@ try:  # FA3 (FlashAttention 3), copied under model_exp/thirdparty
 except Exception:
     _FA3 = False
 
+# FA3 varlen 的 max_seqlen 必须是 host 端常量: 若传随 batch 变化的 n_total, inductor 会按
+# 数值区间 (<=1536 / >1536) 反复特化重编译, 每次重编译所有 rank 在梯度 allreduce 上干等数分钟。
+# 上界 = 最大桶 (512px -> latent 64x64 -> patch 2x2 -> 1024 图像 token) + max_length(512)。
+# 换更大分辨率桶或更长文本时必须同步调大, 否则 forward 里会显式报错。
+MAX_VARLEN_SEQLEN = 1536
+
 
 class RMSNorm(nn.Module):
     def __init__(self, dim, eps=1e-6):
@@ -203,8 +209,10 @@ class GigaExpTransformer(nn.Module):
                 valid2d = cols[None, :] < lens[:, None]  # [b, n_total] 有效前缀掩码
                 pack_idx = (torch.arange(b, device=x.device)[:, None] * n_total + cols[None, :])[valid2d]
                 pos_idx = cols[None, :].expand(b, -1)[valid2d]  # cos/sin 按 [n_total] 位置索引
-                # 使用静态总长度作为 kernel 上界，避免将动态 lens.max() 同步到 CPU。
-                max_seqlen = n_total
+                # max_seqlen 用常量上界, FA3 kernel 只编译一次; 越界显式报错, 防止 kernel 静默截断算错
+                if n_total > MAX_VARLEN_SEQLEN:
+                    raise ValueError(f"n_total={n_total} 超过 MAX_VARLEN_SEQLEN={MAX_VARLEN_SEQLEN}, 请调大上界")
+                max_seqlen = MAX_VARLEN_SEQLEN
                 pack = (pack_idx, pos_idx, cu_seqlens, max_seqlen)
         x = torch.cat((image, text), 1)
         ts = timestep.float().reshape(-1).expand(b)
