@@ -521,21 +521,25 @@ def run_next_batch_validation(engine, vae, tokenizer, text_encoder, device, dtyp
 
     engine.eval()
     try:
-        for i in range(num_steps):  # σ: 1(噪声) → 0(数据), v = noise - data
-            sigma = shift_sigma(1.0 - i / num_steps)
-            next_sigma = shift_sigma(1.0 - (i + 1) / num_steps)
-            model_input = x.to(dtype)
-            timestep = torch.full((b,), sigma * 1000.0, device=device)
-            v_all = engine(
-                torch.cat((model_input, model_input), 0),
-                torch.cat((timestep, timestep), 0),
-                torch.cat((neg, text), 0),
-                torch.cat((neg_mask, mask), 0),
-            ).float()
-            v_uncond, v_cond = v_all.chunk(2, 0)
-            guidance_scale = float(val_cfg.get("guidance_scale", 3.0))
-            v = v_uncond + guidance_scale * (v_cond - v_uncond)
-            x = x - v * (sigma - next_sigma)
+        # 验证 batch 形状与训练不同, 会触发 Inductor 重编译; 其异步编译子进程一旦死亡,
+        # 主进程会永久等待 (无任何报错, NCCL watchdog 也不管) —— 21:59 卡死即此因。
+        # torch.compiler.disable 让 compile 过的模型直接回退 eager, 验证彻底不碰编译。
+        with torch.compiler.disable():
+            for i in range(num_steps):  # σ: 1(噪声) → 0(数据), v = noise - data
+                sigma = shift_sigma(1.0 - i / num_steps)
+                next_sigma = shift_sigma(1.0 - (i + 1) / num_steps)
+                model_input = x.to(dtype)
+                timestep = torch.full((b,), sigma * 1000.0, device=device)
+                v_all = engine(
+                    torch.cat((model_input, model_input), 0),
+                    torch.cat((timestep, timestep), 0),
+                    torch.cat((neg, text), 0),
+                    torch.cat((neg_mask, mask), 0),
+                ).float()
+                v_uncond, v_cond = v_all.chunk(2, 0)
+                guidance_scale = float(val_cfg.get("guidance_scale", 3.0))
+                v = v_uncond + guidance_scale * (v_cond - v_uncond)
+                x = x - v * (sigma - next_sigma)
     finally:
         engine.train()
     gen = vae.decode(x / std_inv + mean).sample
@@ -648,6 +652,9 @@ def main():
         # 导致更早执行的 torch.device(...) 抛 UnboundLocalError; from-import 只绑定 dynamo_config, 无此问题。
         from torch._dynamo import config as dynamo_config
         dynamo_config.cache_size_limit = 64  # text 长度动态变化, 放宽 guard 缓存避免反复重编译
+        # 输入所有维度默认按 dynamic 编译, 从源头消除"新 shape → 中途重编译"风暴:
+        # 单 rank 重编译时其余 rank 会在梯度 allreduce 上干等数分钟, 表现为整卡集体假死。
+        dynamo_config.assume_static_by_default = False
         model.compile(dynamic=True)
         if rank == 0:
             _blue_print("⚡ torch.compile 已启用 (dynamic=True): 前几步为编译 warmup, step 耗时会先长后短, 属正常现象")

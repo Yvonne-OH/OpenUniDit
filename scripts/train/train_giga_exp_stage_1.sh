@@ -21,6 +21,9 @@ export YISU_IMAGE_SAMPLE_TIMEOUT_SECONDS=48
 # 常驻图像解码子进程: 免每样本 fork+import+lmdb env open; 故障自动回退一次性隔离路径
 export YISU_IMAGE_PERSISTENT_DECODER=1
 
+# NCCL 只在 WARN 及以上时输出: 平时静默, 通信异常(超时/降级/连接失败)时能看到原因
+export NCCL_DEBUG=WARN
+
 CONFIG="${CONFIG:-${1:-configs/stage_1.yaml}}"
 GPUS="${NPROC_PER_NODE:-${GPUS:-8}}"
 

@@ -132,7 +132,7 @@ training:
   # (step 保留, optimizer 状态重置), 日志有 ⚠️ 提示, 属预期行为。
   # 就地编译 DiT (nn.Module.compile, 数学等价): 融合每层 norm/adaLN/RoPE 小 kernel, 缓解 28 层 launch overhead;
   # 前几步为编译 warmup, step 耗时先长后短属正常
-  torch_compile: true
+  torch_compile: true #true
   muon:
     enabled: false               # 如需切回 muon+adam: enabled 改 true, optimizer 改 muon+adam
     momentum: 0.95
@@ -151,7 +151,7 @@ training:
   checkpointing_steps: 2500
   state_checkpoints_keep: 2      # DeepSpeed 完整 state 只保留最近 2 个, 纯 weights 快照全部保留
   # auto: 自动恢复 output_dir 下最新 state/weights；none: 不恢复；也可填 .safetensors/.pt 文件或 weights 目录路径，强制从指定纯权重恢复。
-  resume_mode: /home/jovyan/pfs/users/zhanqian.wu/exp/giga_exp_image/stage_1_28layers/checkpoints/weights/step-00025000.safetensors #auto
+  resume_mode: auto #/home/jovyan/pfs/users/zhanqian.wu/exp/giga_exp_image/stage_1_28layers/checkpoints/weights/step-00035000.safetensors #auto
   resume_optimizer: false 
   resume_lr_scheduler: true
 
