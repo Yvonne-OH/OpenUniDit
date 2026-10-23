@@ -14,8 +14,12 @@ except Exception:
 
 # FA3 varlen 的 max_seqlen 必须是 host 端常量: 若传随 batch 变化的 n_total, inductor 会按
 # 数值区间 (<=1536 / >1536) 反复特化重编译, 每次重编译所有 rank 在梯度 allreduce 上干等数分钟。
-# 预留余量: 2K 图 (2048/8=256 -> latent 256x256 -> patch 2x2 -> 16384 图像 token) + 2048 文本 token。
-MAX_VARLEN_SEQLEN = 16384 + 2048
+# 按 t==1 图像 / t>1 视频分两档常量, kernel 各编译一次; 越界在 forward 里显式报错。
+# 图像档: 2K 图 (2048/8=256 -> latent 256x256 -> patch 2x2 -> 16384 token) + 2048 文本。
+# 视频档: 15s@24fps=361 帧 -> VAE 时间 /4 -> 91 latent 帧; 1280x720 -> latent 160x90 ->
+#         patch 2x2 -> 每帧 80x45=3600 token, 91 帧 = 327600; + 4096 文本。
+MAX_SEQLEN_IMAGE = 16384 + 2048
+MAX_SEQLEN_VIDEO = 91 * 3600 + 4096
 
 
 class RMSNorm(nn.Module):
@@ -208,10 +212,12 @@ class GigaExpTransformer(nn.Module):
                 valid2d = cols[None, :] < lens[:, None]  # [b, n_total] 有效前缀掩码
                 pack_idx = (torch.arange(b, device=x.device)[:, None] * n_total + cols[None, :])[valid2d]
                 pos_idx = cols[None, :].expand(b, -1)[valid2d]  # cos/sin 按 [n_total] 位置索引
-                # max_seqlen 用常量上界, FA3 kernel 只编译一次; 越界显式报错, 防止 kernel 静默截断算错
-                if n_total > MAX_VARLEN_SEQLEN:
-                    raise ValueError(f"n_total={n_total} 超过 MAX_VARLEN_SEQLEN={MAX_VARLEN_SEQLEN}, 请调大上界")
-                max_seqlen = MAX_VARLEN_SEQLEN
+                # max_seqlen 用常量上界(图像/视频分档), FA3 kernel 每档只编译一次;
+                # 越界显式报错, 防止 kernel 静默截断算错
+                bound = MAX_SEQLEN_IMAGE if t == 1 else MAX_SEQLEN_VIDEO
+                if n_total > bound:
+                    raise ValueError(f"n_total={n_total} 超过上界 {bound}, 请调大对应 MAX_SEQLEN_* 常量")
+                max_seqlen = bound
                 pack = (pack_idx, pos_idx, cu_seqlens, max_seqlen)
         x = torch.cat((image, text), 1)
         ts = timestep.float().reshape(-1).expand(b)
