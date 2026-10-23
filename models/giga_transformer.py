@@ -14,9 +14,8 @@ except Exception:
 
 # FA3 varlen 的 max_seqlen 必须是 host 端常量: 若传随 batch 变化的 n_total, inductor 会按
 # 数值区间 (<=1536 / >1536) 反复特化重编译, 每次重编译所有 rank 在梯度 allreduce 上干等数分钟。
-# 上界 = 最大桶 (512px -> latent 64x64 -> patch 2x2 -> 1024 图像 token) + max_length(512)。
-# 换更大分辨率桶或更长文本时必须同步调大, 否则 forward 里会显式报错。
-MAX_VARLEN_SEQLEN = 1536
+# 预留余量: 2K 图 (2048/8=256 -> latent 256x256 -> patch 2x2 -> 16384 图像 token) + 2048 文本 token。
+MAX_VARLEN_SEQLEN = 16384 + 2048
 
 
 class RMSNorm(nn.Module):
