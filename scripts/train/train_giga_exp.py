@@ -776,31 +776,34 @@ def main():
     pending_batch = None
     consecutive_batch_skips = 0
     max_consecutive_batch_skips = int(os.environ.get("GIGA_MAX_CONSECUTIVE_BATCH_SKIPS", "64"))
-    # 编译预热: 用假数据把 dynamo 的尺寸特化变体 (文本长度 0/1 特化等) 在启动阶段全部编完,
-    # 避免训练中途遇到新变体时全队停顿 (重编译期间其余 rank 在梯度 allreduce 上干等)。
-    # 覆盖 L==1 / L==2 / L>=3 三种尺寸类; 纯 forward+backward, 不做 optimizer.step 且事后清零
-    # 梯度, 不碰数据迭代器/优化器状态/学习率; 各 rank 预热次数一致, 集合通信不会错位。
+    # 编译预热: 用假数据把各分辨率桶的训练图在启动阶段全部编完, 避免训练中途遇到新变体时
+    # 全队停顿 (重编译期间其余 rank 在梯度 allreduce 上干等)。文本长度经上方钳制恒 >=2,
+    # 只存在唯一的符号化尺寸类, 每桶一次 forward+backward 即可编完整图 (含 FA3 段)。
+    # 纯 forward+backward, 不做 optimizer.step 且事后清零梯度, 不碰数据迭代器/优化器状态/
+    # 学习率; 各 rank 预热次数一致, 集合通信不会错位。
     warm_b = 2
     warm_dtype = next(engine.module.parameters()).dtype
-    warm_img = torch.zeros(warm_b, engine.module.in_channels, 1, 64, 64, device=device, dtype=warm_dtype)
     warm_text_dim = engine.module.text_in.in_features
+    # stage_1.yaml 的三个分辨率桶对应的 latent 空间尺寸 (VAE /8): 512 / 512x384 / 384x512
+    warm_buckets = ((64, 64), (64, 48), (48, 64))
     # 编译心跳: Inductor 单次编译内部无进度回调, 可能静默数分钟; 后台线程每 10s 打印
-    # 已耗时和当前变体序号, 明确"在编译而不是卡死"
+    # 已耗时和当前桶序号, 明确"在编译而不是卡死"
     warm_stop = threading.Event()
     warm_state = {"idx": 0, "t0": time.time()}
 
     def _warmup_heartbeat() -> None:
         while not warm_stop.wait(10.0):
             elapsed = time.time() - warm_state["t0"]
-            logger.info("⏳ 编译预热中... 已 %.0fs (变体 %d/3)", elapsed, min(warm_state["idx"] + 1, 3))
+            logger.info("⏳ 编译预热中... 已 %.0fs (桶 %d/%d)", elapsed, min(warm_state["idx"] + 1, len(warm_buckets)), len(warm_buckets))
 
     threading.Thread(target=_warmup_heartbeat, daemon=True).start()
     try:
-        for warm_len in tqdm((1, 2, 64), desc="🔥 compile warmup", disable=rank != 0, dynamic_ncols=True):
+        for warm_h, warm_w in tqdm(warm_buckets, desc="🔥 compile warmup", disable=rank != 0, dynamic_ncols=True):
             warm_state["idx"] += 1
+            warm_img = torch.zeros(warm_b, engine.module.in_channels, 1, warm_h, warm_w, device=device, dtype=warm_dtype)
             warm_t = torch.rand(warm_b, device=device) * 1000.0
-            warm_text = torch.randn(warm_b, warm_len, warm_text_dim, device=device, dtype=warm_dtype)
-            warm_mask = torch.ones(warm_b, warm_len, dtype=torch.bool, device=device)
+            warm_text = torch.randn(warm_b, 64, warm_text_dim, device=device, dtype=warm_dtype)
+            warm_mask = torch.ones(warm_b, 64, dtype=torch.bool, device=device)
             warm_loss = engine(warm_img, warm_t, warm_text, warm_mask).float().mean()
             engine.backward(warm_loss)
             engine.zero_grad()
@@ -865,6 +868,12 @@ def main():
                     prompts = [empty_prompt if drop[i].item() else prompt for i, prompt in enumerate(prompts)]
                 inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=tc.get("max_length", 512)).to(device)
                 text, mask = encode_text(text_encoder, inputs, tc.get("layer")), inputs.attention_mask.bool()
+                # 钳到 >=2 token: dynamo 对 size 0/1 有 0/1 特化, L<=1 的退化 batch 会在单个 rank
+                # 上现场触发冷编译 (00:53:11 卡死: rank0 编译 10min+, 其余 rank allreduce 等满 600s 团灭)。
+                # 补零嵌入 + False mask, FA3 varlen 按 valid 长度跳过补位, 对训练数值无任何影响。
+                if text.shape[1] < 2:
+                    text = torch.nn.functional.pad(text, (0, 0, 0, 2 - text.shape[1]))
+                    mask = torch.nn.functional.pad(mask, (0, 2 - mask.shape[1]))
             sigma = torch.rand(latents.shape[0], device=device)
             sigma = sigma * cfg["scheduler"]["shift"] / (1 + (cfg["scheduler"]["shift"] - 1) * sigma)
             noise = torch.randn_like(latents)
