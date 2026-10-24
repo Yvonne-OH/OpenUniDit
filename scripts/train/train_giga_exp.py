@@ -776,6 +776,22 @@ def main():
     pending_batch = None
     consecutive_batch_skips = 0
     max_consecutive_batch_skips = int(os.environ.get("GIGA_MAX_CONSECUTIVE_BATCH_SKIPS", "64"))
+    # 编译预热: 用假数据把 dynamo 的尺寸特化变体 (文本长度 0/1 特化等) 在启动阶段全部编完,
+    # 避免训练中途遇到新变体时全队停顿 (重编译期间其余 rank 在梯度 allreduce 上干等)。
+    # 覆盖 L==1 / L==2 / L>=3 三种尺寸类; 纯 forward+backward, 不做 optimizer.step 且事后清零
+    # 梯度, 不碰数据迭代器/优化器状态/学习率; 各 rank 预热次数一致, 集合通信不会错位。
+    warm_b = 2
+    warm_dtype = next(engine.module.parameters()).dtype
+    warm_img = torch.zeros(warm_b, engine.module.in_channels, 1, 64, 64, device=device, dtype=warm_dtype)
+    warm_text_dim = engine.module.text_in[0].in_features
+    for warm_len in tqdm((1, 2, 64), desc="🔥 compile warmup", disable=rank != 0, dynamic_ncols=True):
+        warm_t = torch.rand(warm_b, device=device) * 1000.0
+        warm_text = torch.randn(warm_b, warm_len, warm_text_dim, device=device, dtype=warm_dtype)
+        warm_mask = torch.ones(warm_b, warm_len, dtype=torch.bool, device=device)
+        warm_loss = engine(warm_img, warm_t, warm_text, warm_mask).float().mean()
+        engine.backward(warm_loss)
+        engine.zero_grad()
+    logger.info("✅ compile warmup 完成: 尺寸特化变体已全部编译")
     progress = tqdm(total=max_steps, initial=step, disable=rank != 0, dynamic_ncols=True, desc="🚂 stage_1")
     while step < max_steps:
         step += 1
