@@ -783,7 +783,7 @@ def main():
     warm_b = 2
     warm_dtype = next(engine.module.parameters()).dtype
     warm_img = torch.zeros(warm_b, engine.module.in_channels, 1, 64, 64, device=device, dtype=warm_dtype)
-    warm_text_dim = engine.module.text_in[0].in_features
+    warm_text_dim = engine.module.text_in.in_features
     # 编译心跳: Inductor 单次编译内部无进度回调, 可能静默数分钟; 后台线程每 10s 打印
     # 已耗时和当前变体序号, 明确"在编译而不是卡死"
     warm_stop = threading.Event()
@@ -795,16 +795,22 @@ def main():
             logger.info("⏳ 编译预热中... 已 %.0fs (变体 %d/3)", elapsed, min(warm_state["idx"] + 1, 3))
 
     threading.Thread(target=_warmup_heartbeat, daemon=True).start()
-    for warm_len in tqdm((1, 2, 64), desc="🔥 compile warmup", disable=rank != 0, dynamic_ncols=True):
-        warm_state["idx"] += 1
-        warm_t = torch.rand(warm_b, device=device) * 1000.0
-        warm_text = torch.randn(warm_b, warm_len, warm_text_dim, device=device, dtype=warm_dtype)
-        warm_mask = torch.ones(warm_b, warm_len, dtype=torch.bool, device=device)
-        warm_loss = engine(warm_img, warm_t, warm_text, warm_mask).float().mean()
-        engine.backward(warm_loss)
+    try:
+        for warm_len in tqdm((1, 2, 64), desc="🔥 compile warmup", disable=rank != 0, dynamic_ncols=True):
+            warm_state["idx"] += 1
+            warm_t = torch.rand(warm_b, device=device) * 1000.0
+            warm_text = torch.randn(warm_b, warm_len, warm_text_dim, device=device, dtype=warm_dtype)
+            warm_mask = torch.ones(warm_b, warm_len, dtype=torch.bool, device=device)
+            warm_loss = engine(warm_img, warm_t, warm_text, warm_mask).float().mean()
+            engine.backward(warm_loss)
+            engine.zero_grad()
+    except Exception:
+        # 预热只是优化项, 失败绝不致命: 清零梯度后照常进入训练 (首步仍会正常编译)
         engine.zero_grad()
-    warm_stop.set()
-    logger.info("✅ compile warmup 完成: 尺寸特化变体已全部编译 (耗时 %.0fs)", time.time() - warm_state["t0"])
+        logger.exception("⚠️ compile warmup 失败, 跳过预热继续训练")
+    finally:
+        warm_stop.set()
+    logger.info("✅ compile warmup 结束 (耗时 %.0fs)", time.time() - warm_state["t0"])
     progress = tqdm(total=max_steps, initial=step, disable=rank != 0, dynamic_ncols=True, desc="🚂 stage_1")
     while step < max_steps:
         step += 1
