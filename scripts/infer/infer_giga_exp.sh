@@ -32,19 +32,46 @@ PROMPTS=(
 PROMPT_FILE=""
 
 # ── 输出与权重 (支持环境变量覆盖, 如 CHECKPOINT=xxx.safetensors bash infer_giga_exp.sh) ──
-OUTPUT_DIR="${OUTPUT_DIR:-}"   # 空 = outputs/pretrain/vis_token_exp/<ckpt 名>/
+OUTPUT_DIR="${OUTPUT_DIR:-}"   # 空 = outputs/pretrain_v2/vis_token_exp/<ckpt 名>/，下设 shift_* 子目录
 CHECKPOINT="${CHECKPOINT:-}"   # 空 = 自动取 stage_1 output_dir/checkpoints/weights 下最新 step-*
 CONFIG="${CONFIG:-${ROOT}/configs/stage_1.yaml}"
 
 # ── 采样参数 (默认与训练验证一致) ──
-HEIGHT=128      # 必须是 32 的倍数; 默认横屏 192x128 (WxH, 对应训练桶 192x128)
-WIDTH=192
+HEIGHT=512      # 必须是 32 的倍数; 默认横屏 192x128 (WxH, 对应训练桶 192x128)
+WIDTH=512
 STEPS=40        # 训练验证用 20; 质量优先可加到 40+
 GUIDANCE_SCALE=3.0
-SHIFT=3.0       # 与 configs/stage_1.yaml 的 scheduler.validation_shift 保持一致
+NEGATIVE_PROMPT="blurry, distorted, deformed, low quality"
+SHIFTS=(1 3 6 9) # 同一权重、prompt 和 seed，对比四组采样 shift
 SEED=42         # 所有 prompt 固定同一噪声种子
 BATCH_SIZE="${BATCH_SIZE:-4}"   # 越大越快(结果与 batch 大小无关)
 GPU=""          # 空 = 自动用最后一张 GPU (如 8 卡机为 7)
+
+# 四组共用启动时选定的 checkpoint，避免训练期间新权重写入导致对比不一致。
+CHECKPOINT="$(python - "$ROOT" "$CONFIG" "$CHECKPOINT" <<'PY'
+import sys
+from pathlib import Path
+import yaml
+root, config, checkpoint = sys.argv[1:]
+config = Path(config)
+if not config.is_absolute():
+    config = Path(root) / config
+cfg = yaml.safe_load(config.read_text())
+target = Path(checkpoint) if checkpoint else Path(cfg["output_dir"]) / "checkpoints" / "weights"
+if target.is_dir():
+    candidates = list(target.glob("step-*.safetensors")) + list(target.glob("step-*.pt"))
+    if not candidates:
+        raise FileNotFoundError(f"目录里没有 step-* 权重文件: {target}")
+    target = max(candidates, key=lambda p: int(p.stem.split("-")[1]))
+if not target.is_file():
+    raise FileNotFoundError(f"权重不存在: {target}")
+print(target.resolve())
+PY
+)"
+if [[ -z "$OUTPUT_DIR" ]]; then
+  CHECKPOINT_NAME="$(basename "$CHECKPOINT")"
+  OUTPUT_DIR="$ROOT/outputs/pretrain_v2/vis_token_exp/${CHECKPOINT_NAME%.*}"
+fi
 
 ARGS=(
   "${SCRIPT_DIR}/infer_giga_exp.py"
@@ -53,13 +80,10 @@ ARGS=(
   --width "${WIDTH}"
   --steps "${STEPS}"
   --guidance-scale "${GUIDANCE_SCALE}"
-  --shift "${SHIFT}"
+  --negative-prompt "${NEGATIVE_PROMPT}"
   --seed "${SEED}"
   --batch-size "${BATCH_SIZE}"
 )
-if [[ -n "${OUTPUT_DIR}" ]]; then
-  ARGS+=(--output-dir "${OUTPUT_DIR}")
-fi
 for prompt in "${PROMPTS[@]}"; do
   ARGS+=(--prompt "${prompt}")
 done
@@ -73,4 +97,10 @@ fi
 if [[ -z "${GPU}" ]]; then
   GPU=$(( $(nvidia-smi -L | wc -l) - 1 ))
 fi
-CUDA_VISIBLE_DEVICES="${GPU}" exec python "${ARGS[@]}"
+for SHIFT in "${SHIFTS[@]}"; do
+  SHIFT_OUTPUT_DIR="${OUTPUT_DIR}/shift_${SHIFT}"
+  printf '\n开始推理 shift=%s → %s\n' "$SHIFT" "$SHIFT_OUTPUT_DIR"
+  CUDA_VISIBLE_DEVICES="${GPU}" python "${ARGS[@]}" \
+    --shift "$SHIFT" --output-dir "$SHIFT_OUTPUT_DIR"
+done
+printf '\n四组 shift 推理完成 → %s\n' "$OUTPUT_DIR"

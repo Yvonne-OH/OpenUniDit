@@ -99,6 +99,7 @@ def parse_args():
     parser.add_argument("--guidance-scale", type=float, default=3.0)
     parser.add_argument("--shift", type=float, default=None, help="σ schedule shift; 缺省取 scheduler.validation_shift")
     parser.add_argument("--seed", type=int, default=42, help="固定噪声种子, 所有 prompt 共用")
+    parser.add_argument("--negative-prompt", default="<|im_end|>", help="自然语言 negative prompt; 缺省使用 EOS 无条件分支")
     parser.add_argument("--batch-size", type=int, default=4, help="list input 的分批大小")
     parser.add_argument("--device", default="cuda", choices=["cuda", "cpu"],
                         help="cuda 缺省自动选最后一张可见 GPU; cpu 用于调试")
@@ -159,10 +160,11 @@ def wan_latent_stats(vae, device):
     return mean, std_inv
 
 
-def encode_cfg_prompts(tokenizer, encoder, prompts, device, layer, max_length):
-    """正样本 + eos 负样本一次性编码, 统一 padding 长度后拆分 (对齐训练验证逻辑, 供 CFG cat)."""
+def encode_cfg_prompts(tokenizer, encoder, prompts, negative_prompt, device, layer, max_length):
+    """正样本 + negative prompt 一次性编码, 统一 padding 长度后拆分 (供 CFG cat)."""
     filled = [p.strip() if p and p.strip() else tokenizer.eos_token for p in prompts]
-    inputs = tokenizer(filled + [tokenizer.eos_token] * len(filled),
+    negative = negative_prompt.strip() if negative_prompt and negative_prompt.strip() else tokenizer.eos_token
+    inputs = tokenizer(filled + [negative] * len(filled),
                        return_tensors="pt", padding=True, truncation=True, max_length=max_length).to(device)
     out = encoder(**inputs, use_cache=False, return_dict=True, output_hidden_states=layer is not None)
     text_all = out.hidden_states[layer] if layer is not None else out.last_hidden_state
@@ -222,7 +224,7 @@ def main():
     if args.output_dir is not None:
         output_dir = Path(args.output_dir)
     else:
-        output_dir = ROOT / "outputs" / "pretrain" / "vis_token_exp" / checkpoint.stem
+        output_dir = ROOT / "outputs" / "pretrain_v2" / "vis_token_exp" / checkpoint.stem
     output_dir.mkdir(parents=True, exist_ok=True)
 
     tc, dc = cfg["components"]["text_encoder"], cfg["components"]["wan_vae"]
@@ -236,6 +238,7 @@ def main():
         ("size", f"{args.height} x {args.width}"),
         ("steps", str(args.steps)),
         ("guidance_scale", str(args.guidance_scale)),
+        ("negative_prompt", args.negative_prompt or "<|im_end|>"),
         ("shift", str(shift)),
         ("seed", str(args.seed)),
         ("batch_size", str(args.batch_size)),
@@ -265,7 +268,8 @@ def main():
     manifest = {
         "checkpoint": str(checkpoint), "step": step, "config": str(args.config),
         "height": args.height, "width": args.width, "num_inference_steps": args.steps,
-        "guidance_scale": args.guidance_scale, "shift": shift, "seed": args.seed,
+        "guidance_scale": args.guidance_scale, "negative_prompt": args.negative_prompt or tokenizer.eos_token,
+        "shift": shift, "seed": args.seed,
         "images": [],
     }
     total_batches = math.ceil(len(prompts) / args.batch_size)
@@ -275,7 +279,8 @@ def main():
     for start in batch_iter:
         batch_index = list(range(start, min(start + args.batch_size, len(prompts))))
         batch_prompts = prompts[start:start + args.batch_size]
-        text, mask, neg, neg_mask = encode_cfg_prompts(tokenizer, encoder, batch_prompts, device, layer, max_length)
+        text, mask, neg, neg_mask = encode_cfg_prompts(
+            tokenizer, encoder, batch_prompts, args.negative_prompt, device, layer, max_length)
         # 所有 prompt 固定同一 seed (逐条独立生成器, 结果与 batch_size 无关, 可复现)
         noises = []
         for _ in batch_index:

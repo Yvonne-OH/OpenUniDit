@@ -132,7 +132,7 @@ training:
   # (step 保留, optimizer 状态重置), 日志有 ⚠️ 提示, 属预期行为。
   # 就地编译 DiT (nn.Module.compile, 数学等价): 融合每层 norm/adaLN/RoPE 小 kernel, 缓解 28 层 launch overhead;
   # 前几步为编译 warmup, step 耗时先长后短属正常
-  torch_compile: true #true
+  torch_compile: false #true
   muon:
     enabled: false               # 如需切回 muon+adam: enabled 改 true, optimizer 改 muon+adam
     momentum: 0.95
