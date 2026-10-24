@@ -2,6 +2,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # 直接在这里修改推理参数。
 PROMPT='Satirical documentary illustration, open-plan office of a modern tech company, rows of workstations stretching like farm ridges. Multiple programmers sit at desks, tiredly staring at computer screens and writing code. Desks are cluttered with requirement documents, coffee mugs and error popups. A manager stands beside the workstation in the aisle, leaning forward with an angry expression, loudly reprimanding the programmer while clutching progress reports. No physical violence in the scene, only conflict under heavy work pressure. Harsh overhead office lighting, stuffy and oppressive atmosphere. Muted earth tones mixed with cool grays, realistic painting style, tense and heavy mood. Rich details of laptops, sticky notes and water cups, wide composition with depth, satirical workplace metaphor illustration, high detail, 8k'
@@ -18,7 +19,7 @@ MAX_SEQUENCE_LENGTH=4096
 CPU_OFFLOAD=false
 
 ARGS=(
-  "${ROOT}/infer_moss_image.py"
+  "${SCRIPT_DIR}/infer_moss_image.py"
   "${PROMPT}"
   --model-path "${MODEL_PATH}"
   --output "${OUTPUT}"

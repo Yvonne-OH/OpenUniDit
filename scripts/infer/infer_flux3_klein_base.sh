@@ -2,6 +2,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MODEL_PATH="${MODEL_PATH:-/home/jovyan/pfs/users/zhanqian.wu/ckpt/flux-3-image-klein-base}"
 OUTPUT="${OUTPUT:-${ROOT}/outputs/output.png}"
 PROMPT="${PROMPT:-A cinematic photograph of a red fox standing in a snowy pine forest at golden hour, detailed winter fur, warm rim light, shallow depth of field.}"
@@ -9,7 +10,7 @@ PROMPT="${PROMPT:-A cinematic photograph of a red fox standing in a snowy pine f
 export PYTHONPATH="${ROOT}/diffusers/src:${ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 
-python "${ROOT}/infer.py" "${PROMPT}" \
+python "${SCRIPT_DIR}/infer.py" "${PROMPT}" \
   --model-path "${MODEL_PATH}" \
   --output "${OUTPUT}" \
   --height "${HEIGHT:-1024}" \
