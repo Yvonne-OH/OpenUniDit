@@ -1,0 +1,30 @@
+# LVIS v1 → 过滤 + Qwen caption 数据处理配置
+input:
+  lmdb_dir: /home/jovyan/pfs/users/zhanqian.wu/pfs_data/unified_canvas_images/lvis_v1
+
+output:
+  dir: /home/jovyan/pfs/users/zhanqian.wu/pfs_data/unified_canvas_images/lvis_v1_captioned
+  jsonl_prefix: annotated   # 输出: annotated_shard{I}of{N}.jsonl
+
+bbox_filter:
+  conf_key: score           # 置信度字段名; LVIS GT 无该字段 → 全保留
+  conf_min: 0.0             # score 存在且 < conf_min 时滤除
+  iou_threshold: 0.7        # 类无关 NMS: 面积大者保留, IoU 超阈值者抑制
+  max_regions_per_image: 10 # 过滤后 region 数 > 此值的整图丢弃 (0=不限制)
+
+quality_filter:
+  min_side: 256             # 短边下限
+  max_side: 8000            # 长边上限(异常大图)
+  blur_var_min: 35.0        # Laplacian 方差下限(模糊)
+  brightness_min: 20        # 平均亮度下限(过暗)
+  brightness_max: 235       # 平均亮度上限(过曝)
+  contrast_std_min: 12      # 灰度标准差下限(低对比)
+
+caption:
+  enabled: true
+  model_path: /mnt/nfs/models/huggingface/Qwen/Qwen3-VL-4B-Instruct
+  max_new_tokens: 768
+  language: en              # 描述语言: en
+  max_regions: 64           # 逐 bbox 描述上限(超过时按面积取前 N, 其余坐标/mask 仍完整保留)
+  batch_size: 16
+  dtype: bfloat16
