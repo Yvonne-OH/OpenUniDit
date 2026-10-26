@@ -6,7 +6,7 @@ seed: 42
 # DeepSpeed launcher: deepspeed --num_gpus=8 train_giga_exp.py --config configs/stage_1.yaml
 distributed:
   backend: deepspeed
-  config: configs/zero1.json
+  config: configs/zero2.json
   world_size: 8
   timeout_seconds: 7200
 
