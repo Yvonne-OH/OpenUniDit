@@ -863,6 +863,8 @@ def main():
         micro_sigmas = []
         micro_kd_losses = []
         micro_kd_cos = []
+        micro_teacher_fm_losses = []
+        micro_teacher_bucket_sums = torch.zeros(SIGMA_BUCKETS, device=device)
         micro_bucket_sums = torch.zeros(SIGMA_BUCKETS, device=device)
         micro_bucket_counts = torch.zeros(SIGMA_BUCKETS, device=device)
         last_captions = None
@@ -950,6 +952,10 @@ def main():
                 # teacher 原始输出 = z0 - noise, 取负号对齐 student 的 velocity (noise - z0)
                 kd_sq = [(p.float() - (-o).float()).square().mean() for p, o in zip(pred.unbind(0), teacher_out)]
                 kd_loss = torch.stack(kd_sq).mean()
+                # teacher oracle FM loss (仅诊断, 不参与优化): teacher velocity 对真实 FM target 的误差
+                # L_teacher = || -f_phi(x_sigma, 1-sigma, c) - (noise - z0) ||^2, 用于判断是否值得调高 λ_kd
+                fm_target = (noise - latents).float()
+                teacher_fm_sq = [((-o).float() - fm_target[i]).square().mean() for i, o in enumerate(teacher_out)]
                 loss = loss + kd_weight * kd_loss
             per_sample_loss = diff_sq.flatten(1).mean(1)
             engine.backward(loss)
@@ -965,6 +971,10 @@ def main():
             bins = (sigma.detach() * SIGMA_BUCKETS).long().clamp_(0, SIGMA_BUCKETS - 1)
             micro_bucket_sums.scatter_add_(0, bins, per_sample_loss.detach().float())
             micro_bucket_counts += torch.bincount(bins, minlength=SIGMA_BUCKETS).float()
+            if kd_enabled:
+                micro_teacher_fm_losses.append(torch.stack(teacher_fm_sq).mean().detach())
+                # teacher 各 sigma 桶 FM 误差 (分母复用 micro_bucket_counts: 同 batch 同 sigma, 桶计数一致)
+                micro_teacher_bucket_sums.scatter_add_(0, bins, torch.stack(teacher_fm_sq).detach().float())
         if not micro_losses:
             logger.warning("🚫 step=%d 本 step 的全部 micro batch 均因坏数据跳过, 跳过本 step 优化", step)
             continue
@@ -972,6 +982,7 @@ def main():
         loss_value = torch.stack(micro_losses).mean().item()
         kd_loss_value = torch.stack(micro_kd_losses).mean().item() if micro_kd_losses else None
         kd_cos_value = torch.stack(micro_kd_cos).mean().item() if micro_kd_cos else None
+        teacher_fm_value = torch.stack(micro_teacher_fm_losses).mean().item() if micro_teacher_fm_losses else None
         sigma_mean = torch.stack(micro_sigmas).sum().item() / (grad_accum * latents.shape[0])
         if rank == 0:
             progress.update(1)
@@ -983,12 +994,17 @@ def main():
         if step % log_every == 0:
             stats = torch.stack([micro_bucket_sums, micro_bucket_counts])
             dist.all_reduce(stats)
+            teacher_stats = None
+            if micro_teacher_fm_losses:
+                # 分母 (counts) 与 student 桶计数一致, 直接复用 stats[1]
+                teacher_stats = torch.stack([micro_teacher_bucket_sums, micro_bucket_counts])
+                dist.all_reduce(teacher_stats)
             data_hash = hashlib.md5("\x1f".join(last_captions).encode("utf-8")).hexdigest()[:8]
             log_line = "rank=%d step=%d loss=%.6f data=%s lr=%.3e time=%s sigma_mean=%.5f"
             log_args = [rank, step, loss_value, data_hash, lr_now, time.strftime("%H:%M:%S"), sigma_mean]
             if kd_loss_value is not None:
-                log_line += " kd=%.6f kd_cos=%.4f"
-                log_args += [kd_loss_value, kd_cos_value]
+                log_line += " kd=%.6f kd_cos=%.4f teacher_fm=%.6f"
+                log_args += [kd_loss_value, kd_cos_value, teacher_fm_value]
             logger.info(log_line, *log_args)
             if rank == 0 and wandb_run:
                 payload = {"train/loss": loss_value, "train/lr": lr_now, "train/sigma_mean": sigma_mean, "train/samples": step * grad_accum * cfg['training']['batch_size_per_device'] * dist.get_world_size()}
@@ -996,6 +1012,12 @@ def main():
                     payload["train/kd_loss"] = kd_loss_value
                     payload["train/kd_v_cos"] = kd_cos_value
                     payload["train/kd_weight"] = kd_weight
+                    # 统一指标族 (loss/*): fm=student 原始误差, kd=student-teacher 差距,
+                    # teacher_fm=teacher 对真实 target 的误差, total=实际优化目标
+                    payload["loss/fm"] = loss_value
+                    payload["loss/kd"] = kd_loss_value
+                    payload["loss/teacher_fm"] = teacher_fm_value
+                    payload["loss/total"] = loss_value + kd_weight * kd_loss_value
                 for i in range(SIGMA_BUCKETS):
                     if stats[1, i] <= 0:
                         continue
@@ -1004,6 +1026,11 @@ def main():
                         prev = sigma_bucket_ema[i]
                         sigma_bucket_ema[i] = bucket_loss if not math.isfinite(prev) else 0.9 * prev + 0.1 * bucket_loss
                     payload[f"train/loss_sigma_{i / 10:.1f}-{(i + 1) / 10:.1f}"] = sigma_bucket_ema[i]
+                    # teacher 各噪声区间 FM 质量桶: 若 teacher_fm 在多数桶高于 student fm, 不应盲目调高 λ_kd
+                    if teacher_stats is not None:
+                        teacher_bucket = (teacher_stats[0, i] / teacher_stats[1, i]).item()
+                        if math.isfinite(teacher_bucket):
+                            payload[f"loss/teacher_fm_by_sigma_{i / 10:.1f}-{(i + 1) / 10:.1f}"] = teacher_bucket
                 wandb.log(payload, step=step)
         if cfg["validation"].get("enabled", True) and step % int(cfg["validation"].get("every_n_steps", 1000)) == 0:
             try:
