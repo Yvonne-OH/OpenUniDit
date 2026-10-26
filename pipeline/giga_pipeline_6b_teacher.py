@@ -136,8 +136,11 @@ def build_gwp6b_teacher(teacher_cfg: dict, device: torch.device, dtype: torch.dt
             arch[key] = teacher_cfg[key]
     arch["axes_dims"] = list(teacher_cfg.get("rope_axes_dims", arch["axes_dims"]))
     arch["axes_lens"] = list(teacher_cfg.get("rope_axes_lens", arch["axes_lens"]))
-    arch["all_patch_size"] = tuple(teacher_cfg.get("patch_size", arch["all_patch_size"]))
-    arch["all_f_patch_size"] = tuple(teacher_cfg.get("f_patch_size", arch["all_f_patch_size"]))
+    # patch_size/f_patch_size 兼容标量 (yaml 里 patch_size: 2 -> 多档元组 (2,))
+    patch_size = teacher_cfg.get("patch_size")
+    f_patch_size = teacher_cfg.get("f_patch_size")
+    arch["all_patch_size"] = tuple(patch_size) if isinstance(patch_size, (list, tuple)) else ((patch_size,) if patch_size is not None else arch["all_patch_size"])
+    arch["all_f_patch_size"] = tuple(f_patch_size) if isinstance(f_patch_size, (list, tuple)) else ((f_patch_size,) if f_patch_size is not None else arch["all_f_patch_size"])
     transformer = GWPTransformer6BTeacher(**arch)
     resolved = load_gwp6b_teacher_checkpoint(transformer, teacher_cfg["checkpoint"])
     transformer = transformer.to(device=device, dtype=dtype).eval()
