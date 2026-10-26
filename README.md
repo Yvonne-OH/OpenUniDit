@@ -31,7 +31,7 @@
 本仓库围绕 **Giga-Exp**（0.80B 稠密单流 DiT 文本到图像 Flow Matching 模型）构建，覆盖从数据准备、分布式训练、推理采样到无参考图像评测的完整链路。
 
 <div align="center">
-  <img src="docs/images/giga_samples.jpg" alt="Giga-Exp 生成样例" width="760">
+  <img src="docs/images/giga_samples.png" alt="Giga-Exp 生成样例" width="760">
   <p><em>Giga-Exp stage_1 (step 55000, 512p, CFG 3.0, 40 steps) 生成样例</em></p>
 </div>
 
@@ -64,7 +64,7 @@
 每次 validation（默认每 1000 步）按 rank 落盘对比图：左为训练批次原图，右为模型重建结果，顶部黄色为该样本的 caption。
 
 <div align="center">
-  <img src="docs/images/validation_input_gen.jpg" alt="训练期 validation INPUT vs GENERATED" width="640">
+  <img src="docs/images/validation_input_gen.png" alt="训练期 validation INPUT vs GENERATED" width="640">
   <p><em>stage_1p1 · step 196000 · rank0 · 樱花场景</em></p>
 </div>
 
@@ -73,28 +73,28 @@
 同一权重、同一 prompt、同一 seed 下对比四组采样 shift（`1 / 3 / 6 / 9`）。shift 控制噪声调度的时间分布：shift 越大，高噪声段（决定整体构图）占比越长。
 
 <div align="center">
-  <img src="docs/images/shift_ablation.jpg" alt="sigma-shift 消融对比" width="780">
+  <img src="docs/images/shift_ablation.png" alt="sigma-shift 消融对比" width="780">
   <p><em>同一 step-55000 权重下的 shift 消融</em></p>
 </div>
 
 ### MOSS-Image-SFT 对照
 
 <div align="center">
-  <img src="docs/images/moss_samples.jpg" alt="MOSS-Image-SFT 样例" width="760">
+  <img src="docs/images/moss_samples.png" alt="MOSS-Image-SFT 样例" width="760">
   <p><em>MOSS-Image-SFT · 256p 生成样例</em></p>
 </div>
 
 MOSS-Image-SFT 支持 **JSON Layout Prompt**，可在图中指定文字内容与精确位置：
 
 <div align="center">
-  <img src="docs/images/moss_layout_text.jpg" alt="MOSS-Image-SFT JSON Layout 文字排版" width="340">
+  <img src="docs/images/moss_layout_text.png" alt="MOSS-Image-SFT JSON Layout 文字排版" width="340">
   <p><em>JSON Layout 指定标题与正文的排版</em></p>
 </div>
 
 ### FLUX.3 Klein Base 对照
 
 <div align="center">
-  <img src="docs/images/flux3_fox.jpg" alt="FLUX.3 Klein Base 生成样例" width="340">
+  <img src="docs/images/flux3_fox.png" alt="FLUX.3 Klein Base 生成样例" width="340">
   <p><em>FLUX.3 Image Klein Base · 1024×1024 · CFG 3.5 · 50 steps</em></p>
 </div>
 
@@ -515,13 +515,15 @@ preprocess_style ∈ {cover, resize_long_edge}
 |---|---|
 | `MediaCorruptError` | 跳过该样本，永久拉黑 |
 | `MediaInvalidInputError` | 跳过该样本 |
-| `MediaTransientIOError` | 重试 |
+| `MediaTransientIOError` | 临时 IO 失败，TTL 拉黑后重试 |
 | `MediaDeadlineError` | 超时预算耗尽，换候选样本 |
-| `MediaCapacityError` | 容量不足，丢弃该 batch（**不拉黑**） |
+| `MediaCapacityError` | 容量不足（含 `MemoryError`），丢弃该 batch（**不拉黑**） |
 | `MediaExecutorBugError` | 代码/环境 bug，**立即终止训练** |
-| `MediaCandidatesExhausted` | 本 step 全部候选耗尽，跳过该 step |
+| `MediaCandidatesExhausted` | 单样本候选全部失败，按 `invalid_input` 处理 |
 
-数据级错误默认**不中断训练**；`executor_bug` 类必须终止，避免训练到一半才崩溃。
+数据级错误默认**不中断训练**（连续跳过超过 `GIGA_MAX_CONSECUTIVE_BATCH_SKIPS`，默认 64 才终止）；`executor_bug` 类必须立即终止，避免训练到一半才崩溃。
+
+跨 rank 的 skip 决策通过 `all_reduce` 同步 —— 任一 rank 遇到坏数据则全体跳过该 micro batch，否则各 rank 的 backward/step 通信次数不一致会挂死整个作业。
 
 > ⚠️ **作业运行期间禁止热编辑 `video_decode.py` 及其 import 的模块**。解码子进程每次请求都从磁盘重新读源码，运行中热编辑会导致子进程代码不一致，进而触发整批跳过与多 rank 连锁崩溃。
 

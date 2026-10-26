@@ -6,7 +6,7 @@ seed: 42
 # DeepSpeed launcher: deepspeed --num_gpus=8 train_giga_exp.py --config configs/stage_1.yaml
 distributed:
   backend: deepspeed
-  config: configs/zero2.json
+  config: configs/zero1.json
   world_size: 8
   timeout_seconds: 7200
 
@@ -143,7 +143,7 @@ training:
     enabled: true
     betas: [0.9, 0.95]
     epsilon: 1.0e-8
-  learning_rate: 8.0e-5
+  learning_rate: 1.0e-4
   weight_decay: 0.0
   lr_scheduler: cosine
   lr_warmup_steps: 200

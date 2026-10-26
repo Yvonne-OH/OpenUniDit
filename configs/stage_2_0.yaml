@@ -6,7 +6,7 @@ seed: 42
 
 distributed:
   backend: deepspeed
-  config: configs/zero2.json
+  config: configs/zero1.json
   world_size: 8
   timeout_seconds: 7200
 
