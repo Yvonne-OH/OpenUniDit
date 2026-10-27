@@ -18,6 +18,7 @@ teacher 推理验证: scripts/infer/infer_giga_exp_6b_teacher.py
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
 import logging
@@ -1037,34 +1038,47 @@ def main():
                 teacher_fm_sq = [((-o).float() - fm_target[i]).square().mean() for i, o in enumerate(teacher_out)]
                 teacher_fm_loss = torch.stack(teacher_fm_sq).mean()
             per_sample_loss = diff_sq.flatten(1).mean(1)
-            if kd_enabled and grad_accum == 1 and step <= kd_monitor_end:
-                # 前 N step 梯度范数监控: λ_f·g_feat/g_FM 目标 5%~15%, λ_r·g_rel/g_FM 目标 2%~10%,
-                # 合计 ≤ ~20% —— loss 数值小不代表对优化方向影响小 (velocity KD 的教训)。
-                # autograd.grad 不落 .grad、不触发 DeepSpeed 通信钩子, 只做本地估计, 事后 engine.backward 正常执行。
-                backbone_params = [p for name, p in engine.module.named_parameters()
-                                   if not name.startswith("kd_projectors") and p.requires_grad]
-                grad_fm = torch.autograd.grad(diff_sq.mean(), backbone_params, retain_graph=True, allow_unused=True)
-                grad_feat = torch.autograd.grad(l_feat, backbone_params, retain_graph=True, allow_unused=True)
-                grad_rel = torch.autograd.grad(l_rel, backbone_params, retain_graph=True, allow_unused=True)
-
-                def _grad_norm(grads):
-                    return math.sqrt(sum(float(g.detach().float().pow(2).sum()) for g in grads if g is not None))
-
-                g_fm, g_feat, g_rel = _grad_norm(grad_fm), _grad_norm(grad_feat), _grad_norm(grad_rel)
-                del grad_fm, grad_feat, grad_rel
-                ratio_feat = kd_feat_weight * g_feat / max(g_fm, 1e-20)
-                ratio_rel = kd_rel_weight * g_rel / max(g_fm, 1e-20)
-                logger.info("📊 step=%d 梯度占比: g_FM=%.3e | λ_f·g_feat=%.3e (%.1f%%) | λ_r·g_rel=%.3e (%.1f%%)",
-                            step, g_fm, kd_feat_weight * g_feat, 100 * ratio_feat,
-                            kd_rel_weight * g_rel, 100 * ratio_rel)
-                micro_grad_ratios.append((ratio_feat, ratio_rel))
             engine.backward(loss)
             micro_losses.append(diff_sq.mean().detach())
             if kd_enabled:
                 micro_feat_losses.append(l_feat.detach())
                 micro_rel_losses.append(l_rel.detach())
                 micro_feat_cos.append(feat_cos.detach())
-                del teacher_out, teacher_feats, student_feats
+                del student_feats
+            if kd_enabled and grad_accum == 1 and step <= kd_monitor_end:
+                # 前 N step 梯度范数监控: λ_f·g_feat/g_FM 目标 5%~15%, λ_r·g_rel/g_FM 目标 2%~10%,
+                # 合计 ≤ ~20% —— loss 数值小不代表对优化方向影响小 (velocity KD 的教训)。
+                # DeepSpeed ZeRO 把梯度 hook 挂在参数的 AccumulateGrad 节点上, 任何经过 engine
+                # 参数的 autograd.grad 都会误触发通信 epilogue (bucket IndexError 团灭, 08:54 复现)。
+                # 因此在 detached 克隆上独立前向 + 三次 autograd.grad: hook 只在 engine 参数上,
+                # 克隆参数无 hook, 真实 engine .grad 与通信状态完全不受影响; teacher 复用已 detach 的特征。
+                probe = copy.deepcopy(engine.module)
+                for p in probe.parameters():
+                    p.grad = None
+                probe_pred, probe_feats = probe(xt.to(dtype), sigma * 1000, text, mask,
+                                                feature_layers=student_kd_layers)
+                probe_fm = (probe_pred.float() - (noise - latents).float()).square().mean()
+                probe_feat, probe_rel, _ = feature_relation_kd(
+                    probe_feats, teacher_feats, probe.kd_projectors, n_img, kd_rel_tokens)
+                probe_params = [p for name, p in probe.named_parameters()
+                                if not name.startswith("kd_projectors")]
+                grad_fm = torch.autograd.grad(probe_fm, probe_params, retain_graph=True, allow_unused=True)
+                grad_feat = torch.autograd.grad(probe_feat, probe_params, retain_graph=True, allow_unused=True)
+                grad_rel = torch.autograd.grad(probe_rel, probe_params, retain_graph=True, allow_unused=True)
+
+                def _grad_norm(grads):
+                    return math.sqrt(sum(float(g.detach().float().pow(2).sum()) for g in grads if g is not None))
+
+                g_fm, g_feat, g_rel = _grad_norm(grad_fm), _grad_norm(grad_feat), _grad_norm(grad_rel)
+                del probe, probe_pred, probe_feats, grad_fm, grad_feat, grad_rel
+                ratio_feat = kd_feat_weight * g_feat / max(g_fm, 1e-20)
+                ratio_rel = kd_rel_weight * g_rel / max(g_fm, 1e-20)
+                logger.info("📊 step=%d 梯度占比: g_FM=%.3e | λ_f·g_feat=%.3e (%.1f%%) | λ_r·g_rel=%.3e (%.1f%%)",
+                            step, g_fm, kd_feat_weight * g_feat, 100 * ratio_feat,
+                            kd_rel_weight * g_rel, 100 * ratio_rel)
+                micro_grad_ratios.append((ratio_feat, ratio_rel))
+            if kd_enabled:
+                del teacher_out, teacher_feats
             micro_sigmas.append(sigma.detach().sum())
             bins = (sigma.detach() * SIGMA_BUCKETS).long().clamp_(0, SIGMA_BUCKETS - 1)
             micro_bucket_sums.scatter_add_(0, bins, per_sample_loss.detach().float())
