@@ -61,7 +61,7 @@ kd:
   relation_weight: 0.05                 # λ_r; 启动值, 按 grad_ratio_rel (目标 2%~10%) 调整
   feature_rel_depths: [0.25, 0.5, 0.75] # 相对深度 → student/teacher 各自取整 block 索引
   relation_tokens: 256                  # Relation KD 随机采样 image token 数
-  grad_monitor_steps: 50                # 前 N step 逐项梯度范数监控 λ·g_kd/g_FM (0 关闭)
+  grad_monitor_steps: 50                # 本次启动后前 N step 逐项梯度范数监控 λ·g_kd/g_FM (0 关闭)
 
 components:
   text_encoder:
@@ -185,4 +185,4 @@ logging:
   wandb:
     enabled: true
     project: giga-exp-image
-    name: giga_exp_image_stage_1_kd_28layers_1027
+    name: giga_exp_image_stage_1_kd_28layers_v2

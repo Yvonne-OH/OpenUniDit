@@ -914,6 +914,9 @@ def main():
         warm_stop.set()
     logger.info("✅ compile warmup 结束 (耗时 %.0fs)", time.time() - warm_state["t0"])
     progress = tqdm(total=max_steps, initial=step, disable=rank != 0, dynamic_ncols=True, desc="🚂 stage_1")
+    # 梯度占比监控窗口 = 本次启动后的前 N step (相对启动时 step, 续训/冷启动都能命中):
+    # 随机 projector 起点 KD 梯度最大, 是标定 λ 的保守情形
+    kd_monitor_end = step + kd_grad_monitor_steps
     while step < max_steps:
         step += 1
         micro_losses = []
@@ -1034,7 +1037,7 @@ def main():
                 teacher_fm_sq = [((-o).float() - fm_target[i]).square().mean() for i, o in enumerate(teacher_out)]
                 teacher_fm_loss = torch.stack(teacher_fm_sq).mean()
             per_sample_loss = diff_sq.flatten(1).mean(1)
-            if kd_enabled and grad_accum == 1 and step <= kd_grad_monitor_steps:
+            if kd_enabled and grad_accum == 1 and step <= kd_monitor_end:
                 # 前 N step 梯度范数监控: λ_f·g_feat/g_FM 目标 5%~15%, λ_r·g_rel/g_FM 目标 2%~10%,
                 # 合计 ≤ ~20% —— loss 数值小不代表对优化方向影响小 (velocity KD 的教训)。
                 # autograd.grad 不落 .grad、不触发 DeepSpeed 通信钩子, 只做本地估计, 事后 engine.backward 正常执行。
