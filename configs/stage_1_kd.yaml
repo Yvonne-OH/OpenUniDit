@@ -47,12 +47,21 @@ teacher:
   patch_size: 2
   f_patch_size: 1
 
-# ---- KD 损失: velocity 输出蒸馏 ----
-# 同一 (xt, sigma, prompt) 下: loss = FM_MSE + loss_weight * MSE(student_pred, -teacher_out)
-# (teacher 原始输出 = z0 - noise, 取负号对齐 student 的 noise - z0 约定)
+# ---- KD 损失: Feature + Relation representation 蒸馏 (原 velocity 输出蒸馏已移除) ----
+# loss = FM_MSE + λ_f·L_feat + λ_r·L_rel
+# - Feature KD: 相对深度 25/50/75% 三层, 每层独立 Linear projector (D_S→D_T) 投影后
+#   逐 token cosine (1 - mean cos), 仅 image tokens
+# - Relation KD: 投影前 normalized hidden 的 token×token Gram 矩阵 MSE, 每步随机采样
+#   相同位置 relation_tokens 个 image tokens (token 不足则全用)
+# - projector 挂在 student 模块上仅训练期使用 (约 17.7M params), 推理加载按名称匹配
+#   自动忽略, 推理结构/FLOPs 完全不变; teacher 前向只 hook 3 个 KD 层
 kd:
   enabled: true
-  loss_weight: 0.5                # λ_kd; FM 锚定项权重恒为 1
+  feature_weight: 0.05                  # λ_f; 启动值, 按 grad_ratio_feat (目标 5%~15%) 调整
+  relation_weight: 0.05                 # λ_r; 启动值, 按 grad_ratio_rel (目标 2%~10%) 调整
+  feature_rel_depths: [0.25, 0.5, 0.75] # 相对深度 → student/teacher 各自取整 block 索引
+  relation_tokens: 256                  # Relation KD 随机采样 image token 数
+  grad_monitor_steps: 50                # 前 N step 逐项梯度范数监控 λ·g_kd/g_FM (0 关闭)
 
 components:
   text_encoder:

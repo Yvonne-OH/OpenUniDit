@@ -1,10 +1,16 @@
 """Stage_1 Giga-Exp KD 蒸馏训练: GWP 6B teacher (gigaworld stage1) → GigaExp student。
 
-在 stage_1 flow-matching 基础上增加 velocity 蒸馏项 (同 xt/sigma/条件下的输出对齐):
-    loss = FM_MSE(pred, noise - z0) + kd.loss_weight * KD_MSE(pred, teacher_v)
-teacher 原始输出 = z0 - noise (Z-Image 约定), 取负号后与 student velocity (noise - z0) 对齐;
+Feature + Relation representation 蒸馏 (原 velocity 输出蒸馏已移除):
+    loss = FM_MSE(pred, noise - z0) + λ_f·L_feat + λ_r·L_rel
+    L_feat: 相对深度 25/50/75% 三层, 每层独立 Linear projector (D_S→D_T) 投影后
+            双方 L2 normalize 逐 token cosine (1 - mean cos), 仅 image tokens
+    L_rel : 投影前 normalized hidden 的 token×token Gram 矩阵 MSE, 每步随机采样
+            相同位置 min(relation_tokens, n_img) 个 image tokens, 与 hidden dim 无关
 teacher 条件走 Qwen3-VL chat-template 约定 (与 gigaworld 训练一致), 与 student 共享同一
-编码器实例, 仅文本渲染方式不同。teacher 冻结 (eval + requires_grad False, 不进 DeepSpeed)。
+编码器实例, 仅文本渲染方式不同。teacher 冻结 (eval + requires_grad False, 不进 DeepSpeed),
+前向 no_grad 且只 hook 3 个 KD 层; projector 挂在 student 模块上仅训练期存在,
+推理加载按名称匹配自动忽略, 推理结构/FLOPs 不变。前 grad_monitor_steps 步逐项监控
+λ·g_kd/g_FM 梯度占比 (目标 feat 5%~15%, rel 2%~10%, 合计 ≤ ~20%)。
 
 结构文件: models/giga_transformer_6b_teacher.py / pipeline/giga_pipeline_6b_teacher.py
 teacher 推理验证: scripts/infer/infer_giga_exp_6b_teacher.py
@@ -36,6 +42,7 @@ if str(THIRDPARTY) not in sys.path:
 import deepspeed
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 import wandb
 import yaml
 from tqdm.auto import tqdm
@@ -492,6 +499,37 @@ def wan_latent_stats(vae, device):
 SIGMA_BUCKETS = 10  # sigma 等宽分桶数: [0,0.1) ... [0.9,1.0]
 
 
+def feature_relation_kd(student_feats, teacher_feats, projectors, n_img, relation_tokens):
+    """Feature KD + Relation KD, 仅 image tokens (student/teacher latent 网格逐 token 对齐)。
+
+    - Feature KD: 每层独立 projector (D_S→D_T) 投影后双方 L2 normalize, 逐 token cosine,
+      1 - mean cos, 三层平均; projector 属于 student 模块, 梯度正常回传
+    - Relation KD: 投影前 normalized hidden 随机采样相同位置 tokens 的 Gram 矩阵
+      (token×token 余弦相似度阵) MSE, 三层平均, 不依赖双方 hidden dim
+    - student_feats/teacher_feats: 各层 [B, S, D] (image tokens 为序列前缀, 逐位对应)
+    返回 (l_feat, l_rel, feat_cos_mean)。
+    """
+    feat_losses, rel_losses, cos_means = [], [], []
+    # 采样位置对 teacher/student 完全一致 (相同网格, 相同索引); token 不足则全用
+    perm = torch.randperm(n_img, device=student_feats[0].device)[: min(relation_tokens, n_img)]
+    for h_s, h_t, projector in zip(student_feats, teacher_feats, projectors):
+        s_img = h_s[:, :n_img]  # [B, N, D_S]
+        t_img = h_t[:, :n_img]  # [B, N, D_T]
+        # Feature KD: 投影 → normalize → 逐 token cosine
+        z_s = F.normalize(projector(s_img).float(), dim=-1)
+        z_t = F.normalize(t_img.float(), dim=-1)
+        cos = (z_s * z_t).sum(-1)
+        feat_losses.append(1.0 - cos.mean())
+        cos_means.append(cos.detach().mean())
+        # Relation KD: 投影前 normalized hidden 的 Gram 矩阵 (与 hidden dim 无关)
+        r_s = F.normalize(s_img.float(), dim=-1)[:, perm]
+        r_t = F.normalize(t_img.float(), dim=-1)[:, perm]
+        gram_s = torch.bmm(r_s, r_s.transpose(1, 2))
+        gram_t = torch.bmm(r_t, r_t.transpose(1, 2))
+        rel_losses.append(F.mse_loss(gram_s, gram_t))
+    return torch.stack(feat_losses).mean(), torch.stack(rel_losses).mean(), torch.stack(cos_means).mean()
+
+
 def sigma_bucket_loss_stats(sigma, per_sample_loss):
     """按 sigma 等宽 10 桶汇总 per-sample loss, 跨卡 all_reduce 后返回 (各桶 loss 之和, 各桶样本数)."""
     with torch.no_grad():
@@ -662,7 +700,12 @@ def main():
     kd_cfg = cfg.get("kd") or {}
     teacher_cfg = cfg.get("teacher") or {}
     kd_enabled = bool(kd_cfg.get("enabled", False))
-    kd_weight = float(kd_cfg.get("loss_weight", 1.0))
+    kd_feat_weight = float(kd_cfg.get("feature_weight", 0.05))
+    kd_rel_weight = float(kd_cfg.get("relation_weight", 0.05))
+    kd_rel_depths = [float(d) for d in kd_cfg.get("feature_rel_depths", [0.25, 0.5, 0.75])]
+    kd_rel_tokens = int(kd_cfg.get("relation_tokens", 256))
+    kd_grad_monitor_steps = int(kd_cfg.get("grad_monitor_steps", 50))
+    student_kd_layers, teacher_kd_layers = [], []
     teacher_transformer = None
     teacher_processor = None
     if kd_enabled:
@@ -682,6 +725,20 @@ def main():
             logger.info("KD teacher loaded: %s (%.2fB params, frozen, %s)", teacher_ckpt_resolved,
                         n_params_b, next(teacher_transformer.parameters()).dtype)
     model = GigaExpTransformer(**cfg["model"]).to(device, dtype=dtype)
+    if kd_enabled:
+        # KD 层: 相对深度取整 → student/teacher 各自的 block 索引 (blocks 遍历序输出)
+        student_kd_layers = sorted({int(model.layers * d) for d in kd_rel_depths})
+        teacher_kd_layers = sorted({int(len(teacher_transformer.layers) * d) for d in kd_rel_depths})
+        # projector 挂载进 student 模块: 优化器/DeepSpeed/断点恢复自动覆盖; 推理加载按名称匹配忽略
+        model.attach_kd_projectors(int(teacher_cfg["dim"]), len(student_kd_layers))
+        model.kd_projectors.to(device=device, dtype=dtype)
+        if rank == 0:
+            n_proj_m = sum(p.numel() for p in model.kd_projectors.parameters()) / 1e6
+            _blue_print(f"🎯 KD 损失: L = FM + {kd_feat_weight}·L_feat + {kd_rel_weight}·L_rel | "
+                        f"深度 {kd_rel_depths} → student layers {student_kd_layers} / teacher layers {teacher_kd_layers} | "
+                        f"image tokens only, relation 采样 {kd_rel_tokens} tokens, projector {n_proj_m:.1f}M params (仅训练期)")
+            logger.info("KD feature/relation: student_layers=%s teacher_layers=%s λ_f=%s λ_r=%s rel_tokens=%d grad_monitor=%d",
+                        student_kd_layers, teacher_kd_layers, kd_feat_weight, kd_rel_weight, kd_rel_tokens, kd_grad_monitor_steps)
     if cfg["training"].get("torch_compile"):
         # nn.Module.compile 就地编译: 参数名/state_dict 结构不变, 与 DeepSpeed/优化器分组/断点恢复兼容。
         # 注意: 此处不能写 "import torch._dynamo" —— 函数内 import torch.* 会把 torch 绑定为 main 的局部变量,
@@ -861,8 +918,10 @@ def main():
         step += 1
         micro_losses = []
         micro_sigmas = []
-        micro_kd_losses = []
-        micro_kd_cos = []
+        micro_feat_losses = []
+        micro_rel_losses = []
+        micro_feat_cos = []
+        micro_grad_ratios = []
         micro_teacher_fm_losses = []
         micro_teacher_bucket_sums = torch.zeros(SIGMA_BUCKETS, device=device)
         micro_bucket_sums = torch.zeros(SIGMA_BUCKETS, device=device)
@@ -930,7 +989,10 @@ def main():
                 xt = (1 - sigma[:, None, None, None, None]) * latents + sigma[:, None, None, None, None] * noise
                 # ---- KD teacher 前向 (no_grad, 冻结): t = 1 - sigma (Z-Image 约定), 原始输出 = z0 - noise。
                 # teacher 与 student 使用完全相同的 (xt, sigma, prompt); 仅文本渲染按各自约定。
+                # 只 hook 3 个 KD 层的 unified hidden (detach), 不保存全部层 activation。
                 teacher_out = None
+                teacher_feats = None
+                teacher_img_lens = None
                 if kd_enabled:
                     teacher_caps = encode_prompts_6b_teacher(
                         teacher_processor, text_encoder, teacher_prompts, device,
@@ -941,38 +1003,71 @@ def main():
                     teacher_raw = teacher_transformer(
                         x=list(xt.to(dtype).unbind(0)), t=(1.0 - sigma).to(dtype), cap_feats=teacher_caps,
                         patch_size=teacher_patch_size, f_patch_size=teacher_f_patch_size,
+                        feature_layers=teacher_kd_layers,
                     )
-                    teacher_out = teacher_raw.sample if hasattr(teacher_raw, "sample") else teacher_raw[0]
+                    teacher_out = teacher_raw["sample"]
+                    teacher_feats = [teacher_raw["features"][li] for li in teacher_kd_layers]
+                    teacher_img_lens = teacher_raw["img_real_lens"]
                     del teacher_raw, teacher_caps
-            pred = engine(xt.to(dtype), sigma * 1000, text, mask)
+            if kd_enabled:
+                pred, student_feats = engine(xt.to(dtype), sigma * 1000, text, mask, feature_layers=student_kd_layers)
+            else:
+                pred = engine(xt.to(dtype), sigma * 1000, text, mask)
             diff_sq = (pred.float() - (noise - latents).float()).square()
             # DeepSpeed 会在 gradient_accumulation_steps > 1 时自动缩放 backward loss；这里不要再次除以 grad_accum。
             loss = diff_sq.mean()
             if kd_enabled:
-                # teacher 原始输出 = z0 - noise, 取负号对齐 student 的 velocity (noise - z0)
-                kd_sq = [(p.float() - (-o).float()).square().mean() for p, o in zip(pred.unbind(0), teacher_out)]
-                kd_loss = torch.stack(kd_sq).mean()
+                # student patch [1,2,2] ≡ teacher patch 2/f_patch 1: 同一 latent 网格, image token 逐位对齐。
+                # 不一致说明配置漂移, 直接报错而不是静默错位蒸馏。
+                s_pt, s_ph, s_pw = engine.module.patch_size
+                n_img = (xt.shape[2] // s_pt) * (xt.shape[3] // s_ph) * (xt.shape[4] // s_pw)
+                if set(teacher_img_lens) != {n_img}:
+                    raise ValueError(
+                        f"teacher/student image token 网格不一致: teacher={teacher_img_lens} student={n_img} "
+                        f"(student patch={engine.module.patch_size}, teacher patch={teacher_patch_size}/f={teacher_f_patch_size})")
+                l_feat, l_rel, feat_cos = feature_relation_kd(
+                    student_feats, teacher_feats, engine.module.kd_projectors, n_img, kd_rel_tokens)
+                loss = loss + kd_feat_weight * l_feat + kd_rel_weight * l_rel
                 # teacher oracle FM loss (仅诊断, 不参与优化): teacher velocity 对真实 FM target 的误差
-                # L_teacher = || -f_phi(x_sigma, 1-sigma, c) - (noise - z0) ||^2, 用于判断是否值得调高 λ_kd
+                # L_teacher = || -f_phi(x_sigma, 1-sigma, c) - (noise - z0) ||^2, 用于判断 teacher 质量
                 fm_target = (noise - latents).float()
                 teacher_fm_sq = [((-o).float() - fm_target[i]).square().mean() for i, o in enumerate(teacher_out)]
-                loss = loss + kd_weight * kd_loss
+                teacher_fm_loss = torch.stack(teacher_fm_sq).mean()
             per_sample_loss = diff_sq.flatten(1).mean(1)
+            if kd_enabled and grad_accum == 1 and step <= kd_grad_monitor_steps:
+                # 前 N step 梯度范数监控: λ_f·g_feat/g_FM 目标 5%~15%, λ_r·g_rel/g_FM 目标 2%~10%,
+                # 合计 ≤ ~20% —— loss 数值小不代表对优化方向影响小 (velocity KD 的教训)。
+                # autograd.grad 不落 .grad、不触发 DeepSpeed 通信钩子, 只做本地估计, 事后 engine.backward 正常执行。
+                backbone_params = [p for name, p in engine.module.named_parameters()
+                                   if not name.startswith("kd_projectors") and p.requires_grad]
+                grad_fm = torch.autograd.grad(diff_sq.mean(), backbone_params, retain_graph=True, allow_unused=True)
+                grad_feat = torch.autograd.grad(l_feat, backbone_params, retain_graph=True, allow_unused=True)
+                grad_rel = torch.autograd.grad(l_rel, backbone_params, retain_graph=True, allow_unused=True)
+
+                def _grad_norm(grads):
+                    return math.sqrt(sum(float(g.detach().float().pow(2).sum()) for g in grads if g is not None))
+
+                g_fm, g_feat, g_rel = _grad_norm(grad_fm), _grad_norm(grad_feat), _grad_norm(grad_rel)
+                del grad_fm, grad_feat, grad_rel
+                ratio_feat = kd_feat_weight * g_feat / max(g_fm, 1e-20)
+                ratio_rel = kd_rel_weight * g_rel / max(g_fm, 1e-20)
+                logger.info("📊 step=%d 梯度占比: g_FM=%.3e | λ_f·g_feat=%.3e (%.1f%%) | λ_r·g_rel=%.3e (%.1f%%)",
+                            step, g_fm, kd_feat_weight * g_feat, 100 * ratio_feat,
+                            kd_rel_weight * g_rel, 100 * ratio_rel)
+                micro_grad_ratios.append((ratio_feat, ratio_rel))
             engine.backward(loss)
             micro_losses.append(diff_sq.mean().detach())
             if kd_enabled:
-                micro_kd_losses.append(kd_loss.detach())
-                micro_kd_cos.append(torch.stack([
-                    torch.cosine_similarity(p.float().flatten(), (-o).float().flatten(), dim=0)
-                    for p, o in zip(pred.unbind(0), teacher_out)
-                ]).mean().detach())
-                del teacher_out
+                micro_feat_losses.append(l_feat.detach())
+                micro_rel_losses.append(l_rel.detach())
+                micro_feat_cos.append(feat_cos.detach())
+                del teacher_out, teacher_feats, student_feats
             micro_sigmas.append(sigma.detach().sum())
             bins = (sigma.detach() * SIGMA_BUCKETS).long().clamp_(0, SIGMA_BUCKETS - 1)
             micro_bucket_sums.scatter_add_(0, bins, per_sample_loss.detach().float())
             micro_bucket_counts += torch.bincount(bins, minlength=SIGMA_BUCKETS).float()
             if kd_enabled:
-                micro_teacher_fm_losses.append(torch.stack(teacher_fm_sq).mean().detach())
+                micro_teacher_fm_losses.append(teacher_fm_loss.detach())
                 # teacher 各 sigma 桶 FM 误差 (分母复用 micro_bucket_counts: 同 batch 同 sigma, 桶计数一致)
                 micro_teacher_bucket_sums.scatter_add_(0, bins, torch.stack(teacher_fm_sq).detach().float())
         if not micro_losses:
@@ -980,16 +1075,20 @@ def main():
             continue
         engine.step()
         loss_value = torch.stack(micro_losses).mean().item()
-        kd_loss_value = torch.stack(micro_kd_losses).mean().item() if micro_kd_losses else None
-        kd_cos_value = torch.stack(micro_kd_cos).mean().item() if micro_kd_cos else None
+        feat_value = torch.stack(micro_feat_losses).mean().item() if micro_feat_losses else None
+        rel_value = torch.stack(micro_rel_losses).mean().item() if micro_rel_losses else None
+        feat_cos_value = torch.stack(micro_feat_cos).mean().item() if micro_feat_cos else None
         teacher_fm_value = torch.stack(micro_teacher_fm_losses).mean().item() if micro_teacher_fm_losses else None
+        ratio_feat_value = micro_grad_ratios[-1][0] if micro_grad_ratios else None
+        ratio_rel_value = micro_grad_ratios[-1][1] if micro_grad_ratios else None
         sigma_mean = torch.stack(micro_sigmas).sum().item() / (grad_accum * latents.shape[0])
         if rank == 0:
             progress.update(1)
             postfix = {"loss": f"{loss_value:.5f}", "lr": f"{lr_now:.2e}",
                        "samples": step * grad_accum * cfg['training']['batch_size_per_device'] * dist.get_world_size()}
-            if kd_loss_value is not None:
-                postfix["kd"] = f"{kd_loss_value:.4f}"
+            if feat_value is not None:
+                postfix["feat"] = f"{feat_value:.4f}"
+                postfix["rel"] = f"{rel_value:.5f}"
             progress.set_postfix(postfix)
         if step % log_every == 0:
             stats = torch.stack([micro_bucket_sums, micro_bucket_counts])
@@ -1002,22 +1101,31 @@ def main():
             data_hash = hashlib.md5("\x1f".join(last_captions).encode("utf-8")).hexdigest()[:8]
             log_line = "rank=%d step=%d loss=%.6f data=%s lr=%.3e time=%s sigma_mean=%.5f"
             log_args = [rank, step, loss_value, data_hash, lr_now, time.strftime("%H:%M:%S"), sigma_mean]
-            if kd_loss_value is not None:
-                log_line += " kd=%.6f kd_cos=%.4f teacher_fm=%.6f"
-                log_args += [kd_loss_value, kd_cos_value, teacher_fm_value]
+            if feat_value is not None:
+                log_line += " kd_feat=%.6f kd_rel=%.6f feat_cos=%.4f teacher_fm=%.6f"
+                log_args += [feat_value, rel_value, feat_cos_value, teacher_fm_value]
+                if ratio_feat_value is not None:
+                    log_line += " grad_ratio feat=%.1f%% rel=%.1f%%"
+                    log_args += [100 * ratio_feat_value, 100 * ratio_rel_value]
             logger.info(log_line, *log_args)
             if rank == 0 and wandb_run:
                 payload = {"train/loss": loss_value, "train/lr": lr_now, "train/sigma_mean": sigma_mean, "train/samples": step * grad_accum * cfg['training']['batch_size_per_device'] * dist.get_world_size()}
-                if kd_loss_value is not None:
-                    payload["train/kd_loss"] = kd_loss_value
-                    payload["train/kd_v_cos"] = kd_cos_value
-                    payload["train/kd_weight"] = kd_weight
-                    # 统一指标族 (loss/*): fm=student 原始误差, kd=student-teacher 差距,
+                if feat_value is not None:
+                    payload["train/kd_feat_loss"] = feat_value
+                    payload["train/kd_rel_loss"] = rel_value
+                    payload["train/kd_feat_cos"] = feat_cos_value
+                    payload["train/kd_feat_weight"] = kd_feat_weight
+                    payload["train/kd_rel_weight"] = kd_rel_weight
+                    # 统一指标族 (loss/*): fm=student 原始误差, feat/rel=representation KD,
                     # teacher_fm=teacher 对真实 target 的误差, total=实际优化目标
                     payload["loss/fm"] = loss_value
-                    payload["loss/kd"] = kd_loss_value
+                    payload["loss/feat_kd"] = feat_value
+                    payload["loss/rel_kd"] = rel_value
                     payload["loss/teacher_fm"] = teacher_fm_value
-                    payload["loss/total"] = loss_value + kd_weight * kd_loss_value
+                    payload["loss/total"] = loss_value + kd_feat_weight * feat_value + kd_rel_weight * rel_value
+                    if ratio_feat_value is not None:
+                        payload["kd/grad_ratio_feat"] = ratio_feat_value
+                        payload["kd/grad_ratio_rel"] = ratio_rel_value
                 for i in range(SIGMA_BUCKETS):
                     if stats[1, i] <= 0:
                         continue
@@ -1026,7 +1134,7 @@ def main():
                         prev = sigma_bucket_ema[i]
                         sigma_bucket_ema[i] = bucket_loss if not math.isfinite(prev) else 0.9 * prev + 0.1 * bucket_loss
                     payload[f"train/loss_sigma_{i / 10:.1f}-{(i + 1) / 10:.1f}"] = sigma_bucket_ema[i]
-                    # teacher 各噪声区间 FM 质量桶: 若 teacher_fm 在多数桶高于 student fm, 不应盲目调高 λ_kd
+                    # teacher 各噪声区间 FM 质量桶: 若 teacher_fm 在多数桶高于 student fm, KD 信号本身存疑
                     if teacher_stats is not None:
                         teacher_bucket = (teacher_stats[0, i] / teacher_stats[1, i]).item()
                         if math.isfinite(teacher_bucket):

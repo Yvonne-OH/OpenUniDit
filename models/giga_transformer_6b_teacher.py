@@ -594,9 +594,16 @@ class GWPTransformer6BTeacher(ModelMixin, ConfigMixin):
         return_dict: bool = True,
         patch_size: int = 2,
         f_patch_size: int = 1,
+        feature_layers: list[int] | None = None,
     ):
         """Flow: patchify -> t_embed -> x_embed -> x_refine -> cap_embed -> cap_refine
-        -> build_unified -> main_layers -> final_layer -> unpatchify。"""
+        -> build_unified -> main_layers -> final_layer -> unpatchify。
+
+        feature_layers: 需要抽取中间 hidden 的主 layers 索引列表 (KD 用, 只 hook 指定层,
+        不保存全部 activation)。非 None 时返回 dict:
+          sample       — 与默认路径一致的输出 list[[C,F,H,W]]
+          features     — {layer_idx: [B, S_unified_max, D]} 主 layer 输出 (detach)
+          img_real_lens — 每样本真实 image token 数 (unified 序列前缀, 不含 SEQ_MULTI_OF 内部 padding)"""
         if f_patch_size != 1:
             raise ValueError(f"GWP 6B teacher 仅支持 f_patch_size=1, 收到 {f_patch_size}")
         if patch_size not in self.all_patch_size or f_patch_size not in self.all_f_patch_size:
@@ -648,16 +655,26 @@ class GWPTransformer6BTeacher(ModelMixin, ConfigMixin):
             x, x_freqs, x_seqlens, cap_feats, cap_freqs, cap_seqlens, device
         )
 
-        for layer in self.layers:
+        features = {} if feature_layers is not None else None
+        for layer_idx, layer in enumerate(self.layers):
             unified = (
                 self._gradient_checkpointing_func(layer, unified, unified_mask, unified_freqs, adaln_input)
                 if torch.is_grad_enabled() and self.gradient_checkpointing
                 else layer(unified, unified_mask, unified_freqs, adaln_input)
             )
+            if features is not None and layer_idx in feature_layers:
+                features[layer_idx] = unified.detach()
 
         unified = self.all_final_layer[f"{patch_size}-{f_patch_size}"](unified, c=adaln_input)
 
         # Unpatchify: list of [C, F, H, W]
         x = [self._unpatchify_one(tokens, size, patch_size, f_patch_size) for tokens, size in zip(unified.unbind(dim=0), x_size)]
 
+        if feature_layers is not None:
+            # 每样本真实 image token 数: (F/pF)*(H/pH)*(W/pW); unified 行前缀即 image 区
+            img_real_lens = [
+                (size[0] // f_patch_size) * (size[1] // patch_size) * (size[2] // patch_size)
+                for size in x_size
+            ]
+            return {"sample": x, "features": features, "img_real_lens": img_real_lens}
         return (x,) if not return_dict else Transformer2DModelOutput(sample=x)

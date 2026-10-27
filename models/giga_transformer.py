@@ -183,7 +183,18 @@ class GigaExpTransformer(nn.Module):
             },
         }
 
-    def forward(self, x, timestep, text, text_mask=None):
+    def attach_kd_projectors(self, teacher_dim: int, num_layers: int = 3):
+        """训练期 Feature KD projector: 每层独立 Linear (dim → teacher_dim, 无 bias)。
+
+        - 只在 KD 训练时由训练脚本挂载; forward 推理路径不引用, 推理结构/FLOPs 完全不变
+        - 保存的纯权重多出 kd_projectors.* 键, 推理侧按名称匹配加载自动忽略
+        - 不可零初始化 (零向量 normalize 后 cos 退化), 保持 Linear 默认随机初始化
+        """
+        self.kd_projectors = nn.ModuleList(
+            nn.Linear(self.dim, teacher_dim, bias=False) for _ in range(num_layers)
+        )
+
+    def forward(self, x, timestep, text, text_mask=None, feature_layers=None):
         if x.ndim != 5:
             raise ValueError("x must be [B,C,T,H,W]")
         b, _, t, h, w = x.shape
@@ -226,8 +237,14 @@ class GigaExpTransformer(nn.Module):
         emb = torch.cat(((ts[:, None] * freq).cos(), (ts[:, None] * freq).sin()), -1)
         cond = self.time_in(emb.to(self.time_in[0].weight.dtype))
         cos, sin = self.rope(t, h, w, text.shape[1], x.device, x.dtype)
-        for block in self.blocks:
+        features = [] if feature_layers is not None else None
+        for block_idx, block in enumerate(self.blocks):
             x = block(x, cond, cos, sin, attention_mask, pack)
+            if features is not None and block_idx in feature_layers:
+                features.append(x)  # [B, n_img+n_text, D] 全序列, KD 侧再切 image 前缀
         image = self.out(self.norm(x[:, :t * h * w]))
         image = image.reshape(b, t, h, w, pt, ph, pw, self.out_channels)
-        return image.permute(0, 7, 1, 4, 2, 5, 3, 6).reshape(b, self.out_channels, t * pt, h * ph, w * pw)
+        out = image.permute(0, 7, 1, 4, 2, 5, 3, 6).reshape(b, self.out_channels, t * pt, h * ph, w * pw)
+        if features is not None:
+            return out, features  # features 顺序 = feature_layers 升序 (blocks 遍历序)
+        return out
