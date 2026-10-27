@@ -28,6 +28,11 @@ _STAGE_CONTEXT = None
 _STAGE_STARTED = 0.0
 _REQUEST_DEADLINE = float('inf')
 
+# LMDB 环境文件最小合法尺寸: 至少 2 个元数据页 (4KB 页 -> 8KB)。
+# 0 字节/残缺文件进 lmdb.open 会对元数据页 pread 到 EOF -> lmdb.Error "Bad file descriptor",
+# 曾被归类 executor_bug 而炸掉整个多机训练 (2026-10-27 monet_cc12m/mdb/s016_000007.mdb 空壳)。
+_MIN_LMDB_FILE_BYTES = 2 * os.sysconf('SC_PAGE_SIZE')
+
 
 class NodeMediaCache:
     """Cross-process node cache for immutable media files."""
@@ -59,12 +64,17 @@ class NodeMediaCache:
         key, source, info = self._key(path)
         if key is None:
             return source
+        if info.st_size < _MIN_LMDB_FILE_BYTES:
+            # 空壳/残缺源文件直接判损坏 (换候选), 不 stage、不进 lmdb.open。
+            raise MediaCorruptError(f'LMDB source is empty/truncated ({info.st_size} bytes): {source}')
         target = os.path.join(self.objects, key)
         ready = target + '.ready'
         lock_path = os.path.join(self.locks, key + '.lock')
         with open(lock_path, 'a+b') as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
-            if not (os.path.isfile(target) and os.path.isfile(ready)):
+            if (not (os.path.isfile(target) and os.path.isfile(ready))
+                    or os.path.getsize(target) < _MIN_LMDB_FILE_BYTES):
+                # 缓存条目残缺 (外部清理/历史脏数据) 视同缺失, 在锁内重 stage 自愈。
                 slot = None
                 try:
                     while slot is None:
@@ -224,6 +234,13 @@ def media_error_category(exc):
         return 'transient_io'
     if isinstance(exc, (ValueError, KeyError, IndexError)):
         return 'invalid_input'
+    module = type(exc).__module__.split('.', 1)[0]
+    if module == 'lmdb':
+        # lmdb.Error 绝不能落入 executor_bug (致命): 满映射/满读是容量问题可重试,
+        # 其余 (空文件/EBADF/损坏) 按文件损坏换候选, 不能为它炸掉整个训练作业。
+        if type(exc).__name__ in ('MapFullError', 'ReadersFullError'):
+            return 'capacity'
+        return 'corrupt'
     return 'executor_bug'
 
 
@@ -246,6 +263,11 @@ def _child_error_category(exc):
         return exc.category
     module = type(exc).__module__.split('.', 1)[0]
     if module in ('av', 'decord', 'PIL'):
+        return 'corrupt'
+    if module == 'lmdb':
+        # 同 media_error_category: lmdb.Error 按 capacity/corrupt 处理, 不再判 executor_bug。
+        if type(exc).__name__ in ('MapFullError', 'ReadersFullError'):
+            return 'capacity'
         return 'corrupt'
     if isinstance(exc, MemoryError) or type(exc).__name__ in ('MapFullError', 'ReadersFullError'):
         return 'capacity'
@@ -274,6 +296,10 @@ def _lmdb_cache_path(path):
         return path
     source = os.path.realpath(path)
     info = os.stat(source)
+    if info.st_size < _MIN_LMDB_FILE_BYTES:
+        # 空壳/残缺源文件直接判损坏 (换候选+跳过): 0 字节文件拷贝校验 0==0 能通过,
+        # 但 lmdb.open 必然 "Bad file descriptor", 绝不能让它走到那一步。
+        raise MediaCorruptError(f'LMDB source is empty/truncated ({info.st_size} bytes): {source}')
     root = os.environ.get('YISU_MEDIA_LMDB_CACHE_DIR', '/tmp/yisu-lmdb-cache')
     max_bytes = int(os.environ.get('YISU_MEDIA_LMDB_CACHE_MAX_BYTES', str(64 * 1024**3)))
     if max_bytes <= 0:
@@ -291,7 +317,9 @@ def _lmdb_cache_path(path):
     lock = open(lock_path, 'a+b')
     try:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        if not os.path.isfile(cached) or not os.path.isfile(ready):
+        if (not os.path.isfile(cached) or not os.path.isfile(ready)
+                or os.path.getsize(cached) < _MIN_LMDB_FILE_BYTES):
+            # 缓存条目残缺 (外部清理/历史脏数据) 视同缺失, 在锁内重 stage 自愈, 不盲信 .ready。
             temporary = f'{cached}.tmp.{os.getpid()}'
             try:
                 with open(source, 'rb') as source_file, open(temporary, 'wb') as target:
