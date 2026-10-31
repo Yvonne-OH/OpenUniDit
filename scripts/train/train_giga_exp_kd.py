@@ -44,6 +44,7 @@ import deepspeed
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+import swanlab
 import wandb
 import yaml
 from tqdm.auto import tqdm
@@ -503,32 +504,42 @@ SIGMA_BUCKETS = 10  # sigma 等宽分桶数: [0,0.1) ... [0.9,1.0]
 def feature_relation_kd(student_feats, teacher_feats, projectors, n_img, relation_tokens):
     """Feature KD + Relation KD, 仅 image tokens (student/teacher latent 网格逐 token 对齐)。
 
-    - Feature KD: 每层独立 projector (D_S→D_T) 投影后双方 L2 normalize, 逐 token cosine,
-      1 - mean cos, 三层平均; projector 属于 student 模块, 梯度正常回传
+    - Feature KD (v2 去均值口径): 每层独立 projector (D_S→D_T) 投影 → 逐 sample 减 image token
+      集合均值 → L2 normalize → 逐 token cosine, 1 - mean cos, 三层平均。
+      去均值的原因: transformer hidden 高度各向异性, 所有 token 共享主导方向 u, 旧口径
+      (直接 normalize) 的 cosine 被 u 主导 —— projector 只需对齐 u 即可数百步内刷到 cos≈1
+      (上版实验 feat_cos 0.9999 饱和、梯度耗尽), token 级结构信息并未传递。减去 token 集合
+      均值后 cosine 只度量 token 偏离分量的对齐。
     - Relation KD: 投影前 normalized hidden 随机采样相同位置 tokens 的 Gram 矩阵
-      (token×token 余弦相似度阵) MSE, 三层平均, 不依赖双方 hidden dim
+      (token×token 余弦相似度阵) MSE, 三层平均, 不依赖双方 hidden dim (保持 v1 口径不动,
+      单变量实验: 与 v1 的差异只有 Feature KD 去均值)。
     - student_feats/teacher_feats: 各层 [B, S, D] (image tokens 为序列前缀, 逐位对应)
-    返回 (l_feat, l_rel, feat_cos_mean)。
+    返回 (l_feat, l_rel, feat_cos_centered, feat_cos_raw)。
     """
-    feat_losses, rel_losses, cos_means = [], [], []
+    feat_losses, rel_losses, cos_centered, cos_raw = [], [], [], []
     # 采样位置对 teacher/student 完全一致 (相同网格, 相同索引); token 不足则全用
     perm = torch.randperm(n_img, device=student_feats[0].device)[: min(relation_tokens, n_img)]
     for h_s, h_t, projector in zip(student_feats, teacher_feats, projectors):
         s_img = h_s[:, :n_img]  # [B, N, D_S]
         t_img = h_t[:, :n_img]  # [B, N, D_T]
-        # Feature KD: 投影 → normalize → 逐 token cosine
-        z_s = F.normalize(projector(s_img).float(), dim=-1)
-        z_t = F.normalize(t_img.float(), dim=-1)
+        # Feature KD: 投影 → 去均值 → normalize → 逐 token cosine
+        r_s = projector(s_img).float()
+        r_t = t_img.float()
+        z_s = F.normalize(r_s - r_s.mean(dim=1, keepdim=True), dim=-1)
+        z_t = F.normalize(r_t - r_t.mean(dim=1, keepdim=True), dim=-1)
         cos = (z_s * z_t).sum(-1)
         feat_losses.append(1.0 - cos.mean())
-        cos_means.append(cos.detach().mean())
+        cos_centered.append(cos.mean())
+        # raw 口径 (不减均值) 仅监控: 与 v1 的 feat_cos 可比, 量化各向异性捷径的占比
+        cos_raw.append((F.normalize(r_s, dim=-1) * F.normalize(r_t, dim=-1)).sum(-1).mean())
         # Relation KD: 投影前 normalized hidden 的 Gram 矩阵 (与 hidden dim 无关)
         r_s = F.normalize(s_img.float(), dim=-1)[:, perm]
         r_t = F.normalize(t_img.float(), dim=-1)[:, perm]
         gram_s = torch.bmm(r_s, r_s.transpose(1, 2))
         gram_t = torch.bmm(r_t, r_t.transpose(1, 2))
         rel_losses.append(F.mse_loss(gram_s, gram_t))
-    return torch.stack(feat_losses).mean(), torch.stack(rel_losses).mean(), torch.stack(cos_means).mean()
+    return (torch.stack(feat_losses).mean(), torch.stack(rel_losses).mean(),
+            torch.stack(cos_centered).mean(), torch.stack(cos_raw).mean())
 
 
 def sigma_bucket_loss_stats(sigma, per_sample_loss):
@@ -544,7 +555,7 @@ def sigma_bucket_loss_stats(sigma, per_sample_loss):
 
 
 @torch.no_grad()
-def run_next_batch_validation(engine, vae, tokenizer, text_encoder, device, dtype, batch, step, rank, cfg, output_dir, logger, wandb_run):
+def run_next_batch_validation(engine, vae, tokenizer, text_encoder, device, dtype, batch, step, rank, cfg, output_dir, logger, wandb_run, swanlab_run=None):
     """每卡对 next batch 做真实推理: flow ODE 采样 → VAE 解码 → 黑底黄字 prompt 对比图 + JSON 信息."""
     import textwrap
     from PIL import Image, ImageDraw
@@ -642,6 +653,8 @@ def run_next_batch_validation(engine, vae, tokenizer, text_encoder, device, dtyp
     logger.info("🖼️ step=%d rank=%d next-batch 推理完成: %d samples → %s", step, rank, b, val_dir / f"rank{rank}.png")
     if wandb_run and rank == 0:
         wandb.log({"val/grid": wandb.Image(grid)}, step=step)
+    if swanlab_run and rank == 0:
+        swanlab.log({"val/grid": swanlab.Image(grid)}, step=step)
 
 
 def print_banner(cfg, rank):
@@ -668,7 +681,10 @@ def print_banner(cfg, rank):
     print(f"⚙️  Optimizer: {cfg['training']['optimizer']} | lr={cfg['training']['learning_rate']} | warmup={cfg['training'].get('lr_warmup_steps')} | max_epochs={cfg['training']['max_epochs']} | cosine", flush=True)
     print(f"    global_batch={cfg['training']['batch_size_per_device']}×{cfg['distributed'].get('world_size', '?')} GPUs | precision={cfg['training'].get('mixed_precision')}", flush=True)
     print(f"💾 Output: {cfg['output_dir']}", flush=True)
-    print(f"📊 Wandb: project={cfg['logging']['wandb']['project']} name={cfg['logging']['wandb']['name']}", flush=True)
+    print(f"📊 Wandb: project={cfg['logging']['wandb']['project']} name={cfg['logging']['wandb']['name']} enabled={cfg['logging']['wandb'].get('enabled')}", flush=True)
+    sl = cfg["logging"].get("swanlab", {})
+    if sl.get("enabled"):
+        print(f"📊 SwanLab: project={sl['project']} name={sl['name']}", flush=True)
     print("📋 Config:", flush=True)
     for key in ("model", "scheduler", "dataset", "training"):
         print(f"   [{key}] {json.dumps(cfg[key], ensure_ascii=False, default=str)}", flush=True)
@@ -865,6 +881,19 @@ def main():
         run_file.write_text(json.dumps({"id": run_id}))
         wandb_run = wandb.init(project=cfg["logging"]["wandb"]["project"], name=cfg["logging"]["wandb"]["name"], id=run_id, resume="allow", dir=str(wandb_dir), config=cfg)
 
+    swanlab_run = None
+    if rank == 0 and cfg["logging"].get("swanlab", {}).get("enabled"):
+        sl_cfg = cfg["logging"]["swanlab"]
+        if sl_cfg.get("api_key"):
+            os.environ["SWANLAB_API_KEY"] = str(sl_cfg["api_key"])
+        swanlab_dir = output_dir / "swanlab"
+        swanlab_dir.mkdir(exist_ok=True)
+        run_file = swanlab_dir / "run.json"
+        # 与 wandb 同一持久化策略: 同一 output 重启复用同一 SwanLab 实验 id, resume="allow" 续写
+        run_id = json.loads(run_file.read_text())["id"] if run_file.exists() else uuid.uuid4().hex[:20]
+        run_file.write_text(json.dumps({"id": run_id}))
+        swanlab_run = swanlab.init(project=sl_cfg["project"], name=sl_cfg["name"], id=run_id, resume="allow", log_dir=str(swanlab_dir), config=cfg)
+
     sigma_bucket_ema = [float("nan")] * SIGMA_BUCKETS  # rank0: 各 sigma 桶 loss 的 EMA (α=0.1)
     log_every = int(cfg["logging"].get("log_every_n_steps", 1))
     pending_batch = None
@@ -925,6 +954,7 @@ def main():
         micro_feat_losses = []
         micro_rel_losses = []
         micro_feat_cos = []
+        micro_feat_cos_raw = []
         micro_grad_ratios = []
         micro_teacher_fm_losses = []
         micro_teacher_bucket_sums = torch.zeros(SIGMA_BUCKETS, device=device)
@@ -1029,7 +1059,7 @@ def main():
                     raise ValueError(
                         f"teacher/student image token 网格不一致: teacher={teacher_img_lens} student={n_img} "
                         f"(student patch={engine.module.patch_size}, teacher patch={teacher_patch_size}/f={teacher_f_patch_size})")
-                l_feat, l_rel, feat_cos = feature_relation_kd(
+                l_feat, l_rel, feat_cos, feat_cos_raw = feature_relation_kd(
                     student_feats, teacher_feats, engine.module.kd_projectors, n_img, kd_rel_tokens)
                 loss = loss + kd_feat_weight * l_feat + kd_rel_weight * l_rel
                 # teacher oracle FM loss (仅诊断, 不参与优化): teacher velocity 对真实 FM target 的误差
@@ -1044,6 +1074,7 @@ def main():
                 micro_feat_losses.append(l_feat.detach())
                 micro_rel_losses.append(l_rel.detach())
                 micro_feat_cos.append(feat_cos.detach())
+                micro_feat_cos_raw.append(feat_cos_raw.detach())
                 del student_feats
             if kd_enabled and grad_accum == 1 and step <= kd_monitor_end:
                 # 前 N step 梯度范数监控: λ_f·g_feat/g_FM 目标 5%~15%, λ_r·g_rel/g_FM 目标 2%~10%,
@@ -1058,7 +1089,7 @@ def main():
                 probe_pred, probe_feats = probe(xt.to(dtype), sigma * 1000, text, mask,
                                                 feature_layers=student_kd_layers)
                 probe_fm = (probe_pred.float() - (noise - latents).float()).square().mean()
-                probe_feat, probe_rel, _ = feature_relation_kd(
+                probe_feat, probe_rel, _, _ = feature_relation_kd(
                     probe_feats, teacher_feats, probe.kd_projectors, n_img, kd_rel_tokens)
                 probe_params = [p for name, p in probe.named_parameters()
                                 if not name.startswith("kd_projectors")]
@@ -1095,6 +1126,7 @@ def main():
         feat_value = torch.stack(micro_feat_losses).mean().item() if micro_feat_losses else None
         rel_value = torch.stack(micro_rel_losses).mean().item() if micro_rel_losses else None
         feat_cos_value = torch.stack(micro_feat_cos).mean().item() if micro_feat_cos else None
+        feat_cos_raw_value = torch.stack(micro_feat_cos_raw).mean().item() if micro_feat_cos_raw else None
         teacher_fm_value = torch.stack(micro_teacher_fm_losses).mean().item() if micro_teacher_fm_losses else None
         ratio_feat_value = micro_grad_ratios[-1][0] if micro_grad_ratios else None
         ratio_rel_value = micro_grad_ratios[-1][1] if micro_grad_ratios else None
@@ -1119,18 +1151,19 @@ def main():
             log_line = "rank=%d step=%d loss=%.6f data=%s lr=%.3e time=%s sigma_mean=%.5f"
             log_args = [rank, step, loss_value, data_hash, lr_now, time.strftime("%H:%M:%S"), sigma_mean]
             if feat_value is not None:
-                log_line += " kd_feat=%.6f kd_rel=%.6f feat_cos=%.4f teacher_fm=%.6f"
-                log_args += [feat_value, rel_value, feat_cos_value, teacher_fm_value]
+                log_line += " kd_feat=%.6f kd_rel=%.6f feat_cos=%.4f feat_cos_raw=%.4f teacher_fm=%.6f"
+                log_args += [feat_value, rel_value, feat_cos_value, feat_cos_raw_value, teacher_fm_value]
                 if ratio_feat_value is not None:
                     log_line += " grad_ratio feat=%.1f%% rel=%.1f%%"
                     log_args += [100 * ratio_feat_value, 100 * ratio_rel_value]
             logger.info(log_line, *log_args)
-            if rank == 0 and wandb_run:
+            if rank == 0 and (wandb_run or swanlab_run):
                 payload = {"train/loss": loss_value, "train/lr": lr_now, "train/sigma_mean": sigma_mean, "train/samples": step * grad_accum * cfg['training']['batch_size_per_device'] * dist.get_world_size()}
                 if feat_value is not None:
                     payload["train/kd_feat_loss"] = feat_value
                     payload["train/kd_rel_loss"] = rel_value
                     payload["train/kd_feat_cos"] = feat_cos_value
+                    payload["train/kd_feat_cos_raw"] = feat_cos_raw_value
                     payload["train/kd_feat_weight"] = kd_feat_weight
                     payload["train/kd_rel_weight"] = kd_rel_weight
                     # 统一指标族 (loss/*): fm=student 原始误差, feat/rel=representation KD,
@@ -1156,7 +1189,10 @@ def main():
                         teacher_bucket = (teacher_stats[0, i] / teacher_stats[1, i]).item()
                         if math.isfinite(teacher_bucket):
                             payload[f"loss/teacher_fm_by_sigma_{i / 10:.1f}-{(i + 1) / 10:.1f}"] = teacher_bucket
-                wandb.log(payload, step=step)
+                if wandb_run:
+                    wandb.log(payload, step=step)
+                if swanlab_run:
+                    swanlab.log(payload, step=step)
         if cfg["validation"].get("enabled", True) and step % int(cfg["validation"].get("every_n_steps", 1000)) == 0:
             try:
                 pending_batch = next(iterator)
@@ -1170,9 +1206,13 @@ def main():
             else:
                 if rank == 0:
                     logger.info("🔍 step=%d 每卡对 next batch 推理", step)
+                # 验证前主动回收缓存碎片: 训练期显存贴边, 验证 6.10 GiB 分配曾连续 17 个验证点
+                # 看运气失败 (10-27~10-28), 每 1000 步一次 empty_cache 代价可忽略
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
                 # 验证是纯前向、无集合通信, 单 rank 失败不影响其他 rank; 兜底避免 val OOM 带崩整个作业
                 try:
-                    run_next_batch_validation(engine, vae, tokenizer, text_encoder, device, dtype, pending_batch, step, rank, cfg, output_dir, logger, wandb_run)
+                    run_next_batch_validation(engine, vae, tokenizer, text_encoder, device, dtype, pending_batch, step, rank, cfg, output_dir, logger, wandb_run, swanlab_run)
                 except Exception as exc:
                     logger.warning("⏭️ step=%d 验证异常, 跳过本步验证 (训练继续): %s", step, repr(exc))
                     if torch.cuda.is_available():
@@ -1190,6 +1230,8 @@ def main():
         progress.close()
     if wandb_run:
         wandb.finish()
+    if swanlab_run:
+        swanlab.finish()
 
 
 if __name__ == "__main__":

@@ -268,7 +268,7 @@ pip install -r requirements.txt
 `requirements.txt` 仅覆盖通用依赖；训练线还需额外安装：
 
 ```bash
-pip install deepspeed wandb lmdb pyarrow tqdm
+pip install deepspeed wandb swanlab lmdb pyarrow tqdm
 ```
 
 ### 外部资源

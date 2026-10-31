@@ -26,6 +26,7 @@ if str(THIRDPARTY) not in sys.path:
 import deepspeed
 import torch
 import torch.distributed as dist
+import swanlab
 import wandb
 import yaml
 from tqdm.auto import tqdm
@@ -494,7 +495,7 @@ def sigma_bucket_loss_stats(sigma, per_sample_loss):
 
 
 @torch.no_grad()
-def run_next_batch_validation(engine, vae, tokenizer, text_encoder, device, dtype, batch, step, rank, cfg, output_dir, logger, wandb_run):
+def run_next_batch_validation(engine, vae, tokenizer, text_encoder, device, dtype, batch, step, rank, cfg, output_dir, logger, wandb_run, swanlab_run=None):
     """每卡对 next batch 做真实推理: flow ODE 采样 → VAE 解码 → 黑底黄字 prompt 对比图 + JSON 信息."""
     import textwrap
     from PIL import Image, ImageDraw
@@ -592,6 +593,8 @@ def run_next_batch_validation(engine, vae, tokenizer, text_encoder, device, dtyp
     logger.info("🖼️ step=%d rank=%d next-batch 推理完成: %d samples → %s", step, rank, b, val_dir / f"rank{rank}.png")
     if wandb_run and rank == 0:
         wandb.log({"val/grid": wandb.Image(grid)}, step=step)
+    if swanlab_run and rank == 0:
+        swanlab.log({"val/grid": swanlab.Image(grid)}, step=step)
 
 
 def print_banner(cfg, rank):
@@ -618,7 +621,10 @@ def print_banner(cfg, rank):
     print(f"⚙️  Optimizer: {cfg['training']['optimizer']} | lr={cfg['training']['learning_rate']} | warmup={cfg['training'].get('lr_warmup_steps')} | max_epochs={cfg['training']['max_epochs']} | cosine", flush=True)
     print(f"    global_batch={cfg['training']['batch_size_per_device']}×{cfg['distributed'].get('world_size', '?')} GPUs | precision={cfg['training'].get('mixed_precision')}", flush=True)
     print(f"💾 Output: {cfg['output_dir']}", flush=True)
-    print(f"📊 Wandb: project={cfg['logging']['wandb']['project']} name={cfg['logging']['wandb']['name']}", flush=True)
+    print(f"📊 Wandb: project={cfg['logging']['wandb']['project']} name={cfg['logging']['wandb']['name']} enabled={cfg['logging']['wandb'].get('enabled')}", flush=True)
+    sl = cfg["logging"].get("swanlab", {})
+    if sl.get("enabled"):
+        print(f"📊 SwanLab: project={sl['project']} name={sl['name']}", flush=True)
     print("📋 Config:", flush=True)
     for key in ("model", "scheduler", "dataset", "training"):
         print(f"   [{key}] {json.dumps(cfg[key], ensure_ascii=False, default=str)}", flush=True)
@@ -773,6 +779,19 @@ def main():
         run_file.write_text(json.dumps({"id": run_id}))
         wandb_run = wandb.init(project=cfg["logging"]["wandb"]["project"], name=cfg["logging"]["wandb"]["name"], id=run_id, resume="allow", dir=str(wandb_dir), config=cfg)
 
+    swanlab_run = None
+    if rank == 0 and cfg["logging"].get("swanlab", {}).get("enabled"):
+        sl_cfg = cfg["logging"]["swanlab"]
+        if sl_cfg.get("api_key"):
+            os.environ["SWANLAB_API_KEY"] = str(sl_cfg["api_key"])
+        swanlab_dir = output_dir / "swanlab"
+        swanlab_dir.mkdir(exist_ok=True)
+        run_file = swanlab_dir / "run.json"
+        # 与 wandb 同一持久化策略: 同一 output 重启复用同一 SwanLab 实验 id, resume="allow" 续写
+        run_id = json.loads(run_file.read_text())["id"] if run_file.exists() else uuid.uuid4().hex[:20]
+        run_file.write_text(json.dumps({"id": run_id}))
+        swanlab_run = swanlab.init(project=sl_cfg["project"], name=sl_cfg["name"], id=run_id, resume="allow", log_dir=str(swanlab_dir), config=cfg)
+
     sigma_bucket_ema = [float("nan")] * SIGMA_BUCKETS  # rank0: 各 sigma 桶 loss 的 EMA (α=0.1)
     log_every = int(cfg["logging"].get("log_every_n_steps", 1))
     pending_batch = None
@@ -911,7 +930,7 @@ def main():
             dist.all_reduce(stats)
             data_hash = hashlib.md5("\x1f".join(last_captions).encode("utf-8")).hexdigest()[:8]
             logger.info("rank=%d step=%d loss=%.6f data=%s lr=%.3e time=%s sigma_mean=%.5f", rank, step, loss_value, data_hash, lr_now, time.strftime("%H:%M:%S"), sigma_mean)
-            if rank == 0 and wandb_run:
+            if rank == 0 and (wandb_run or swanlab_run):
                 payload = {"train/loss": loss_value, "train/lr": lr_now, "train/sigma_mean": sigma_mean, "train/samples": step * grad_accum * cfg['training']['batch_size_per_device'] * dist.get_world_size()}
                 for i in range(SIGMA_BUCKETS):
                     if stats[1, i] <= 0:
@@ -921,7 +940,10 @@ def main():
                         prev = sigma_bucket_ema[i]
                         sigma_bucket_ema[i] = bucket_loss if not math.isfinite(prev) else 0.9 * prev + 0.1 * bucket_loss
                     payload[f"train/loss_sigma_{i / 10:.1f}-{(i + 1) / 10:.1f}"] = sigma_bucket_ema[i]
-                wandb.log(payload, step=step)
+                if wandb_run:
+                    wandb.log(payload, step=step)
+                if swanlab_run:
+                    swanlab.log(payload, step=step)
         if cfg["validation"].get("enabled", True) and step % int(cfg["validation"].get("every_n_steps", 1000)) == 0:
             try:
                 pending_batch = next(iterator)
@@ -937,7 +959,7 @@ def main():
                     logger.info("🔍 step=%d 每卡对 next batch 推理", step)
                 # 验证是纯前向、无集合通信, 单 rank 失败不影响其他 rank; 兜底避免 val OOM 带崩整个作业
                 try:
-                    run_next_batch_validation(engine, vae, tokenizer, text_encoder, device, dtype, pending_batch, step, rank, cfg, output_dir, logger, wandb_run)
+                    run_next_batch_validation(engine, vae, tokenizer, text_encoder, device, dtype, pending_batch, step, rank, cfg, output_dir, logger, wandb_run, swanlab_run)
                 except Exception as exc:
                     logger.warning("⏭️ step=%d 验证异常, 跳过本步验证 (训练继续): %s", step, repr(exc))
                     if torch.cuda.is_available():
@@ -955,6 +977,8 @@ def main():
         progress.close()
     if wandb_run:
         wandb.finish()
+    if swanlab_run:
+        swanlab.finish()
 
 
 if __name__ == "__main__":

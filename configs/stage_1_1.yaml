@@ -145,10 +145,15 @@ training:
   resume_lr_scheduler: true
 
 logging:
-  report_to: [console, wandb]
+  report_to: [console, swanlab]
   log_every_n_steps: 1
   save_samples: true
-  wandb:
+  swanlab:
     enabled: true
+    project: giga-exp-image
+    name: giga_exp_image_stage_1p1
+    api_key: Dit2ngq8iuiGfUkI88e5b
+  wandb:
+    enabled: false
     project: giga-exp-image
     name: giga_exp_image_stage_1p1

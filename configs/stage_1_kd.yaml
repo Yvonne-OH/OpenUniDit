@@ -174,15 +174,20 @@ training:
   state_checkpoints_keep: 2
   # KD 启动: resume_mode 指向 stage_1 纯权重目录 (自动取最新 step-*, step 从 130000 续计, optimizer 全新);
   # KD 中断续训改回 resume_mode: auto 即可优先恢复本目录 checkpoint。
-  resume_mode: /home/jovyan/pfs/users/zhanqian.wu/exp/giga_exp_image/stage_1_28layers/checkpoints/weights
+  resume_mode: auto #/home/jovyan/pfs/users/zhanqian.wu/exp/giga_exp_image/stage_1_28layers/checkpoints/weights
   resume_optimizer: false
   resume_lr_scheduler: true
 
 logging:
-  report_to: [console, wandb]
+  report_to: [console, swanlab]
   log_every_n_steps: 1
   save_samples: true
-  wandb:
+  swanlab:
     enabled: true
+    project: giga-exp-image
+    name: giga_exp_image_stage_1_kd_28layers_v2
+    api_key: Dit2ngq8iuiGfUkI88e5b
+  wandb:
+    enabled: false
     project: giga-exp-image
     name: giga_exp_image_stage_1_kd_28layers_v2

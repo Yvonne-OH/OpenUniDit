@@ -3,5 +3,6 @@ diffusers>=0.38.0
 huggingface-hub>=1.5.0,<2.0
 pillow>=10.0.0
 safetensors>=0.4.3
+swanlab>=0.3.9
 torch>=2.4.0
 transformers>=5.0.0
