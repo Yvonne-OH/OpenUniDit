@@ -483,6 +483,10 @@ class ImageDatabaseDataset(Dataset):
                 print(f'[image] stage=sample_start {detail}', flush=True)
             try:
                 candidate_timeout = budget.timeout()
+                if candidate_timeout < 2.0:
+                    # 剩余预算连 spawn+lmdb open 都不够 (实测 0.5s 尝试 100% 超时),
+                    # 别再空转子进程, 直接放弃换下一个样本。
+                    break
                 result = self._load_item(candidate, min(budget.deadline, time.monotonic() + candidate_timeout), detail, bucket_override=bucket_override)
                 return result
             except Exception as exc:

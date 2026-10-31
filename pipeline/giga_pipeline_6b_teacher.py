@@ -78,7 +78,9 @@ def encode_prompts_6b_teacher(
         raise RuntimeError(
             f"teacher 条件长度 {int(seq_lens.max())} 超过 max_condition_tokens={max_condition_tokens}"
         )
-    outputs = vl_text_encoder(**inputs, output_hidden_states=True, use_cache=False, return_dict=True)
+    # logits_to_keep=1: 只需要 hidden_states, 跳过 lm_head 全序列 logits (batch×seq×151936 vocab,
+    # 长 caption batch 可达 10+ GiB, 10-28 step≈169194 rank1 正是在这里 OOM 团灭整个作业)。
+    outputs = vl_text_encoder(**inputs, output_hidden_states=True, use_cache=False, return_dict=True, logits_to_keep=1)
     hidden = outputs.hidden_states[layer]
     mask = inputs["attention_mask"].bool()
     encoded = [hidden[i][mask[i]].clone() for i in range(len(prompts))]

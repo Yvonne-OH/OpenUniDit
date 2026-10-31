@@ -40,9 +40,9 @@ CONFIG="${CONFIG:-${ROOT}/configs/stage_1.yaml}"
 HEIGHT=512      # 必须是 32 的倍数; 默认横屏 192x128 (WxH, 对应训练桶 192x128)
 WIDTH=512
 STEPS=40        # 训练验证用 20; 质量优先可加到 40+
-GUIDANCE_SCALE=3.0
+CFGS=(3 6 9 12) # guidance scale 组合, 与 SHIFTS 笛卡尔积
 NEGATIVE_PROMPT="blurry, distorted, deformed, low quality"
-SHIFTS=(1 3 6 9) # 同一权重、prompt 和 seed，对比四组采样 shift
+SHIFTS=(3 6)    # 同一权重、prompt 和 seed, 对比 shift × cfg 组合
 SEED=42         # 所有 prompt 固定同一噪声种子
 BATCH_SIZE="${BATCH_SIZE:-4}"   # 越大越快(结果与 batch 大小无关)
 GPU=""          # 空 = 自动用最后一张 GPU (如 8 卡机为 7)
@@ -79,7 +79,6 @@ ARGS=(
   --height "${HEIGHT}"
   --width "${WIDTH}"
   --steps "${STEPS}"
-  --guidance-scale "${GUIDANCE_SCALE}"
   --negative-prompt "${NEGATIVE_PROMPT}"
   --seed "${SEED}"
   --batch-size "${BATCH_SIZE}"
@@ -98,9 +97,12 @@ if [[ -z "${GPU}" ]]; then
   GPU=$(( $(nvidia-smi -L | wc -l) - 1 ))
 fi
 for SHIFT in "${SHIFTS[@]}"; do
-  SHIFT_OUTPUT_DIR="${OUTPUT_DIR}/shift_${SHIFT}"
-  printf '\n开始推理 shift=%s → %s\n' "$SHIFT" "$SHIFT_OUTPUT_DIR"
-  CUDA_VISIBLE_DEVICES="${GPU}" python "${ARGS[@]}" \
-    --shift "$SHIFT" --output-dir "$SHIFT_OUTPUT_DIR"
+  for CFG in "${CFGS[@]}"; do
+    COMBO_OUTPUT_DIR="${OUTPUT_DIR}/shift_${SHIFT}_cfg_${CFG}"
+    printf '\n开始推理 shift=%s cfg=%s → %s\n' "$SHIFT" "$CFG" "$COMBO_OUTPUT_DIR"
+    CUDA_VISIBLE_DEVICES="${GPU}" python "${ARGS[@]}" \
+      --shift "$SHIFT" --guidance-scale "$CFG" --output-dir "$COMBO_OUTPUT_DIR"
+  done
 done
-printf '\n四组 shift 推理完成 → %s\n' "$OUTPUT_DIR"
+printf '\nshift×cfg 共 %d 组推理完成 → %s\n' \
+  "$(( ${#SHIFTS[@]} * ${#CFGS[@]} ))" "$OUTPUT_DIR"

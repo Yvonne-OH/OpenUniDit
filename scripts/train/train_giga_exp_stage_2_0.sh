@@ -23,7 +23,9 @@ fi
 MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
 MASTER_PORT="${MASTER_PORT:-29500}"
 
-OUTPUT_DIR="$(python - "$CONFIG" <<'PY'
+OUTPUT_DIR="$(python - "$CONFIG" <<'PY' | grep '^/'
+# 平台注入的 ftelasticagent 钩子会往 stdout 打 "Module imported successfully: ...",
+# 命令替换会把它一起捕获; 只保留以 / 开头的行 = yaml 里的 output_dir。
 import sys, yaml
 from pathlib import Path
 path = Path(sys.argv[1])

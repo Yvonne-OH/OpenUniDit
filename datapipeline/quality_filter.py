@@ -36,6 +36,11 @@ def quality_check(img: Image.Image, cfg: dict) -> dict:
         fails.append(f"min_side<{cfg['min_side']}")
     if max(w, h) > cfg["max_side"]:
         fails.append(f"max_side>{cfg['max_side']}")
+    aspect = w / h if h else float("inf")
+    if cfg.get("aspect_min") and aspect < cfg["aspect_min"]:
+        fails.append(f"aspect<{cfg['aspect_min']}")
+    if cfg.get("aspect_max") and aspect > cfg["aspect_max"]:
+        fails.append(f"aspect>{cfg['aspect_max']}")
 
     gray = np.asarray(img.convert("L"), dtype=np.float32)
     blur_var = _laplacian_var(gray)

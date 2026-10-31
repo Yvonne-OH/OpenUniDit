@@ -906,6 +906,17 @@ def decode_pair(path, frames, fps, height, width, random_crop=True, sample_rate=
                 sample_rate=sample_rate)
 
 
+def _child_env(**overrides):
+    """解码子进程环境: 剥离 PYTHONPATH 里的平台 ftelasticagent 钩子路径。
+
+    子进程不 import torch, 钩子的 SymbolRewrite 对它毫无用处; 且 copy19 实测每次
+    PIL import 都经钩子 _custom_import 后 MemoryError (钩子在子进程故障路径上,
+    rank 主进程从不 import PIL, 只有解码子进程会踩)。剥离同时让子进程启动更快。
+    """
+    paths = [p for p in os.environ.get('PYTHONPATH', '').split(':') if p and 'fault-tolerance' not in p]
+    return dict(os.environ, PYTHONPATH=':'.join(paths), **overrides)
+
+
 class _PersistentDecoderClient:
     def __init__(self):
         self.proc = None
@@ -915,13 +926,19 @@ class _PersistentDecoderClient:
             [sys.executable, os.path.abspath(__file__), '--persistent'],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
             text=True, bufsize=1,
-            env=dict(os.environ, YISU_MEDIA_LMDB_CACHE='0'),
+            env=_child_env(YISU_MEDIA_LMDB_CACHE='0'),
         )
 
     def close(self):
         if self.proc is not None:
             self.proc.kill()
-            self.proc.wait()
+            try:
+                # 存储 stall 时子进程处于 D 状态, SIGKILL 排队但不生效;
+                # 无限 wait() 会阻塞到 IO 完成, 把样本预算烧穿
+                # (实测 16s select 超时后 close() 仍多阻塞 ~24s, 后续候选只剩 0.5s 必死)。
+                self.proc.wait(timeout=0.2)
+            except subprocess.TimeoutExpired:
+                pass  # 交给后续 Popen cleanup 收尸, 不阻塞当前请求
             for stream in (self.proc.stdin, self.proc.stdout):
                 if stream is not None:
                     stream.close()
@@ -954,6 +971,9 @@ class _PersistentDecoderClient:
 
 
 _PERSISTENT_CLIENT = None
+# 通道级故障 (select 超时/管道断裂) 后的冷却截止时刻 (time.monotonic): 冷却期内
+# decode_isolated 直接走一次性路径, 不再让每个候选白烧 cap 秒。成功解码会清零。
+_PERSISTENT_DISABLED_UNTIL = 0.0
 
 
 def _persistent_decode_request(request, timeout):
@@ -965,31 +985,50 @@ def _persistent_decode_request(request, timeout):
 
 def decode_isolated(request, timeout, context):
     """Use a resident LMDB decoder for metadata; isolate native media decoding."""
+    global _PERSISTENT_DISABLED_UNTIL
     persistent_images = (os.environ.get('YISU_IMAGE_PERSISTENT_DECODER', '0') == '1'
                          and request.get('kind') in ('image', 'images'))
-    if persistent_images:
-        # 常驻子进程解码图像: 省去每样本 fork + import + lmdb env open;
-        # 大数组经 /dev/shm npy 回传; 任何故障回退到一次性隔离路径, 保持候选重试语义。
+    if (os.environ.get('YISU_MEDIA_PERSISTENT_DECODER', '0') == '1'
+            and request.get('kind') in ('record', 'video_record')):
+        # 视频/记录走常驻通道, 等待上限即 timeout (视频解码本身就慢, 无需硬顶)
+        request = dict(request)
+        request.pop('_trace_context', None)
+        return _persistent_decode_request(request, timeout)
+    if persistent_images and time.monotonic() >= _PERSISTENT_DISABLED_UNTIL:
+        # 常驻子进程解码图像: 省去每样本 fork + import + lmdb env open (~0.2-0.3s/样本,
+        # 压测 192 路并发实测一次性路径 0.4s/样本 vs 常驻 ~0.1s); 大数组经 /dev/shm npy 回传。
+        # stall 防护 (copy18 教训): 等待硬顶 cap=8s (健康解码 <1s, 等满 cap 即通道 stall),
+        # 通道级故障冷却 cooldown=600s 内直接走一次性路径, 不再每个候选白烧 cap;
+        # 一次性路径扣除常驻已耗时间, 并给出权威的 categorized error, 保持候选重试语义。
+        cap = float(os.environ.get('YISU_IMAGE_PERSISTENT_CAP_SECONDS', '8'))
+        cooldown = float(os.environ.get('YISU_IMAGE_PERSISTENT_COOLDOWN_SECONDS', '600'))
         request = dict(request)
         request.pop('_trace_context', None)
         output = tempfile.mkstemp(prefix='yisu-img-', suffix='.npy', dir='/dev/shm')[1]
+        persistent_started = time.monotonic()
         try:
-            _persistent_decode_request(dict(request, _output_path=output), timeout)
+            _persistent_decode_request(dict(request, _output_path=output), min(timeout, cap))
             pixels = np.load(output, allow_pickle=False)
+            _PERSISTENT_DISABLED_UNTIL = 0.0  # 成功 → 立即恢复常驻通道 (存储自愈场景)
             return pixels
-        except Exception:
-            # 常驻通道故障或样本级解码失败 → 一次性路径给出权威的 categorized error
-            pass
+        except Exception as exc:
+            # 通道级故障 (select 硬顶超时/管道断裂/子进程退出) → 冷却降级:
+            # 后续样本跳过常驻通道, 每候选直接用满 candidate timeout 做真实读取。
+            # 子进程正常应答的样本级错误 (corrupt/capacity/invalid_input) 不禁用。
+            if isinstance(exc, (MediaDeadlineError, MediaExecutorBugError)):
+                _PERSISTENT_DISABLED_UNTIL = time.monotonic() + cooldown
+                print(f"[image] persistent decoder channel failed: {type(exc).__name__}: {exc}; "
+                      f"disable persistent for {cooldown:g}s", flush=True)
+            # 扣除常驻通道已耗时间: stall 时一次性路径若再烧满整个 candidate timeout,
+            # 单候选实际耗时 cap+timeout 会破坏 3 候选预算 (0.5s 下限保证快速失败语义)。
+            timeout = max(0.5, timeout - (time.monotonic() - persistent_started))
+            print(f"[image] persistent decoder fallback: {type(exc).__name__}: {exc}; "
+                  f"one-shot timeout reduced to {timeout:.3f}s", flush=True)
         finally:
             try:
                 os.unlink(output)
             except OSError:
                 pass
-    elif (os.environ.get('YISU_MEDIA_PERSISTENT_DECODER', '0') == '1'
-            and request.get('kind') in ('record', 'video_record')):
-        request = dict(request)
-        request.pop('_trace_context', None)
-        return _persistent_decode_request(request, timeout)
     if not math.isfinite(timeout) or timeout <= 0:
         raise ValueError('isolated I/O timeout must be finite and positive')
     import socket
@@ -1011,7 +1050,7 @@ def decode_isolated(request, timeout, context):
         with tempfile.TemporaryFile(dir=directory) as errors:
             errors.write(f'[media-stage] {context} uri={request["path"]} stage=child_launch event=start elapsed=0s\n'.encode())
             errors.flush()
-            env = dict(os.environ, OPENBLAS_NUM_THREADS="1", OMP_NUM_THREADS="1", MKL_NUM_THREADS="1")
+            env = _child_env(OPENBLAS_NUM_THREADS="1", OMP_NUM_THREADS="1", MKL_NUM_THREADS="1")
             proc = subprocess.Popen(
                 [sys.executable, os.path.abspath(__file__), output],
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=errors, env=env,

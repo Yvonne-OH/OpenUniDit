@@ -13,13 +13,17 @@ if [[ -f "$LIBCUDA" && ":${LD_PRELOAD:-}:" != *":$(basename "$LIBCUDA"):*" ]]; t
   export LD_PRELOAD="${LD_PRELOAD:+${LD_PRELOAD}:}${LIBCUDA}"
 fi
 
-# 图像样本加载超时预算: DecodeBudget 将样本预算均分给最多 3 个候选 (48/3=16s/次),
+# 图像样本加载超时预算: DecodeBudget 将样本预算均分给最多 3 个候选,
 # 避免多机 192 路并发冷缓存启动时, Lustre 首读 ~11s 的样本被判超时换图。
 # 单次尝试有效超时 = min(YISU_IMAGE_TIMEOUT_SECONDS, 样本预算/剩余候选数)。
+# 样本预算 120s → 每候选 min(48, 120/3)=40s 真实读取窗口;
+# 48s 预算只给 16s/候选, 存储 stall (单读 >16s) 时必然烧穿换图空转。
 export YISU_IMAGE_TIMEOUT_SECONDS=48
-export YISU_IMAGE_SAMPLE_TIMEOUT_SECONDS=48
-# 常驻图像解码子进程: 免每样本 fork+import+lmdb env open; 故障自动回退一次性隔离路径
-export YISU_IMAGE_PERSISTENT_DECODER=1
+export YISU_IMAGE_SAMPLE_TIMEOUT_SECONDS=120
+# 常驻解码子进程已关闭 (=0): 存储 stall 时常驻通道 select 烧满候选超时,
+# 一次性回退只剩 0.5s 必死 (copy18 实测); 关闭后每次尝试直接一次性解码
+# 用满候选超时, fork+lmdb open 仅 1~3s 可忽略。存储恢复后可改回 1。
+export YISU_IMAGE_PERSISTENT_DECODER=0
 
 # NCCL 只在 WARN 及以上时输出: 平时静默, 通信异常(超时/降级/连接失败)时能看到原因
 export NCCL_DEBUG=WARN
@@ -45,7 +49,11 @@ fi
 MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
 MASTER_PORT="${MASTER_PORT:-29500}"
 
-OUTPUT_DIR="$(python - "$CONFIG" <<'PY'
+OUTPUT_DIR="$(python - "$CONFIG" <<'PY' | grep '^/'
+# 平台给每个 python 进程注入的 ftelasticagent 钩子会往 stdout 打一行
+# "Module imported successfully: ...", 命令替换会把它一起捕获进 OUTPUT_DIR,
+# 导致 logs/compile_cache 全写进 model_exp 下名字带换行的畸形目录
+# (历史日志曾全部丢在那里)。只保留以 / 开头的行 = yaml 里的 output_dir。
 import sys, yaml
 from pathlib import Path
 path = Path(sys.argv[1])
