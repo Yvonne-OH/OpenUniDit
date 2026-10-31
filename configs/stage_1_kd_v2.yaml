@@ -1,0 +1,203 @@
+# Giga-Exp Image stage_1 KD v2: Feature KD 去均值口径重做实验。
+# v1 教训: Feature KD 的 Linear projector 在各向异性 hidden 上走捷径 —— 只对齐 token 集合
+# 共享的主导方向即刷到 feat_cos 0.9999 (≈300 步), 梯度耗尽, token 级结构信息未传递。
+# v2 改动 (相对 stage_1_kd.yaml, 其余完全一致):
+#   1. Feature KD loss: 投影后逐 sample 减 image token 集合均值再 cosine (去各向异性捷径);
+#      Relation KD 口径不动 —— 单变量实验, 与 v1 的差异只有 Feature KD 去均值。
+#   2. grad_monitor_steps 50 → 300: 去均值后 feat 初始 loss 大一个量级, 需更长窗口观察
+#      λ_f·g_feat/g_FM 演化 (目标仍 5%~15%)。
+#   3. 起点 stage_1 纯权重 step-00232500 (bos_ckpt 指定文件, 基线对照组同源同起跑线),
+#      projector 全新初始化; output_dir 换新目录, v1 的 run/checkpoint/wandb 完整保留可追溯。
+# 判据 (先于实验定死): feat_cos (centered) 长期 ≥0.9 → 表征真对齐; 稳定在 0.3~0.7 → v1 确为
+# 捷径, v2 在真实传递结构; 效果以同 step 与基线 stage_1 的验证图 A/B 为准 (OOM 已修, 验证应 8/8)。
+# 启动: bash scripts/train/train_giga_exp_kd.sh configs/stage_1_kd_v2.yaml
+stage: stage_1_kd_v2
+output_dir: /home/jovyan/pfs/users/zhanqian.wu/exp/giga_exp_image/stage_1_kd_28layers_v2
+seed: 42
+
+distributed:
+  backend: deepspeed
+  config: configs/zero1.json
+  world_size: 8
+  timeout_seconds: 7200
+
+# student 结构 (与 stage_1.yaml 完全一致)
+model:
+  in_channels: 48
+  out_channels: 48
+  text_dim: 2560
+  dim: 1536
+  ffn_dim: 4096
+  heads: 12
+  layers: 28
+  rope_theta: 10000.0
+  rope_axes_dims: [16, 48, 48, 16]
+  patch_size: [1, 2, 2]
+
+# ---- KD teacher: GWP 6B (Z-Image 架构, gigaworld stage1 训练) ----
+# 结构参数与 checkpoint 实测一致 (dim=3840/30层/30头/FFN=10240/cap 2560); 推理验证见
+# scripts/infer/infer_giga_exp_6b_teacher.py。训练时冻结 (bf16, no_grad), 与 student 共享
+# Qwen3-VL 编码器实例 (text_encoder), 文本渲染走 teacher 的 chat-template 约定。
+teacher:
+  type: gwp_6b
+  checkpoint: /home/jovyan/pfs/users/zhanqian.wu/ckpt/stage1_wan_image_qwen3_vl_mid_train_256/checkpoint-44000  # 仅 model_weights.pt; 原始完整 ckpt (含 optim) 在 /mnt/nfs/.../checkpoint-44000
+  attention_backend: flash3       # auto|flash3|flash|native (启动时探测)
+  layer: -2                       # Qwen3-VL 条件层 (对齐 gigaworld stage1 约定)
+  max_condition_tokens: 4064
+  dim: 3840
+  n_layers: 30
+  n_heads: 30
+  n_kv_heads: 30
+  cap_feat_dim: 2560
+  in_channels: 48
+  rope_theta: 256.0
+  t_scale: 1000.0                 # teacher 内部 t_embedder(t * t_scale); 输入 t = 1 - sigma
+  rope_axes_dims: [32, 48, 48]
+  rope_axes_lens: [4096, 512, 512]
+  patch_size: 2
+  f_patch_size: 1
+
+# ---- KD 损失: Feature (v2 去均值) + Relation representation 蒸馏 ----
+# loss = FM_MSE + λ_f·L_feat + λ_r·L_rel
+# - Feature KD v2: 相对深度 25/50/75% 三层, 每层独立 Linear projector (D_S→D_T) 投影后
+#   逐 sample 减 image token 集合均值, 再逐 token cosine (1 - mean cos), 仅 image tokens
+# - Relation KD: 投影前 normalized hidden 的 token×token Gram 矩阵 MSE, 每步随机采样
+#   相同位置 relation_tokens 个 image tokens (token 不足则全用); 口径与 v1 一致
+# - projector 挂在 student 模块上仅训练期使用 (约 17.7M params), 推理加载按名称匹配
+#   自动忽略, 推理结构/FLOPs 完全不变; teacher 前向只 hook 3 个 KD 层
+kd:
+  enabled: true
+  feature_weight: 0.05                  # λ_f; 去均值后 L_feat 初始量大, 以 grad_ratio 校准 (目标 5%~15%)
+  relation_weight: 0.05                 # λ_r; 启动值, 按 grad_ratio_rel (目标 2%~10%) 调整
+  feature_rel_depths: [0.25, 0.5, 0.75] # 相对深度 → student/teacher 各自取整 block 索引
+  relation_tokens: 256                  # Relation KD 随机采样 image token 数
+  grad_monitor_steps: 300               # 本次启动后 N step 逐项梯度范数监控 λ·g_kd/g_FM (0 关闭)
+
+components:
+  text_encoder:
+    type: qwen3_vl
+    pretrained_path: /mnt/nfs/models/huggingface/Qwen/Qwen3-VL-4B-Instruct
+    tokenizer_path: /mnt/nfs/models/huggingface/Qwen/Qwen3-VL-4B-Instruct
+    local_files_only: true
+    layer: -2                     # 取倒数第二层 hidden states (对齐 gigaworld stage1 约定)
+    max_length: 512
+  wan_vae:
+    type: AutoencoderKLWan
+    pretrained_path: /mnt/nfs/models/huggingface/models--Wan-AI--Wan2.2-TI2V-5B-Diffusers
+    subfolder: vae
+    local_files_only: true
+
+scheduler:
+  type: flow_matching
+  num_train_timesteps: 1000
+  shift: 3.0                      # sigma 采样分布与 teacher/student 各自训练一致
+  timestep_sampling: uniform
+  validation_shift: 3.0
+
+dataset:
+  dataset_type: lmdb_parquet
+  image_training_enabled: true
+  edit_training_enabled: false
+  database_path: /home/jovyan/pfs/users/zhanqian.wu/pfs_data/unified_images_lmdb
+  image_database_path: /home/jovyan/pfs/users/zhanqian.wu/pfs_data/unified_images_lmdb
+  lmdb_root: /home/jovyan/pfs/users/zhanqian.wu/pfs_data/unified_images_lmdb
+  image_root: /home/jovyan/pfs/users/zhanqian.wu/pfs_data/unified_images_lmdb
+  image_sources:
+    - 4KLSDB
+    - Aesthetic-4K
+    - HumanCaption-10M
+    - LAION_Aesthetics_1024
+    - Poster100K
+    - anime_captions
+    - bg_photo_concepts
+    - blip3o-long-caption-wds
+    - blip3o-long-caption
+    - caption3o-xl-v4
+    - ffhq_captioned_1024
+    - fine_t2i
+    - pexels-advertisement-photography
+    - pexels_aesth_2_1024
+    - qwen-synth-characters-fused
+    - sa1b_en
+    - anyword_3m
+    - pixelprose_cc12m
+    - pixelprose_commonpool
+    - pixelprose_redcaps
+    - monet_cc12m
+    - monet_commoncatalog_cc_by
+    - monet_coyo
+  contract: "[B,C,T,H,W]"
+  num_frames: 1
+  preprocess_style: cover   # 短边贴桶+中心裁剪, 无黑边 (实测 resize_long_edge 加权后 37% 样本补黑 >1%)
+  resolution: 512
+  long_edge: 512
+  max_upscale_ratio: 1.2    # 512 桶要求源图短边 >= 427px (抽样: blip3o/fine_t2i/sa1b 等 92~100% 合格, 仅 HumanCaption-10M ~52%)
+  max_retries: 16
+  refresh_index_cache: false   # 索引指纹不含 buckets, 换桶复用缓存; 桶归属在加载后按 width/height 重算
+  index_cache_dir: /home/jovyan/pfs/users/zhanqian.wu/exp/giga_exp_image/stage_1/dataset_index_cache   # 复用 stage_1 索引缓存, 免全量重扫
+  buckets:
+    - 512_square
+    - 512x384
+    - 384x512
+  # 桶耗尽后不再回绕重复: 不足的 batch 由同比例高分桶借图降采样补足,
+  # 单一分辨率层无同比例高分桶时, 整批自动切换到仍有余量的桶。
+  bucket_sampling_weights:
+    512_square: 0.45
+    512x384: 0.275
+    384x512: 0.275
+
+validation:
+  enabled: true
+  every_n_steps: 1000
+  per_rank: true
+  use_next_batch: true
+  num_inference_steps: 20
+  seed: 42
+  guidance_scale: 3.0
+
+training:
+  enabled: true
+  t2v_only: true
+  cfg_dropout: 0.1                # 同一 dropout mask 同时作用于 student/teacher 条件
+  batch_size_per_device: 8       # teacher 前向约占 +10GB 峰值显存; OOM 时降到 8
+  num_workers: 4
+  max_epochs: 5
+  mixed_precision: bf16
+  optimizer: adamw
+  torch_compile: false
+  muon:
+    enabled: false
+    momentum: 0.95
+    learning_rate: 3x
+    adjust_lr_fn: match_rms_adamw
+    weight_decay: 0.0
+  adam:
+    enabled: true
+    betas: [0.9, 0.95]
+    epsilon: 1.0e-8
+  learning_rate: 1.0e-4
+  weight_decay: 0.0
+  lr_scheduler: cosine
+  lr_warmup_steps: 200
+  gradient_accumulation_steps: 1
+  checkpointing_steps: 2500
+  state_checkpoints_keep: 2
+  # v2 冷启: 每次启动都从 bos_ckpt 纯权重 step-00232500 重新开始 (optimizer 全新, projector 随机初始化)。
+  # 注意: 平台崩溃自动重启同样会重置回 232500, 丢失中途进度! 需要断点续训时改为 resume_mode: auto。
+  resume_mode: /home/jovyan/pfs/users/zhanqian.wu/code/model_exp/outputs/bos_ckpt/giga_exp_image/stage_1_28layers/step-00232500.safetensors
+  resume_optimizer: false
+  resume_lr_scheduler: true
+
+logging:
+  report_to: [console, swanlab]
+  log_every_n_steps: 1
+  save_samples: true
+  swanlab:
+    enabled: true
+    project: giga-exp-image
+    name: giga_exp_image_stage_1_kd_28layers_v3_centered_feat
+    api_key: Dit2ngq8iuiGfUkI88e5b
+  wandb:
+    enabled: false
+    project: giga-exp-image
+    name: giga_exp_image_stage_1_kd_28layers_v3_centered_feat
