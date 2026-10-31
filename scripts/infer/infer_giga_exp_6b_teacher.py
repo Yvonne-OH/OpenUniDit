@@ -74,7 +74,7 @@ def main():
         teacher_checkpoint=args.checkpoint,
         qwen3_vl_path=args.qwen3_vl_path,
         vae_path=args.wan_vae_path,
-        attention_backend="flash3",
+        attention_backend="auto",
         text_layer=args.text_layer,
         scheduler_shift=args.shift,
         device=device,

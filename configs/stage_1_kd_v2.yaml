@@ -184,7 +184,7 @@ training:
   state_checkpoints_keep: 2
   # v2 冷启: 每次启动都从 bos_ckpt 纯权重 step-00232500 重新开始 (optimizer 全新, projector 随机初始化)。
   # 注意: 平台崩溃自动重启同样会重置回 232500, 丢失中途进度! 需要断点续训时改为 resume_mode: auto。
-  resume_mode: /home/jovyan/pfs/users/zhanqian.wu/code/model_exp/outputs/bos_ckpt/giga_exp_image/stage_1_28layers/step-00232500.safetensors
+  resume_mode: auto #/home/jovyan/pfs/users/zhanqian.wu/code/model_exp/outputs/bos_ckpt/giga_exp_image/stage_1_28layers/step-00232500.safetensors
   resume_optimizer: false
   resume_lr_scheduler: true
 
