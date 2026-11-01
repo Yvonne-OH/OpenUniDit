@@ -1,0 +1,164 @@
+# Giga-Exp mHC 2/4-Stream 对比实验配置: 独立文件, 不覆盖 stage_1.yaml。
+# model 段与 configs/stage_1.yaml 完全一致 (28L/1536), 仅追加 mhc 段。
+# mhc.enabled 显式为 true: mHC 模块按此构建; false 时本配置不应被 mHC 脚本接受。
+stage: stage_1_mhc
+output_dir: /home/jovyan/pfs/users/zhanqian.wu/exp/giga_exp_image/stage_1_28layers_mhc
+seed: 42
+
+distributed:
+  backend: deepspeed
+  config: configs/zero1.json
+  world_size: 8
+  timeout_seconds: 7200
+
+model:
+  in_channels: 48
+  out_channels: 48
+  text_dim: 2560
+  dim: 1536
+  ffn_dim: 4096
+  heads: 12
+  layers: 28
+  rope_theta: 10000.0
+  rope_axes_dims: [16, 48, 48, 16]
+  patch_size: [1, 2, 2]
+  # --- mHC 专属 (GigaExpTransformerMHC 独有参数, 原模型 config 无) ---
+  n_streams: 4
+  sinkhorn_iters: 20
+  mhc_mapping_fp32: true
+
+mhc:
+  enabled: true            # 显式开启 (转换/训练脚本强制校验)
+  n_streams: 4
+  sinkhorn_iters: 20
+  mapping_mode: dynamic
+  init_mode: function_preserving
+  init_eps: 1.0e-6
+
+components:
+  text_encoder:
+    type: qwen3_vl
+    pretrained_path: /mnt/nfs/models/huggingface/Qwen/Qwen3-VL-4B-Instruct
+    tokenizer_path: /mnt/nfs/models/huggingface/Qwen/Qwen3-VL-4B-Instruct
+    local_files_only: true
+    layer: -2
+    max_length: 512
+  wan_vae:
+    type: AutoencoderKLWan
+    pretrained_path: /mnt/nfs/models/huggingface/models--Wan-AI--Wan2.2-TI2V-5B-Diffusers
+    subfolder: vae
+    local_files_only: true
+
+scheduler:
+  type: flow_matching
+  num_train_timesteps: 1000
+  shift: 3.0
+  timestep_sampling: uniform
+  validation_shift: 3.0
+
+dataset:
+  dataset_type: lmdb_parquet
+  image_training_enabled: true
+  edit_training_enabled: false
+  database_path: /home/jovyan/pfs/users/zhanqian.wu/pfs_data/unified_images_lmdb
+  image_database_path: /home/jovyan/pfs/users/zhanqian.wu/pfs_data/unified_images_lmdb
+  lmdb_root: /home/jovyan/pfs/users/zhanqian.wu/pfs_data/unified_images_lmdb
+  image_root: /home/jovyan/pfs/users/zhanqian.wu/pfs_data/unified_images_lmdb
+  image_sources:
+    - 4KLSDB
+    - Aesthetic-4K
+    - HumanCaption-10M
+    - LAION_Aesthetics_1024
+    - Poster100K
+    - anime_captions
+    - bg_photo_concepts
+    - blip3o-long-caption-wds
+    - blip3o-long-caption
+    - caption3o-xl-v4
+    - ffhq_captioned_1024
+    - fine_t2i
+    - pexels-advertisement-photography
+    - pexels_aesth_2_1024
+    - qwen-synth-characters-fused
+    - sa1b_en
+    - anyword_3m
+    - pixelprose_cc12m
+    - pixelprose_commonpool
+    - pixelprose_redcaps
+    - monet_cc12m
+    - monet_commoncatalog_cc_by
+    - monet_coyo
+  contract: "[B,C,T,H,W]"
+  num_frames: 1
+  preprocess_style: cover
+  resolution: 512
+  long_edge: 512
+  max_upscale_ratio: 1.2
+  max_retries: 16
+  refresh_index_cache: false
+  index_cache_dir: /home/jovyan/pfs/users/zhanqian.wu/exp/giga_exp_image/stage_1/dataset_index_cache
+  buckets:
+    - 512_square
+    - 512x384
+    - 384x512
+  bucket_sampling_weights:
+    512_square: 0.45
+    512x384: 0.275
+    384x512: 0.275
+
+validation:
+  enabled: true
+  every_n_steps: 1000
+  per_rank: true
+  use_next_batch: true
+  num_inference_steps: 20
+  seed: 42
+  guidance_scale: 3.0
+
+training:
+  enabled: true
+  t2v_only: true
+  cfg_dropout: 0.1
+  batch_size_per_device: 8
+  num_workers: 4
+  max_epochs: 6
+  mixed_precision: bf16
+  optimizer: adamw
+  torch_compile: false          # mHC 第一版: eager 优先, 保证数值正确性 (Sinkhorn 20 轮循环)
+  muon:
+    enabled: false
+    momentum: 0.95
+    learning_rate: 3x
+    adjust_lr_fn: match_rms_adamw
+    weight_decay: 0.0
+  adam:
+    enabled: true
+    betas: [0.9, 0.95]
+    epsilon: 1.0e-8
+  learning_rate: 4.0e-6         # 第一轮保守启动 (从 280k 分叉, 原历史 lr 1e-4/4e-5)
+  mhc_lr: 4.0e-6                # mHC mapping 独立分组 lr
+  weight_decay: 0.0
+  lr_scheduler: cosine
+  lr_warmup_steps: 200
+  gradient_accumulation_steps: 1
+  checkpointing_steps: 1000
+  state_checkpoints_keep: 2
+  # 从 280k 原模型 checkpoint 分叉 (先跑 tools/convert_checkpoint_to_mhc.py 生成 mHC 权重)
+  init_from: /home/jovyan/pfs/users/zhanqian.wu/exp/giga_exp_image/stage_1_28layers_mhc/checkpoints/weights_mhc_converted/converted.safetensors
+  resume_mode: auto
+  resume_optimizer: false
+  resume_lr_scheduler: true
+
+logging:
+  report_to: [console, swanlab]
+  log_every_n_steps: 1
+  save_samples: true
+  swanlab:
+    enabled: true
+    project: giga-exp-image
+    name: giga_exp_image_stage_1_28layers_mhc_4stream
+    api_key: Dit2ngq8iuiGfUkI88e5b
+  wandb:
+    enabled: false
+    project: giga-exp-image
+    name: giga_exp_image_stage_1_28layers_mhc_4stream
