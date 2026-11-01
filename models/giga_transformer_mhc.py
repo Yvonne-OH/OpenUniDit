@@ -25,6 +25,8 @@ from models.giga_transformer import (
     RMSNorm,
     SpacetimeRoPE,
     _FA3,
+    _fa3_func,
+    _fa3_varlen,
     rotate_half,
 )
 from models.mhc_residual import MHCResidual, read_out, stack_stream
