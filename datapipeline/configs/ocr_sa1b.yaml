@@ -1,0 +1,43 @@
+# OCR-Data (SA1B-Dense-Caption OCR 合集) → 过滤 + 美学 + Qwen-VL caption 配置
+input:
+  parquet_dir: /home/jovyan/pfs/users/zhanqian.wu/pfs_data/unified_canvas_images/OCR-Data/data
+
+output:
+  dir: /home/jovyan/pfs/users/zhanqian.wu/pfs_data/unified_canvas_images/ocr_captioned
+  jsonl_prefix: ocr_annotated   # 输出: ocr_annotated_shard{I}of{N}.jsonl
+  save_images: true             # 通过过滤的原图落盘 (原始字节, 不重编码)
+
+bbox_filter:                    # OCR 文字框过滤 (xyxy)
+  min_box_side: 16              # w 或 h < 16px 的小文字直接剔除
+  min_box_area: 1000            # 面积 < ~32x32 的小文字剔除
+  overlap_iou: 0.7              # 两框 IoU > 此值记为重合
+  max_overlap_ratio: 0.3        # 重合框占比 > 30% 整图丢弃 (0 = 不检查)
+  max_regions_per_image: 0      # 过滤后 region 数上限 (0 = 不限)
+
+quality_filter:
+  min_side: 256                 # 短边下限 (图片过小)
+  max_side: 8000                # 长边上限 (异常大图)
+  aspect_min: 0.25              # 宽高比下限 (宽高不合理)
+  aspect_max: 4.0               # 宽高比上限
+  blur_var_min: 35.0            # Laplacian 方差下限 (模糊)
+  brightness_min: 20            # 灰度均值下限 (过暗)
+  brightness_max: 235           # 灰度均值上限 (过亮)
+  contrast_std_min: 12          # 灰度标准差下限 (低对比)
+
+aesthetic:
+  enabled: true
+  threshold: 5.0                # 美学分 < threshold 整图丢弃
+  head_path: /home/jovyan/pfs/users/zhanqian.wu/ckpt/laion-aesthetic-heads/sac+logos+ava1-l14-linearMSE.pth
+  # openclip:<arch>:<pretrained> — pretrained 可为 hf tag 或本地权重文件 (推荐本地, 离线可复现)
+  # hf:/path = 本地 OpenAI CLIP (embedding 空间不匹配, 分数偏低需自行校准阈值)
+  clip_backbone: openclip:ViT-L-14:/home/jovyan/pfs/users/zhanqian.wu/ckpt/CLIP-ViT-L-14-laion2B-s32B-b82K/open_clip_pytorch_model.bin
+  batch_size: 128
+
+caption:
+  enabled: true
+  model_path: /home/jovyan/pfs/users/zhanqian.wu/ckpt/Qwen2.5-VL-7B-Instruct
+  dtype: bfloat16
+  max_new_tokens: 640           # 单次生成中英双语 (scene/text_style × zh/en)
+  max_pixels: 2621440           # VLM 输入分辨率上限 (~2048x1280, 防 OOM)
+  language: both                # 中英双语
+  batch_size: 8

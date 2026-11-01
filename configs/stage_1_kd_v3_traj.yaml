@@ -1,0 +1,206 @@
+# Giga-Exp Image stage_1 KD v3: Teacher Trajectory Replay + 2-step Flow Map KD。
+# 依据 (diag/traj_20261031_121241, 标准口径 shift=6/cfg=3.5/30步):
+#   - student 局部速度误差 25~41%, 误差方向 100% 相干: cos(e,Δt·Δv)=+0.46 (116/116 全正),
+#     cos(Δv_k,Δv_{k+1})=+0.92 —— 低频相干偏置场沿既有偏差方向逐步放大, 非随机累积。
+#   - 逐点独立监督 (v1 velocity / v2 feat+rel) 对此类偏置无针对性: pointwise MSE 压到 ~10%
+#     仍会沿同一错误方向走完 30 步 (endpoint drift 60~87%)。
+# v3 核心改动:
+#   1. Teacher 在线轨迹段生成 (kd.traj.source: online): 每 step 取 FM 半批之后的真实数据
+#      VAE 编码为 z0, 随机 k∈[0,48] 按 50-step shift=6.0 schedule 构造 FM 插值起点
+#      x_k=(1-σ_k)z0+σ_k·x1; teacher 在线 no_grad 2-step CFG rollout 得目标 x_{k+2}^T。
+#      全 σ 覆盖, 无缓存, 无预生成步骤。(source: cache 可切换为离线 Replay 缓存方案)
+#   2. 训练: 每 micro batch 拆半, FM(4) + traj(4)。traj 分支 student 从 x_k 出发用自身
+#      速度场 (CFG 组合, 文本条件 = 当前数据 caption 的 chat-template 编码, 与 teacher 逐位
+#      一致) 连走两步 —— 第二步必须经过自己预测的 x̂_{k+1} (两次独立 teacher forcing 则失去
+#      区间意义) —— 对齐 x_{k+2}^T, L_traj = ||Δ||²/(RMS(x_{k+2}^T)²+ε)。
+#   3. L = L_FM + λ_traj·L_traj; λ_traj 前 500 步按 λ·g_traj = 0.5·g_FM 每 50 步标定, 之后冻结。
+#   4. Feature/Relation KD + projector 全关。
+# 启动: bash scripts/train/train_giga_exp_kd.sh configs/stage_1_kd_v3_traj.yaml
+stage: stage_1_kd_v3_traj
+output_dir: /home/jovyan/pfs/users/zhanqian.wu/exp/giga_exp_image/stage_1_kd_28layers_v3_traj
+seed: 42
+
+distributed:
+  backend: deepspeed
+  config: configs/zero1.json
+  world_size: 8
+  timeout_seconds: 7200
+
+# student 结构 (与 stage_1.yaml 完全一致)
+model:
+  in_channels: 48
+  out_channels: 48
+  text_dim: 2560
+  dim: 1536
+  ffn_dim: 4096
+  heads: 12
+  layers: 28
+  rope_theta: 10000.0
+  rope_axes_dims: [16, 48, 48, 16]
+  patch_size: [1, 2, 2]
+
+# ---- teacher: 仅缓存生成脚本使用 (traj 模式训练时不加载) ----
+teacher:
+  type: gwp_6b
+  checkpoint: /home/jovyan/pfs/users/zhanqian.wu/ckpt/stage1_wan_image_qwen3_vl_mid_train_256/checkpoint-44000
+  attention_backend: flash3       # auto|flash3|flash|native (启动时探测)
+  layer: -2
+  max_condition_tokens: 4064
+  dim: 3840
+  n_layers: 30
+  n_heads: 30
+  n_kv_heads: 30
+  cap_feat_dim: 2560
+  in_channels: 48
+  rope_theta: 256.0
+  t_scale: 1000.0
+  rope_axes_dims: [32, 48, 48]
+  rope_axes_lens: [4096, 512, 512]
+  patch_size: 2
+  f_patch_size: 1
+
+# ---- KD: Teacher Trajectory Replay + 2-step Flow Map ----
+kd:
+  enabled: true
+  mode: traj                      # feat_rel (v1/v2) | traj (v3)
+  feature_weight: 0.0             # v3 关闭
+  relation_weight: 0.0            # v3 关闭
+  grad_monitor_steps: 0
+  traj:
+    source: online                # online: teacher 在线 2-step rollout (FM 插值起点) | cache: 离线 Replay 缓存
+    cache_dir: /home/jovyan/pfs/users/zhanqian.wu/exp/giga_exp_image/teacher_traj_cache
+    guidance: 3.5                 # CFG 组合 v_un + g·(v_cond - v_un) ≡ 标准 s=2.5 (与诊断口径一致)
+    cache_steps: 50               # σ schedule 步数 (标准推理口径 = 50 step; online 起点采样/cache 生成共用)
+    cache_shift: 6.0              # σ schedule shift (teacher 原生推理口径)
+    batch_frac: 0.5               # 每 micro batch 中 traj 样本占比 (4/8)
+    lambda: 0.05                  # λ_traj 初值 (warmup 期间自适应覆盖)
+    warmup_steps: 500             # λ 自适应窗口 (相对启动 step)
+    target_grad_ratio: 0.5        # 目标 λ·g_traj / g_FM = 50%
+    measure_every: 50             # warmup 期间每 N 步测一次梯度占比
+    num_workers: 2
+
+components:
+  text_encoder:
+    type: qwen3_vl
+    pretrained_path: /mnt/nfs/models/huggingface/Qwen/Qwen3-VL-4B-Instruct
+    tokenizer_path: /mnt/nfs/models/huggingface/Qwen/Qwen3-VL-4B-Instruct
+    local_files_only: true
+    layer: -2
+    max_length: 512
+  wan_vae:
+    type: AutoencoderKLWan
+    pretrained_path: /mnt/nfs/models/huggingface/models--Wan-AI--Wan2.2-TI2V-5B-Diffusers
+    subfolder: vae
+    local_files_only: true
+
+scheduler:
+  type: flow_matching
+  num_train_timesteps: 1000
+  shift: 3.0                      # FM 分支 σ 采样分布不变 (单变量: 只换 KD 项)
+  timestep_sampling: uniform
+  validation_shift: 3.0
+
+dataset:
+  dataset_type: lmdb_parquet
+  image_training_enabled: true
+  edit_training_enabled: false
+  database_path: /home/jovyan/pfs/users/zhanqian.wu/pfs_data/unified_images_lmdb
+  image_database_path: /home/jovyan/pfs/users/zhanqian.wu/pfs_data/unified_images_lmdb
+  lmdb_root: /home/jovyan/pfs/users/zhanqian.wu/pfs_data/unified_images_lmdb
+  image_root: /home/jovyan/pfs/users/zhanqian.wu/pfs_data/unified_images_lmdb
+  image_sources:
+    - 4KLSDB
+    - Aesthetic-4K
+    - HumanCaption-10M
+    - LAION_Aesthetics_1024
+    - Poster100K
+    - anime_captions
+    - bg_photo_concepts
+    - blip3o-long-caption-wds
+    - blip3o-long-caption
+    - caption3o-xl-v4
+    - ffhq_captioned_1024
+    - fine_t2i
+    - pexels-advertisement-photography
+    - pexels_aesth_2_1024
+    - qwen-synth-characters-fused
+    - sa1b_en
+    - anyword_3m
+    - pixelprose_cc12m
+    - pixelprose_commonpool
+    - pixelprose_redcaps
+    - monet_cc12m
+    - monet_commoncatalog_cc_by
+    - monet_coyo
+  contract: "[B,C,T,H,W]"
+  num_frames: 1
+  preprocess_style: cover
+  resolution: 512
+  long_edge: 512
+  max_upscale_ratio: 1.2
+  max_retries: 16
+  refresh_index_cache: false
+  index_cache_dir: /home/jovyan/pfs/users/zhanqian.wu/exp/giga_exp_image/stage_1/dataset_index_cache
+  buckets:
+    - 512_square
+    - 512x384
+    - 384x512
+  bucket_sampling_weights:
+    512_square: 0.45
+    512x384: 0.275
+    384x512: 0.275
+
+validation:
+  enabled: true
+  every_n_steps: 1000
+  per_rank: true
+  use_next_batch: true
+  num_inference_steps: 20
+  seed: 42
+  guidance_scale: 3.0
+
+training:
+  enabled: true
+  t2v_only: true
+  cfg_dropout: 0.1                # 仅作用于 FM 分支; traj 分支条件 = 缓存 caption 全量 (无 dropout)
+  batch_size_per_device: 8       # teacher 不在线, 显存余量大; FM 半批 + traj 双步 rollout
+  num_workers: 4
+  max_epochs: 5
+  mixed_precision: bf16
+  optimizer: adamw
+  torch_compile: false
+  muon:
+    enabled: false
+    momentum: 0.95
+    learning_rate: 3x
+    adjust_lr_fn: match_rms_adamw
+    weight_decay: 0.0
+  adam:
+    enabled: true
+    betas: [0.9, 0.95]
+    epsilon: 1.0e-8
+  learning_rate: 1.0e-4
+  weight_decay: 0.0
+  lr_scheduler: cosine
+  lr_warmup_steps: 200
+  gradient_accumulation_steps: 1
+  checkpointing_steps: 2500
+  state_checkpoints_keep: 2
+  # v3 冷启: 从 stage_1 纯权重 step-00232500 (与 v2 同一起跑线, 单变量 = KD 项)
+  resume_mode: /home/jovyan/pfs/users/zhanqian.wu/code/model_exp/outputs/bos_ckpt/giga_exp_image/stage_1_28layers/step-00280000.safetensors
+  resume_optimizer: false
+  resume_lr_scheduler: true
+
+logging:
+  report_to: [console, swanlab]
+  log_every_n_steps: 1
+  save_samples: true
+  swanlab:
+    enabled: true
+    project: giga-exp-image
+    name: giga_exp_image_stage_1_kd_28layers_v3_traj
+    api_key: Dit2ngq8iuiGfUkI88e5b
+  wandb:
+    enabled: false
+    project: giga-exp-image
+    name: giga_exp_image_stage_1_kd_28layers_v3_traj

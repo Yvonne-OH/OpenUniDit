@@ -1,11 +1,26 @@
 """Stage_1 Giga-Exp KD 蒸馏训练: GWP 6B teacher (gigaworld stage1) → GigaExp student。
 
-Feature + Relation representation 蒸馏 (原 velocity 输出蒸馏已移除):
-    loss = FM_MSE(pred, noise - z0) + λ_f·L_feat + λ_r·L_rel
-    L_feat: 相对深度 25/50/75% 三层, 每层独立 Linear projector (D_S→D_T) 投影后
-            双方 L2 normalize 逐 token cosine (1 - mean cos), 仅 image tokens
-    L_rel : 投影前 normalized hidden 的 token×token Gram 矩阵 MSE, 每步随机采样
-            相同位置 min(relation_tokens, n_img) 个 image tokens, 与 hidden dim 无关
+两种 KD 模式 (kd.mode):
+  feat_rel (默认, v1/v2): Feature + Relation representation 蒸馏, teacher 在线前向。
+  traj (v3): Teacher Trajectory Segment KD (2-step Flow Map)。每 micro batch 拆半
+      FM(n_fm) + traj(n_traj)。traj 分支: student 从起点状态出发用自身速度场 (CFG 组合,
+      文本条件与 teacher 逐位一致) 连走两步 —— 第二步必须经过自己预测的 x̂_{k+1} (不许
+      重塞 teacher 中间状态) —— 对齐 teacher 真实 2-step rollout 终点:
+          L_traj = ||x̂_{k+2}^S - x_{k+2}^T||² / (RMS(x_{k+2}^T)² + ε)
+      source 两种 (kd.traj.source):
+        online (默认, FM 路径起点): 每 step 取 FM 半批之后的真实数据 (pixels[n_fm:]) VAE
+            编码为 z0, 随机 k∈[0, steps-2], 按 50-step shift=6.0 schedule 构造起点
+            x_k=(1-σ_k)z0+σ_k·x1; teacher 在线 no_grad 2-step CFG rollout 得 x_{k+2}^T。
+            全 σ 覆盖, 无缓存; 起点是条件 FM 插值路径 (非纯 teacher ODE 状态, 2 步内局部近似)。
+        cache: 读取离线 Teacher Trajectory Replay 缓存 (scripts/cache/gen_teacher_traj_cache.py
+            预生成, 纯 teacher ODE 轨迹区间), teacher 不进训练。
+      L = L_FM + λ_traj·L_traj; λ_traj 前 warmup_steps 步按梯度占比自适应
+      (目标 λ·g_traj = target_grad_ratio·g_FM, 每 measure_every 步测一次), 之后冻结。
+
+traj 模式诊断依据 (diag/traj_20261031_121241): 误差方向 100% 相干 (cos(e,ΔtΔv)=+0.46,
+cos(Δv_k,Δv_{k+1})=+0.92), 逐点独立监督 (feat/rel) 已到天花板, 需要轨迹级区间监督打断
+"相干偏置逐步放大"环。
+
 teacher 条件走 Qwen3-VL chat-template 约定 (与 gigaworld 训练一致), 与 student 共享同一
 编码器实例, 仅文本渲染方式不同。teacher 冻结 (eval + requires_grad False, 不进 DeepSpeed),
 前向 no_grad 且只 hook 3 个 KD 层; projector 挂在 student 模块上仅训练期存在,
@@ -53,6 +68,7 @@ from transformers import AutoModel, AutoTokenizer
 
 from data.lmdb_dataset import GigaLMDBDataset, collate_image_batch
 from data.samplers.bucket_sampler import BucketBatchSampler
+from data.traj_cache_dataset import TeacherTrajCacheDataset, collate_traj_batch
 from models.giga_transformer import GigaExpTransformer
 import models.giga_transformer as _giga_transformer
 from pipeline.giga_pipeline_6b_teacher import build_gwp6b_teacher, encode_prompts_6b_teacher
@@ -713,10 +729,17 @@ def main():
         raise ValueError(f"tokenizer 词表异常: {tc['tokenizer_path']}")
     text_encoder = build_text_encoder(tc, dtype, device)
     vae = AutoencoderKLWan.from_pretrained(dc["pretrained_path"], subfolder=dc.get("subfolder", "vae"), torch_dtype=torch.float32, local_files_only=True).eval().to(device)
-    # ---- KD teacher (GWP 6B, 冻结): 与 student 共享 Qwen3-VL 编码器实例, 仅多载一份 processor 用于 chat-template 渲染
+    # ---- KD teacher / 模式解析: feat_rel (v1/v2, teacher 在线前向) vs traj (v3, teacher 离线缓存) ----
     kd_cfg = cfg.get("kd") or {}
     teacher_cfg = cfg.get("teacher") or {}
-    kd_enabled = bool(kd_cfg.get("enabled", False))
+    kd_cfg_enabled = bool(kd_cfg.get("enabled", False))
+    kd_mode = str(kd_cfg.get("mode", "feat_rel"))
+    traj_cfg = dict(kd_cfg.get("traj") or {})
+    traj_enabled = kd_cfg_enabled and kd_mode == "traj"
+    traj_source = str(traj_cfg.get("source", "online"))  # online: teacher 在线 | cache: 离线缓存
+    # online 需要 teacher 在线 rollout; cache 模式 teacher 不进训练 (缓存即目标)
+    kd_enabled = kd_cfg_enabled and (not traj_enabled or traj_source == "online")
+    kd_feat_rel = kd_cfg_enabled and not traj_enabled  # feat/rel representation KD
     kd_feat_weight = float(kd_cfg.get("feature_weight", 0.05))
     kd_rel_weight = float(kd_cfg.get("relation_weight", 0.05))
     kd_rel_depths = [float(d) for d in kd_cfg.get("feature_rel_depths", [0.25, 0.5, 0.75])]
@@ -731,18 +754,21 @@ def main():
         teacher_transformer, teacher_ckpt_resolved = build_gwp6b_teacher(
             teacher_cfg, device, dtype,
         )
-        from transformers import AutoProcessor
-        teacher_processor = AutoProcessor.from_pretrained(tc["tokenizer_path"], local_files_only=True)
-        teacher_max_cond_tokens = int(teacher_cfg.get("max_condition_tokens", 4064))
-        teacher_patch_size = int(teacher_cfg.get("patch_size", 2))
-        teacher_f_patch_size = int(teacher_cfg.get("f_patch_size", 1))
         if rank == 0:
             n_params_b = sum(p.numel() for p in teacher_transformer.parameters()) / 1e9
             _blue_print(f"🧑‍🏫 KD teacher: GWP 6B ({n_params_b:.2f}B params, frozen) ← {teacher_ckpt_resolved}")
             logger.info("KD teacher loaded: %s (%.2fB params, frozen, %s)", teacher_ckpt_resolved,
                         n_params_b, next(teacher_transformer.parameters()).dtype)
+    if kd_enabled or traj_enabled:
+        # 共享 Qwen3-VL 编码器的 chat-template 渲染: feat_rel 用于 teacher 条件,
+        # traj 用于缓存区间的条件现算 (与缓存生成口径逐位一致)
+        from transformers import AutoProcessor
+        teacher_processor = AutoProcessor.from_pretrained(tc["tokenizer_path"], local_files_only=True)
+        teacher_max_cond_tokens = int(teacher_cfg.get("max_condition_tokens", 4064))
+        teacher_patch_size = int(teacher_cfg.get("patch_size", 2))
+        teacher_f_patch_size = int(teacher_cfg.get("f_patch_size", 1))
     model = GigaExpTransformer(**cfg["model"]).to(device, dtype=dtype)
-    if kd_enabled:
+    if kd_feat_rel:
         # KD 层: 相对深度取整 → student/teacher 各自的 block 索引 (blocks 遍历序输出)
         student_kd_layers = sorted({int(model.layers * d) for d in kd_rel_depths})
         teacher_kd_layers = sorted({int(len(teacher_transformer.layers) * d) for d in kd_rel_depths})
@@ -866,6 +892,58 @@ def main():
                                          prefetch_factor=4, persistent_workers=True, collate_fn=collate)
     iterator = iter(loader)
 
+    # ---- traj 模式: Teacher Trajectory Segment KD (v3) ----
+    traj_loader = traj_iterator = None
+    n_fm = int(cfg["training"]["batch_size_per_device"])
+    n_traj = 0
+    traj_launch_step = step
+    if traj_enabled:
+        batch_size = int(cfg["training"]["batch_size_per_device"])
+        n_traj = max(1, min(int(round(batch_size * float(traj_cfg.get("batch_frac", 0.5)))), batch_size - 1))
+        n_fm = batch_size - n_traj
+        traj_guidance = float(traj_cfg.get("guidance", 3.5))
+        lambda_traj = float(traj_cfg.get("lambda", 0.05))
+        traj_warmup_steps = int(traj_cfg.get("warmup_steps", 500))
+        traj_target_ratio = float(traj_cfg.get("target_grad_ratio", 0.5))
+        traj_measure_every = int(traj_cfg.get("measure_every", 50))
+        traj_warmup_end = traj_launch_step + traj_warmup_steps
+        traj_steps = int(traj_cfg.get("cache_steps", 30))
+        traj_shift = float(traj_cfg.get("cache_shift", 6.0))
+        if traj_source == "cache":
+            traj_ds = TeacherTrajCacheDataset(str(traj_cfg.get("cache_dir") or ""))
+            traj_loader = torch.utils.data.DataLoader(
+                traj_ds, batch_size=n_traj, shuffle=True, drop_last=True,
+                num_workers=int(traj_cfg.get("num_workers", 2)), prefetch_factor=2,
+                persistent_workers=True, collate_fn=collate_traj_batch,
+                generator=torch.Generator().manual_seed(int(cfg.get("seed", 42)) + rank))
+            traj_iterator = iter(traj_loader)
+        else:
+            # online: 50-step shift=6.0 σ 表 (k ∈ [0, steps-2] → (σ_k, σ_{k+1}, σ_{k+2})),
+            # 与 kd_trajectory_diag.py / 缓存生成同一公式; cache_steps 默认 50 (标准推理口径)
+            def _shift6(u):
+                return traj_shift * u / (1.0 + (traj_shift - 1.0) * u)
+            _sig = [_shift6(1.0 - i / traj_steps) for i in range(traj_steps + 1)]
+            traj_sigma_table = torch.tensor(
+                [[_sig[k], _sig[k + 1], _sig[k + 2]] for k in range(traj_steps - 1)],
+                dtype=torch.float32)
+            traj_k_gen = torch.Generator().manual_seed(int(cfg.get("seed", 42)) + rank)
+        if rank == 0:
+            if traj_source == "cache":
+                _src_desc = (f"cache {traj_ds.total_rows} 区间 (steps={traj_ds.meta.get('steps')}, "
+                             f"shift={traj_ds.meta.get('shift')}, cfg={traj_ds.meta.get('guidance')}) "
+                             f"← {traj_cfg.get('cache_dir')}, teacher 不进训练")
+            else:
+                _src_desc = (f"online teacher 2-step rollout (steps={traj_steps}, shift={traj_shift}), "
+                             f"起点 = 真实数据 FM 插值路径, 随机 k 全 σ 覆盖")
+            _blue_print(
+                f"🛤️ KD traj 模式 [{traj_source}]: {_src_desc}\n"
+                f"   batch FM:{n_fm}+traj:{n_traj} | g={traj_guidance} | λ₀={lambda_traj} | "
+                f"λ warmup {traj_warmup_steps} steps (target λ·g_traj/g_FM={traj_target_ratio:.0%}, "
+                f"每 {traj_measure_every} 步测量)")
+            logger.info("KD traj 模式 [%s]: batch FM:%d+traj:%d g=%.2f λ=%.4f warmup=%d target=%.2f",
+                        traj_source, n_fm, n_traj, traj_guidance, lambda_traj,
+                        traj_warmup_steps, traj_target_ratio)
+
     wandb_run = None
     if rank == 0 and cfg["logging"]["wandb"]["enabled"]:
         wandb_dir = output_dir / "wandb"
@@ -957,6 +1035,7 @@ def main():
         micro_feat_cos_raw = []
         micro_grad_ratios = []
         micro_teacher_fm_losses = []
+        micro_traj_losses = []
         micro_teacher_bucket_sums = torch.zeros(SIGMA_BUCKETS, device=device)
         micro_bucket_sums = torch.zeros(SIGMA_BUCKETS, device=device)
         micro_bucket_counts = torch.zeros(SIGMA_BUCKETS, device=device)
@@ -964,6 +1043,7 @@ def main():
         lr_now = set_lr(client_optimizer, ds_optimizer, step, cfg["training"])
         for micro_idx in range(grad_accum):
             bad_local = 0
+            traj_batch = None
             try:
                 if pending_batch is not None:
                     batch = pending_batch
@@ -974,6 +1054,12 @@ def main():
                         batch_sampler.set_epoch(batch_sampler.epoch + 1)
                         iterator = iter(loader)
                         batch = next(iterator)
+                if traj_enabled and traj_source == "cache":
+                    try:
+                        traj_batch = next(traj_iterator)
+                    except StopIteration:
+                        traj_iterator = iter(traj_loader)
+                        traj_batch = next(traj_iterator)
             except Exception as exc:
                 # 数据级错误 (坏图/坏视频/解码子进程 MemoryError 等) 跳过该 micro batch,
                 # 不再炸掉整个多卡作业; executor_bug 或连续跳过超限仍然终止。
@@ -993,8 +1079,14 @@ def main():
                 continue
             consecutive_batch_skips = 0
             pending_batch = None
-            pixels = torch.from_numpy(batch["pixel_values"]).to(device)
-            captions = batch["captions"]
+            pixels_full = torch.from_numpy(batch["pixel_values"]).to(device)
+            captions_full = batch["captions"]
+            if traj_enabled:
+                # 每 micro batch 拆两半: 前 n_fm 真实数据 FM, 后 n_traj 给 traj 分支
+                # (online: VAE 编码为 z0 → FM 插值起点; cache: 弃用, 区间来自缓存)
+                pixels, captions = pixels_full[:n_fm], captions_full[:n_fm]
+            else:
+                pixels, captions = pixels_full, captions_full
             last_captions = captions
             with torch.no_grad():
                 # Wan 官方约定: encode 后标准化 z_norm = (z - mean) * latents_std_inv
@@ -1027,7 +1119,7 @@ def main():
                 teacher_out = None
                 teacher_feats = None
                 teacher_img_lens = None
-                if kd_enabled:
+                if kd_feat_rel:
                     teacher_caps = encode_prompts_6b_teacher(
                         teacher_processor, text_encoder, teacher_prompts, device,
                         layer=int(teacher_cfg.get("layer", tc.get("layer", -2))),
@@ -1043,14 +1135,14 @@ def main():
                     teacher_feats = [teacher_raw["features"][li] for li in teacher_kd_layers]
                     teacher_img_lens = teacher_raw["img_real_lens"]
                     del teacher_raw, teacher_caps
-            if kd_enabled:
+            if kd_feat_rel:
                 pred, student_feats = engine(xt.to(dtype), sigma * 1000, text, mask, feature_layers=student_kd_layers)
             else:
                 pred = engine(xt.to(dtype), sigma * 1000, text, mask)
             diff_sq = (pred.float() - (noise - latents).float()).square()
             # DeepSpeed 会在 gradient_accumulation_steps > 1 时自动缩放 backward loss；这里不要再次除以 grad_accum。
             loss = diff_sq.mean()
-            if kd_enabled:
+            if kd_feat_rel:
                 # student patch [1,2,2] ≡ teacher patch 2/f_patch 1: 同一 latent 网格, image token 逐位对齐。
                 # 不一致说明配置漂移, 直接报错而不是静默错位蒸馏。
                 s_pt, s_ph, s_pw = engine.module.patch_size
@@ -1068,15 +1160,133 @@ def main():
                 teacher_fm_sq = [((-o).float() - fm_target[i]).square().mean() for i, o in enumerate(teacher_out)]
                 teacher_fm_loss = torch.stack(teacher_fm_sq).mean()
             per_sample_loss = diff_sq.flatten(1).mean(1)
+            # ---- traj 分支 (v3): student 从起点状态出发, 用自身速度场 (CFG 组合, 文本条件
+            # 与 teacher 逐位一致) 连走两步, 第二步必须经过自己预测的 x̂_{k+1}; 对齐 teacher
+            # 2-step rollout 终点 x_{k+2}^T:
+            #     L_traj = mean_i ||x̂_{k+2,i}^S - x_{k+2,i}^T||² / (RMS(x_{k+2,i}^T)² + ε)
+            l_traj = None
+            if traj_enabled:
+                # ---- 起点状态 / 目标 / σ: source 分流 ----
+                if traj_source == "online":
+                    # FM 路径起点: 真实数据 z0 (FM 半批之后的那一半) + 随机 k 的 σ_k 插值;
+                    # 全 σ 覆盖, teacher 在线 rollout (no_grad), 无需缓存
+                    with torch.no_grad():
+                        z0_traj = (vae.encode(pixels_full[n_fm:].float()).latent_dist.sample()
+                                   - latents_mean) * latents_std_inv
+                    sig3 = traj_sigma_table[
+                        torch.randint(0, traj_sigma_table.shape[0], (n_traj,), generator=traj_k_gen)
+                    ].to(device)
+                    s0 = sig3[:, 0][:, None, None, None, None]
+                    xs = ((1.0 - s0) * z0_traj + s0 * torch.randn_like(z0_traj)).to(dtype)
+                    caps_list = [str(c).strip() for c in captions_full[n_fm:]]
+                else:
+                    xs = torch.from_numpy(traj_batch["x_start"]).to(device, dtype=dtype).unsqueeze(2)
+                    xe = torch.from_numpy(traj_batch["x_end"]).to(device, dtype=dtype).unsqueeze(2)
+                    sig3 = torch.from_numpy(traj_batch["sigmas"]).to(device, dtype=torch.float32)
+                    caps_list = list(traj_batch["captions"])
+                n_t = xs.shape[0]
+                # 文本条件: 缓存 caption / 当前数据 caption 的 teacher chat-template 编码,
+                # cond 与 uncond ("") 一次编码 —— student 与 teacher 条件逐位一致
+                t_caps = encode_prompts_6b_teacher(
+                    teacher_processor, text_encoder, caps_list + [""] * n_t, device,
+                    layer=int(teacher_cfg.get("layer", tc.get("layer", -2))),
+                    max_condition_tokens=teacher_max_cond_tokens,
+                )
+                t_caps = [c.to(dtype) for c in t_caps]
+                pad_to = max(c.shape[0] for c in t_caps)
+
+                def _pad_caps(caps):
+                    text_b = torch.stack([F.pad(c, (0, 0, 0, pad_to - c.shape[0])) for c in caps])
+                    mask_b = torch.stack([F.pad(torch.ones(c.shape[0], dtype=torch.bool, device=c.device),
+                                                (0, pad_to - c.shape[0])) for c in caps])
+                    return text_b, mask_b
+
+                text_c, mask_c = _pad_caps(t_caps[:n_t])
+                text_u, mask_u = _pad_caps([t_caps[n_t]] * n_t)
+                if traj_source == "online":
+                    # teacher 在线 2-step CFG rollout (no_grad): cond/uncond 分支拼批前向;
+                    # 原始输出 = z0 - noise, 取负对齐 student 约定 (与 diag/缓存生成完全一致)
+                    with torch.no_grad():
+                        xf = xs.float()
+                        for j in range(2):
+                            t_b = (1.0 - sig3[:, j]).to(dtype).repeat(2)
+                            out = teacher_transformer(
+                                x=list(xf.to(dtype).unbind(0)) * 2, t=t_b,
+                                cap_feats=t_caps[:n_t] + [t_caps[n_t]] * n_t,
+                                patch_size=teacher_patch_size, f_patch_size=teacher_f_patch_size,
+                            )
+                            mo = out["sample"]
+                            if isinstance(mo, list):
+                                mo = torch.stack(mo)
+                            f_cond, f_un = mo[:n_t].float(), mo[n_t:].float()
+                            vel = -(f_un + traj_guidance * (f_cond - f_un))
+                            xf = xf + (sig3[:, j + 1] - sig3[:, j])[:, None, None, None, None] * vel
+                        xe = xf
+                # ---- student 2-step 自走 rollout (梯度穿过两步): 第二步必须用自己的 x̂_{k+1} ----
+                # 注意 dt (fp32 σ 差) × v (bf16) 会把状态提升为 fp32, 必须显式 fp32 累积、
+                # 每次前向 cast 回 bf16, 否则第 2 步 engine 收到 Float 输入直接 dtype 崩溃
+                xs_roll = xs
+                for j in range(2):
+                    ts_j = sig3[:, j] * 1000.0
+                    v_c = engine(xs_roll, ts_j, text_c, mask_c)
+                    v_u = engine(xs_roll, ts_j, text_u, mask_u)
+                    v = v_u + traj_guidance * (v_c - v_u)
+                    xs_roll = (xs_roll.float()
+                               + (sig3[:, j + 1] - sig3[:, j])[:, None, None, None, None] * v.float()
+                               ).to(dtype)
+                denom = xe.float().flatten(1).pow(2).mean(1)
+                l_traj = (((xs_roll.float() - xe.float()) ** 2).flatten(1).mean(1)
+                          / (denom + 1e-6)).mean()
+                loss = loss + lambda_traj * l_traj
             engine.backward(loss)
             micro_losses.append(diff_sq.mean().detach())
-            if kd_enabled:
+            if l_traj is not None:
+                micro_traj_losses.append(l_traj.detach())
+            if traj_enabled and grad_accum == 1 and step <= traj_warmup_end and (
+                    (step - traj_launch_step) % traj_measure_every == 0 or step == traj_launch_step + 1):
+                # λ_traj 自适应: λ·g_traj / g_FM → target_grad_ratio (默认 0.5)。
+                # 与 feat/rel 监控同样的 probe 模式 (detached 克隆 + autograd.grad, 不触碰
+                # engine 的 DeepSpeed 梯度 hook); rollout 梯度穿过两步前向。
+                probe = copy.deepcopy(engine.module)
+                for p in probe.parameters():
+                    p.grad = None
+                probe_pred = probe(xt.to(dtype), sigma * 1000, text, mask)
+                probe_fm = (probe_pred.float() - (noise - latents).float()).square().mean()
+                probe_xs = xs
+                for j in range(2):
+                    ts_j = sig3[:, j] * 1000.0
+                    pv_c = probe(probe_xs, ts_j, text_c, mask_c)
+                    pv_u = probe(probe_xs, ts_j, text_u, mask_u)
+                    pv = pv_u + traj_guidance * (pv_c - pv_u)
+                    probe_xs = (probe_xs.float()
+                                + (sig3[:, j + 1] - sig3[:, j])[:, None, None, None, None] * pv.float()
+                                ).to(dtype)
+                probe_traj = (((probe_xs.float() - xe.float()) ** 2).flatten(1).mean(1)
+                              / (denom + 1e-6)).mean()
+                probe_params = list(probe.parameters())
+                grad_fm = torch.autograd.grad(probe_fm, probe_params, retain_graph=True, allow_unused=True)
+                grad_traj = torch.autograd.grad(probe_traj, probe_params, allow_unused=True)
+
+                def _grad_norm(grads):
+                    return math.sqrt(sum(float(g.detach().float().pow(2).sum()) for g in grads if g is not None))
+
+                g_fm, g_traj = _grad_norm(grad_fm), _grad_norm(grad_traj)
+                if g_traj > 1e-12:
+                    lambda_traj = traj_target_ratio * g_fm / g_traj
+                ratio_traj = lambda_traj * g_traj / max(g_fm, 1e-20)
+                logger.info("📊 step=%d traj 梯度标定: g_FM=%.3e g_traj=%.3e → λ_traj=%.4f (λ·g_traj/g_FM=%.1f%%)",
+                            step, g_fm, g_traj, lambda_traj, 100 * ratio_traj)
+                micro_grad_ratios.append((ratio_traj, float("nan")))
+                del probe, probe_pred, probe_fm, probe_traj, grad_fm, grad_traj
+            elif traj_enabled and step == traj_warmup_end + 1:
+                logger.info("🔒 λ_traj warmup 结束: 固定 λ=%.4f (后续不再自适应)", lambda_traj)
+            if kd_feat_rel:
                 micro_feat_losses.append(l_feat.detach())
                 micro_rel_losses.append(l_rel.detach())
                 micro_feat_cos.append(feat_cos.detach())
                 micro_feat_cos_raw.append(feat_cos_raw.detach())
                 del student_feats
-            if kd_enabled and grad_accum == 1 and step <= kd_monitor_end:
+            if kd_feat_rel and grad_accum == 1 and step <= kd_monitor_end:
                 # 前 N step 梯度范数监控: λ_f·g_feat/g_FM 目标 5%~15%, λ_r·g_rel/g_FM 目标 2%~10%,
                 # 合计 ≤ ~20% —— loss 数值小不代表对优化方向影响小 (velocity KD 的教训)。
                 # DeepSpeed ZeRO 把梯度 hook 挂在参数的 AccumulateGrad 节点上, 任何经过 engine
@@ -1108,13 +1318,13 @@ def main():
                             step, g_fm, kd_feat_weight * g_feat, 100 * ratio_feat,
                             kd_rel_weight * g_rel, 100 * ratio_rel)
                 micro_grad_ratios.append((ratio_feat, ratio_rel))
-            if kd_enabled:
+            if kd_feat_rel:
                 del teacher_out, teacher_feats
             micro_sigmas.append(sigma.detach().sum())
             bins = (sigma.detach() * SIGMA_BUCKETS).long().clamp_(0, SIGMA_BUCKETS - 1)
             micro_bucket_sums.scatter_add_(0, bins, per_sample_loss.detach().float())
             micro_bucket_counts += torch.bincount(bins, minlength=SIGMA_BUCKETS).float()
-            if kd_enabled:
+            if kd_feat_rel:
                 micro_teacher_fm_losses.append(teacher_fm_loss.detach())
                 # teacher 各 sigma 桶 FM 误差 (分母复用 micro_bucket_counts: 同 batch 同 sigma, 桶计数一致)
                 micro_teacher_bucket_sums.scatter_add_(0, bins, torch.stack(teacher_fm_sq).detach().float())
@@ -1128,6 +1338,7 @@ def main():
         feat_cos_value = torch.stack(micro_feat_cos).mean().item() if micro_feat_cos else None
         feat_cos_raw_value = torch.stack(micro_feat_cos_raw).mean().item() if micro_feat_cos_raw else None
         teacher_fm_value = torch.stack(micro_teacher_fm_losses).mean().item() if micro_teacher_fm_losses else None
+        traj_value = torch.stack(micro_traj_losses).mean().item() if micro_traj_losses else None
         ratio_feat_value = micro_grad_ratios[-1][0] if micro_grad_ratios else None
         ratio_rel_value = micro_grad_ratios[-1][1] if micro_grad_ratios else None
         sigma_mean = torch.stack(micro_sigmas).sum().item() / (grad_accum * latents.shape[0])
@@ -1138,6 +1349,9 @@ def main():
             if feat_value is not None:
                 postfix["feat"] = f"{feat_value:.4f}"
                 postfix["rel"] = f"{rel_value:.5f}"
+            if traj_value is not None:
+                postfix["traj"] = f"{traj_value:.4f}"
+                postfix["λt"] = f"{lambda_traj:.3f}"
             progress.set_postfix(postfix)
         if step % log_every == 0:
             stats = torch.stack([micro_bucket_sums, micro_bucket_counts])
@@ -1156,6 +1370,9 @@ def main():
                 if ratio_feat_value is not None:
                     log_line += " grad_ratio feat=%.1f%% rel=%.1f%%"
                     log_args += [100 * ratio_feat_value, 100 * ratio_rel_value]
+            if traj_value is not None:
+                log_line += " traj=%.5f λ_traj=%.4f"
+                log_args += [traj_value, lambda_traj]
             logger.info(log_line, *log_args)
             if rank == 0 and (wandb_run or swanlab_run):
                 payload = {"train/loss": loss_value, "train/lr": lr_now, "train/sigma_mean": sigma_mean, "train/samples": step * grad_accum * cfg['training']['batch_size_per_device'] * dist.get_world_size()}
@@ -1176,6 +1393,14 @@ def main():
                     if ratio_feat_value is not None:
                         payload["kd/grad_ratio_feat"] = ratio_feat_value
                         payload["kd/grad_ratio_rel"] = ratio_rel_value
+                if traj_value is not None:
+                    payload["train/traj_loss"] = traj_value
+                    payload["train/lambda_traj"] = lambda_traj
+                    payload["loss/fm"] = loss_value
+                    payload["loss/traj_kd"] = traj_value
+                    payload["loss/total"] = loss_value + lambda_traj * traj_value
+                    if ratio_feat_value is not None:
+                        payload["kd/grad_ratio_traj"] = ratio_feat_value
                 for i in range(SIGMA_BUCKETS):
                     if stats[1, i] <= 0:
                         continue
