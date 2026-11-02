@@ -53,8 +53,15 @@ model:
     heads: 14                      # 默认同主 DiT heads
 ```
 
-当前 `configs/stage_1_1.yaml` 已开启 `text_trans: {enabled: true, layers: 2, heads: 14}`；
-其余 yaml 未开启（保持原版行为），需要时把上面 `text_trans` 段复制进 `model:` 即可。
+当前 `configs/` 下**所有 10 个 yaml 均已默认开启**
+`text_trans: {enabled: true, layers: 2, heads: <同主 DiT>}`（含 mhc_2stream / mhc_from0）；
+关闭设 `enabled: false` 或删除该段即回原版直通。
+
+`GigaExpTransformerMHC`（`models/giga_transformer_mhc.py`）同样支持 `text_trans`
+（复用同一个 `TextRefiner`，接在 `text_in` 之后、`stack_stream` 之前，mHC 残差结构不变），
+mHC 训练脚本复用主脚本的 `load_pure_weights` → 自动获得相同的恒等初始化 + 警告逻辑；
+`tools/convert_checkpoint_to_mhc.py` 对旧 ckpt（无 `text_refiner.*`）转换时在输出中补零初始化
+refiner 并警告，对已带 `text_refiner.*` 的 ckpt 则原样保留。
 
 ## 3. checkpoint 兼容与警告
 
@@ -91,8 +98,10 @@ SFT `init_from`、完整 state 恢复失败后的自动降级）都走 `load_com
 | 2 × LayerNorm | 7,168 | 14,336 |
 | **合计** | **38,558,464** | **77,116,928 (77.12M)** |
 
-- 主 DiT 基线 ≈1110.37M → 加 2 层 refiner 后 1187.48M（**+77.12M, +6.9%**）；
-- 若消融用 1 层：38.56M（+3.5%）。
+- 主 DiT 基线 ≈1110.37M → 加 2 层 refiner 后 1187.48M（**+77.12M, +6.9%）**；
+- dim=1536 / heads=12 配置（stage_1 系列 / mhc 系列）：每层 28,331,520，2 层
+  **56,663,040 (56.66M)**；
+- 若消融用 1 层：对应减半。
 
 ## 5. step0 恒等验证
 
@@ -115,4 +124,6 @@ FLOPs 增量仅 `O(L_txt²·d)` 的文本自注意力 + FFN（L_txt ≤ 512，�
    检测「模型有 `text_refiner.*` 但 ckpt 没有」→ 保持恒等初始化 + rank0 黄色警告；
 2. `print_banner` 新增 `✍️ Text Refiner(text_trans)` 一行，启动即可见开关状态与层数。
 
-mHC 双流模型（`giga_transformer_mhc.py`）不在本次范围内，行为不受影响。
+`scripts/train/train_giga_exp_mhc.py`：banner 同款状态行；权重加载复用主脚本的
+`load_pure_weights`（自动带恒等初始化 + 警告）。mHC 转换权重路径保持 strict
+（转换输出的 ckpt 已含零初始化 `text_refiner.*`，键集合一致可直接 strict）。

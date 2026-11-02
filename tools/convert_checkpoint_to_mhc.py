@@ -46,12 +46,15 @@ def convert(checkpoint_path: Path, config_path: Path, output_path: Path) -> dict
     # ---- 1. 原模型侧: 加载并建立命名/shape 基准 ---- #
     from safetensors.torch import load_file, save_file
     original = load_file(str(checkpoint_path), device="cpu")
+    # text_trans (Text Refiner) 开启时: 旧 ckpt 无 text_refiner.* → MHC 侧恒等零初始化;
+    # ckpt 已带 text_refiner.* (text_trans 训练过的权重) 则原样保留 → 允许参与基准核对
+    refiner_keys_in_ckpt = {k for k in original if k.startswith("text_refiner.")}
     base_keys = {"in_channels", "out_channels", "text_dim", "dim", "ffn_dim",
                  "heads", "layers", "rope_theta", "rope_axes_dims", "patch_size"}
     base_model = GigaExpTransformer(**{k: v for k, v in cfg["model"].items() if k in base_keys})
     base_ref = base_model.state_dict()
     missing_in_ckpt = sorted(set(base_ref) - set(original))
-    unexpected_in_ckpt = sorted(set(original) - set(base_ref))
+    unexpected_in_ckpt = sorted(set(original) - set(base_ref) - refiner_keys_in_ckpt)
     shape_mismatch = {k: (tuple(base_ref[k].shape), tuple(original[k].shape))
                       for k in set(base_ref) & set(original) if base_ref[k].shape != original[k].shape}
     if missing_in_ckpt or unexpected_in_ckpt or shape_mismatch:
@@ -78,6 +81,10 @@ def convert(checkpoint_path: Path, config_path: Path, output_path: Path) -> dict
         print(f"⚠️ mod-adaln 迁移: copied_layers={migration['copied']} "
               f"missing_layers={migration['missing']} orphan_dual={migration['orphan_dual']}")
     mhc_new_keys = sorted(set(mhc_state) - set(original))
+    if any(k.startswith("text_refiner.") for k in mhc_state) and not refiner_keys_in_ckpt:
+        print(f"⚠️ text_trans: checkpoint 缺少 text_refiner.* 权重但 yaml model.text_trans 已开启, "
+              f"转换输出中 {sum(1 for k in mhc_new_keys if k.startswith('text_refiner.'))} 个 tensor "
+              f"保持恒等映射零初始化 (step0 forward 与原版一致)")
     load_result = mhc_model.load_state_dict(original, strict=False)
     # strict=False 后必须人工核对: missing 只允许 mhc 新增键, unexpected 必须为空
     if load_result.unexpected_keys:

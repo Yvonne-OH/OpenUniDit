@@ -33,6 +33,7 @@ from models.giga_transformer import (
     _FA3,
     _fa3_func,
     _fa3_varlen,
+    TextRefiner,
     rotate_half,
 )
 from models.mhc_residual import MHCResidual, read_out, stack_stream
@@ -150,7 +151,8 @@ class GigaExpTransformerMHC(nn.Module):
     def __init__(self, in_channels=48, out_channels=48, text_dim=4096, dim=1792,
                  ffn_dim=4864, heads=14, layers=24, rope_theta=10000.0,
                  rope_axes_dims=(32, 32, 32, 32), patch_size=(1, 1, 1),
-                 n_streams=4, sinkhorn_iters=20, mhc_mapping_fp32=True, mod_adaln=False):
+                 n_streams=4, sinkhorn_iters=20, mhc_mapping_fp32=True, mod_adaln=False,
+                 text_trans=False):
         super().__init__()
         self.patch_size = tuple(patch_size)
         if len(self.patch_size) != 3 or self.patch_size[0] != 1 or any(p < 1 for p in self.patch_size):
@@ -159,6 +161,19 @@ class GigaExpTransformerMHC(nn.Module):
         self.text_dim, self.ffn_dim, self.layers = text_dim, ffn_dim, layers
         self.n_streams = int(n_streams)
         self.mod_adaln = bool(mod_adaln)
+        # Text Refiner (与 GigaExpTransformer 同款, MOSS-Image 风格): 恒等零初始化残差块,
+        # 只精炼 text_in 投影后的文本 token; text_trans 可为 bool 或 dict({enabled, layers, heads})。
+        refiner_cfg = None
+        if isinstance(text_trans, dict):
+            refiner_cfg = text_trans if text_trans.get("enabled", True) else None
+        elif text_trans:
+            refiner_cfg = {}
+        self.text_trans = None if refiner_cfg is None else {
+            "layers": int(refiner_cfg.get("layers", 2)),
+            "heads": int(refiner_cfg.get("heads", heads)),
+        }
+        if self.text_trans is not None:
+            self.text_refiner = TextRefiner(dim, self.text_trans["heads"], self.text_trans["layers"])
         patch_volume = math.prod(self.patch_size)
         self.patch_in = nn.Linear(in_channels * patch_volume, dim)
         self.text_in = nn.Linear(text_dim, dim)
@@ -189,6 +204,7 @@ class GigaExpTransformerMHC(nn.Module):
             "rope_theta": self.rope.theta,
             "rope_axes": list(self.rope.axes_dims),
             "mod_adaln": self.mod_adaln,
+            "text_trans": self.text_trans,
             "implementation": {
                 "version": "giga_semantics_v1_mhc",
                 "rope": "fp32_cos_sin_and_rotation",
@@ -212,6 +228,9 @@ class GigaExpTransformerMHC(nn.Module):
         image = x.reshape(b, self.in_channels, t, pt, gh, ph, gw, pw)
         image = self.patch_in(image.permute(0, 2, 4, 6, 3, 5, 7, 1).reshape(b, t * gh * gw, -1))
         text = self.text_in(text)
+        if self.text_trans is not None:
+            # Text Refiner: 恒等初始化的残差自注意力+FFN, 只精炼文本 token, padding mask 透传
+            text = self.text_refiner(text, text_mask)
         n_img = image.shape[1]
         n_total = n_img + text.shape[1]
         attention_mask = None

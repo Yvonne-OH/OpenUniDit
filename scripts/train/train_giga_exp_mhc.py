@@ -153,6 +153,14 @@ def print_banner(cfg, rank):
     print(f"🧠 Giga-Exp mHC stage_1 | dim={model['dim']} layers={model['layers']} "
           f"n_streams={model['n_streams']} sinkhorn_iters={model.get('sinkhorn_iters', 20)}", flush=True)
     print(f"🎚️  AdaLN: {'dual-branch (mod_img/mod_txt, MiniMax H3 风格)' if model.get('mod_adaln') else 'shared (全序列一个 mod)'}", flush=True)
+    tt = model.get("text_trans")
+    if isinstance(tt, dict) and tt.get("enabled", True):
+        tt_desc = f"ON (layers={tt.get('layers', 2)}, heads={tt.get('heads', model['heads'])}, 恒等零初始化热启动)"
+    elif tt:
+        tt_desc = f"ON (layers=2, heads={model['heads']}, 恒等零初始化热启动)"
+    else:
+        tt_desc = "off (文本 token 直进主 DiT)"
+    print(f"✍️  Text Refiner(text_trans): {tt_desc}", flush=True)
     print(f"⚙️  optimizer=adamw+adamw | base_lr={cfg['training']['learning_rate']} "
           f"mhc_lr={cfg['training'].get('mhc_lr')} | mhc.enabled={cfg['mhc']['enabled']} "
           f"init_mode={cfg['mhc'].get('init_mode')}", flush=True)

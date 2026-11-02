@@ -16,6 +16,13 @@ model:
   # dual-branch AdaLN (MiniMax H3 风格): image token 用 mod_img, text token 用 mod_txt;
   # 旧 ckpt 的 blocks.*.mod.* 加载时自动拷贝到两分支 (无损等价热启动, 训练后独立分化)。
   mod_adaln: true
+  # Text Refiner (MOSS-Image 风格): text_in 投影后的文本 token 先过 2 层残差自注意力+FFN 再进主 DiT;
+  # 残差支路输出层零初始化 → 初始为恒等映射, step0 与原版逐位一致; 旧 ckpt 无 text_refiner.* 时
+  # 自动恒等初始化并给出警告, 平滑增量学习。设为 false 或删除即回到原版直通。
+  text_trans:
+    enabled: true
+    layers: 2        # MOSS 配置 2 层; 消融可先改 1
+    heads: 12        # 默认同主 DiT heads
   in_channels: 48
   out_channels: 48
   text_dim: 2560
