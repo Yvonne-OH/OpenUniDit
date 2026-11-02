@@ -118,6 +118,49 @@ def apply_mod_adaln_migration(current, state):
     return result
 
 
+class TextRefinerBlock(nn.Module):
+    """文本侧残差自注意力+FFN block (MOSS-Image Text Refiner)。
+
+    - 只处理文本 token (text_in 投影后), 不与图像 token 交互, 无 timestep AdaLN;
+    - 残差支路输出层 (attn.out_proj / ffn 末层) 零初始化 → block 初始为恒等映射,
+      step0 推理与原版逐位一致, 旧 ckpt (无 text_refiner.*) 可无损热启动平滑增量学习;
+    - padding 位置的输出会被主 DiT 的 attention mask / FA3 varlen 丢弃, 不影响数值。
+    """
+
+    def __init__(self, dim, num_heads):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim, eps=1e-6)
+        self.attn = nn.MultiheadAttention(dim, num_heads, batch_first=True)
+        self.norm2 = nn.LayerNorm(dim, eps=1e-6)
+        self.ffn = nn.Sequential(nn.Linear(dim, dim * 4), nn.GELU(), nn.Linear(dim * 4, dim))
+        # 恒等初始化: 残差支路输出层权重+bias 置零, 初始 forward = identity
+        nn.init.zeros_(self.attn.out_proj.weight)
+        nn.init.zeros_(self.attn.out_proj.bias)
+        nn.init.zeros_(self.ffn[-1].weight)
+        nn.init.zeros_(self.ffn[-1].bias)
+
+    def forward(self, x, key_padding_mask=None):
+        # x: [B, L_txt, D]
+        h = self.norm1(x)
+        attn_out, _ = self.attn(h, h, h, key_padding_mask=key_padding_mask, need_weights=False)
+        x = x + attn_out
+        x = x + self.ffn(self.norm2(x))
+        return x
+
+
+class TextRefiner(nn.Module):
+    def __init__(self, dim, num_heads, num_layers=2):
+        super().__init__()
+        self.blocks = nn.ModuleList(TextRefinerBlock(dim, num_heads) for _ in range(num_layers))
+
+    def forward(self, text_hidden, text_mask=None):
+        # text_mask: bool [B, L], True=有效 token; MHA key_padding_mask 语义相反 (True=padding)
+        key_padding_mask = ~text_mask if text_mask is not None else None
+        for blk in self.blocks:
+            text_hidden = blk(text_hidden, key_padding_mask)
+        return text_hidden
+
+
 class GigaBlock(nn.Module):
     def __init__(self, dim, heads, ffn_dim, mod_adaln=False):
         super().__init__()
@@ -217,7 +260,8 @@ class GigaExpTransformer(nn.Module):
     """~0.8B dense DiT: 1792 width, 16 blocks, 14 heads, temporal RoPE retained."""
     def __init__(self, in_channels=48, out_channels=48, text_dim=4096, dim=1792,
                  ffn_dim=4864, heads=14, layers=24, rope_theta=10000.0,
-                 rope_axes_dims=(32, 32, 32, 32), patch_size=(1, 1, 1), mod_adaln=False):
+                 rope_axes_dims=(32, 32, 32, 32), patch_size=(1, 1, 1), mod_adaln=False,
+                 text_trans=False):
         super().__init__()
         self.patch_size = tuple(patch_size)
         if len(self.patch_size) != 3 or self.patch_size[0] != 1 or any(p < 1 for p in self.patch_size):
@@ -225,6 +269,19 @@ class GigaExpTransformer(nn.Module):
         self.in_channels, self.out_channels, self.dim, self.heads = in_channels, out_channels, dim, heads
         self.text_dim, self.ffn_dim, self.layers = text_dim, ffn_dim, layers
         self.mod_adaln = bool(mod_adaln)
+        # Text Refiner (MOSS-Image 风格): text_in 投影后的文本 token 先过恒等初始化的残差
+        # 自注意力+FFN 再 concat 进主 DiT; text_trans 可为 bool 或 dict({enabled, layers, heads})。
+        refiner_cfg = None
+        if isinstance(text_trans, dict):
+            refiner_cfg = text_trans if text_trans.get("enabled", True) else None
+        elif text_trans:
+            refiner_cfg = {}
+        self.text_trans = None if refiner_cfg is None else {
+            "layers": int(refiner_cfg.get("layers", 2)),
+            "heads": int(refiner_cfg.get("heads", heads)),
+        }
+        if self.text_trans is not None:
+            self.text_refiner = TextRefiner(dim, self.text_trans["heads"], self.text_trans["layers"])
         patch_volume = math.prod(self.patch_size)
         self.patch_in = nn.Linear(in_channels * patch_volume, dim)
         self.text_in = nn.Linear(text_dim, dim)
@@ -247,6 +304,7 @@ class GigaExpTransformer(nn.Module):
             "rope_theta": self.rope.theta,
             "rope_axes": list(self.rope.axes_dims),
             "mod_adaln": self.mod_adaln,
+            "text_trans": self.text_trans,
             "implementation": {
                 "version": "giga_semantics_v1",
                 "rope": "fp32_cos_sin_and_rotation",
@@ -277,6 +335,9 @@ class GigaExpTransformer(nn.Module):
         image = x.reshape(b, self.in_channels, t, pt, h, ph, w, pw)
         image = self.patch_in(image.permute(0, 2, 4, 6, 3, 5, 7, 1).reshape(b, t * h * w, -1))
         text = self.text_in(text)
+        if self.text_trans is not None:
+            # Text Refiner: 恒等初始化的残差自注意力+FFN, 只精炼文本 token, padding mask 透传
+            text = self.text_refiner(text, text_mask)
         n_img = image.shape[1]
         n_total = n_img + text.shape[1]
         attention_mask = None

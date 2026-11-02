@@ -402,6 +402,25 @@ def _report_mod_adaln_migration(migration, logger=None):
         print(f"\033[1;31m{message}\033[0m", flush=True)
 
 
+def _report_text_trans_reinit(model, state, logger=None):
+    """yaml 开启 text_trans 但 ckpt 无 text_refiner.* 权重 → 保持恒等映射零初始化并警告 (rank0)。
+
+    TextRefiner 残差支路输出层零初始化, 初始 forward 为恒等映射:
+    step0 行为与原版逐位一致, 后续训练平滑增量学习 (MOSS-Image 热启动方案)。"""
+    if _dist_rank() != 0:
+        return
+    refiner_keys = [key for key in model.state_dict() if key.startswith("text_refiner.")]
+    if not refiner_keys or any(key in state for key in refiner_keys):
+        return
+    logger = logger or logging.getLogger("giga_exp")
+    params = sum(p.numel() for name, p in model.named_parameters() if name.startswith("text_refiner."))
+    message = (f"⚠️ text_trans: checkpoint 缺少 text_refiner.* 权重但 yaml model.text_trans 已开启, "
+               f"{len(refiner_keys)} 个 tensor / {params / 1e6:.2f}M 参数保持恒等映射零初始化 "
+               f"(step0 forward 与原版一致, 平滑增量学习)")
+    logger.warning(message)
+    print(f"\033[1;33m{message}\033[0m", flush=True)
+
+
 def load_compatible_state_dict(model, state):
     """只加载名称和 shape 都匹配的参数，其余参数保留当前初始化值。
 
@@ -409,6 +428,7 @@ def load_compatible_state_dict(model, state):
     双分支 (拷贝复用而非权重共享), step0 forward 与 shared AdaLN 完全等价, 无损热启动。"""
     current = model.state_dict()
     _report_mod_adaln_migration(apply_mod_adaln_migration(current, state))
+    _report_text_trans_reinit(model, state)
     matched = {key: value for key, value in state.items()
                if key in current and current[key].shape == value.shape}
     patch_volume = math.prod(model.patch_size)
@@ -639,6 +659,14 @@ def print_banner(cfg, rank):
     print("🧠 Giga-Exp stage_1 | T2V-only flow matching (T=1, video-ready)", flush=True)
     print(f"📐 DiT: dim={model['dim']} layers={model['layers']} heads={model['heads']} ffn={model['ffn_dim']} head_dim={model['dim'] // model['heads']}", flush=True)
     print(f"🎚️  AdaLN: {'dual-branch (mod_img/mod_txt, MiniMax H3 风格)' if model.get('mod_adaln') else 'shared (全序列一个 mod)'}", flush=True)
+    tt = model.get("text_trans")
+    if isinstance(tt, dict) and tt.get("enabled", True):
+        tt_desc = f"ON (layers={tt.get('layers', 2)}, heads={tt.get('heads', model['heads'])}, 恒等零初始化热启动)"
+    elif tt:
+        tt_desc = f"ON (layers=2, heads={model['heads']}, 恒等零初始化热启动)"
+    else:
+        tt_desc = "off (文本 token 直进主 DiT)"
+    print(f"✍️  Text Refiner(text_trans): {tt_desc}", flush=True)
     print(f"⚡ 加速: torch.compile={'ON (dynamic)' if cfg['training'].get('torch_compile') else 'off'} | FA3={'READY (varlen 支持右 padding)' if _giga_transformer._FA3 else 'MISSING (SDPA 回退)'}", flush=True)
     print(f"🌀 RoPE: axes(t/h/w)={model['rope_axes_dims']} theta={model['rope_theta']} — time axis retained for video", flush=True)
     print(f"📝 Text encoder: {cfg['components']['text_encoder']['pretrained_path']}", flush=True)
