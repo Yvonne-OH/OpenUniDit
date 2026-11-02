@@ -8,8 +8,14 @@
 - 子层接收单流 [B,N,C] (pre 映射混合), 因此 FA3/varlen/pack/RoPE/mask 路径零改动;
 - H = [x, 0, ..., 0] 进模型, readout=[1,0..0] stream0 直出, 初始状态与原模型 forward 等价。
 
-state_dict 命名: 原 291 个张量名 1:1 保留; 新增 blocks.{i}.mhc_attn.mapping.*,
-blocks.{i}.mhc_ffn.mapping.*, readout。
+mod_adaln=True 时 (yaml model 下显式开启, 默认 False 保持上述约束):
+- blocks.{i}.mod 替换为 mod_img / mod_txt 双分支 (MiniMax H3 风格):
+  image 前缀用 mod_img 调制, text 后缀用 mod_txt, 两分支独立参数独立梯度;
+- 旧 ckpt 恢复时由 models.giga_transformer.apply_mod_adaln_migration 把旧 mod.*
+  拷贝初始化到两分支 (拷贝复用而非权重共享), step0 forward 与 shared AdaLN 等价。
+
+state_dict 命名: 原 291 个张量名 1:1 保留 (mod_adaln=False); 新增 blocks.{i}.mhc_attn.mapping.*,
+blocks.{i}.mhc_ffn.mapping.*, readout; mod_adaln=True 时 blocks.{i}.mod.* → mod_img/mod_txt。
 """
 from __future__ import annotations
 
@@ -36,9 +42,10 @@ class GigaBlockMHC(nn.Module):
     """GigaBlock 的 mHC 版本: 子层权重名与 GigaBlock 完全一致。"""
 
     def __init__(self, dim, heads, ffn_dim, n_streams=4, sinkhorn_iters=20,
-                 mhc_mapping_fp32=True):
+                 mhc_mapping_fp32=True, mod_adaln=False):
         super().__init__()
         self.heads = heads
+        self.mod_adaln = bool(mod_adaln)
         self.norm1 = RMSNorm(dim)
         self.norm2 = RMSNorm(dim)
         self.qkv = nn.Linear(dim, dim * 3, bias=False)
@@ -48,7 +55,12 @@ class GigaBlockMHC(nn.Module):
         self.out = nn.Linear(dim, dim, bias=False)
         self.ff = nn.Sequential(nn.Linear(dim, ffn_dim, bias=False), nn.SiLU(),
                                 nn.Linear(ffn_dim, dim, bias=False))
-        self.mod = nn.Linear(dim, dim * 6)
+        if self.mod_adaln:
+            # dual-branch AdaLN: 旧 ckpt 恢复时由 apply_mod_adaln_migration 拷贝初始化
+            self.mod_img = nn.Linear(dim, dim * 6)
+            self.mod_txt = nn.Linear(dim, dim * 6)
+        else:
+            self.mod = nn.Linear(dim, dim * 6)
         self.mhc_attn = MHCResidual(dim, n_streams=n_streams, sinkhorn_iters=sinkhorn_iters,
                                     mapping_fp32=mhc_mapping_fp32)
         self.mhc_ffn = MHCResidual(dim, n_streams=n_streams, sinkhorn_iters=sinkhorn_iters,
@@ -57,9 +69,16 @@ class GigaBlockMHC(nn.Module):
     # ------------------------------------------------------------------ #
     # 原始子层 (复制自 GigaBlock.forward, 仅去掉 residual add)
     # ------------------------------------------------------------------ #
-    def _attn_core(self, x, cond, cos, sin, attention_mask=None, pack=None):
-        shift_a, scale_a, gate_a, _, _, _ = self.mod(cond).chunk(6, -1)
-        y = self.norm1(x) * (1 + scale_a[:, None]) + shift_a[:, None]
+    def _attn_core(self, x, cond, cos, sin, attention_mask=None, pack=None, n_img=None):
+        if self.mod_adaln:
+            sa_i, sca_i, ga_i, _, _, _ = self.mod_img(cond).chunk(6, -1)
+            sa_t, sca_t, ga_t, _, _, _ = self.mod_txt(cond).chunk(6, -1)
+            img, txt = x[:, :n_img], x[:, n_img:]
+            y = torch.cat((self.norm1(img) * (1 + sca_i[:, None]) + sa_i[:, None],
+                           self.norm1(txt) * (1 + sca_t[:, None]) + sa_t[:, None]), 1)
+        else:
+            shift_a, scale_a, gate_a, _, _, _ = self.mod(cond).chunk(6, -1)
+            y = self.norm1(x) * (1 + scale_a[:, None]) + shift_a[:, None]
         q, k, v = self.qkv(y).chunk(3, -1)
         b, n, _ = q.shape
         q = self.q_norm(q.view(b, n, self.heads, -1)).view(b, n, -1)
@@ -96,17 +115,32 @@ class GigaBlockMHC(nn.Module):
             k = (kf * cos4 + rotate_half(kf) * sin4).to(v.dtype)
             a = F.scaled_dot_product_attention(q, k, v, attn_mask=attention_mask).transpose(1, 2).reshape(b, n, -1)
         # 原: x = x + self.out(a) * gate_a[:, None]; mHC 中 residual add 由 mhc_attn 完成
-        return self.out(a) * gate_a[:, None]
+        out = self.out(a)
+        if self.mod_adaln:
+            return torch.cat((out[:, :n_img] * ga_i[:, None],
+                              out[:, n_img:] * ga_t[:, None]), 1)
+        return out * gate_a[:, None]
 
-    def _ffn_core(self, x, cond):
+    def _ffn_core(self, x, cond, n_img=None):
+        if self.mod_adaln:
+            _, _, _, sf_i, scf_i, gf_i = self.mod_img(cond).chunk(6, -1)
+            _, _, _, sf_t, scf_t, gf_t = self.mod_txt(cond).chunk(6, -1)
+            img, txt = x[:, :n_img], x[:, n_img:]
+            y = torch.cat((self.norm2(img) * (1 + scf_i[:, None]) + sf_i[:, None],
+                           self.norm2(txt) * (1 + scf_t[:, None]) + sf_t[:, None]), 1)
+            f = self.ff(y)
+            return torch.cat((f[:, :n_img] * gf_i[:, None],
+                              f[:, n_img:] * gf_t[:, None]), 1)
         _, _, _, shift_f, scale_f, gate_f = self.mod(cond).chunk(6, -1)
         y = self.norm2(x) * (1 + scale_f[:, None]) + shift_f[:, None]
         # 原: return x + self.ff(y) * gate_f[:, None]
         return self.ff(y) * gate_f[:, None]
 
-    def forward(self, h, cond, cos, sin, attention_mask=None, pack=None):
-        h = self.mhc_attn(h, lambda s: self._attn_core(s, cond, cos, sin, attention_mask, pack))
-        h = self.mhc_ffn(h, lambda s: self._ffn_core(s, cond))
+    def forward(self, h, cond, cos, sin, attention_mask=None, pack=None, n_img=None):
+        if self.mod_adaln and (n_img is None or not 0 < n_img < h.shape[1]):
+            raise ValueError(f"mod_adaln 需要 0 < n_img < seq_len, got n_img={n_img}, seq_len={h.shape[1]}")
+        h = self.mhc_attn(h, lambda s: self._attn_core(s, cond, cos, sin, attention_mask, pack, n_img))
+        h = self.mhc_ffn(h, lambda s: self._ffn_core(s, cond, n_img))
         return h
 
 
@@ -116,7 +150,7 @@ class GigaExpTransformerMHC(nn.Module):
     def __init__(self, in_channels=48, out_channels=48, text_dim=4096, dim=1792,
                  ffn_dim=4864, heads=14, layers=24, rope_theta=10000.0,
                  rope_axes_dims=(32, 32, 32, 32), patch_size=(1, 1, 1),
-                 n_streams=4, sinkhorn_iters=20, mhc_mapping_fp32=True):
+                 n_streams=4, sinkhorn_iters=20, mhc_mapping_fp32=True, mod_adaln=False):
         super().__init__()
         self.patch_size = tuple(patch_size)
         if len(self.patch_size) != 3 or self.patch_size[0] != 1 or any(p < 1 for p in self.patch_size):
@@ -124,6 +158,7 @@ class GigaExpTransformerMHC(nn.Module):
         self.in_channels, self.out_channels, self.dim, self.heads = in_channels, out_channels, dim, heads
         self.text_dim, self.ffn_dim, self.layers = text_dim, ffn_dim, layers
         self.n_streams = int(n_streams)
+        self.mod_adaln = bool(mod_adaln)
         patch_volume = math.prod(self.patch_size)
         self.patch_in = nn.Linear(in_channels * patch_volume, dim)
         self.text_in = nn.Linear(text_dim, dim)
@@ -131,7 +166,8 @@ class GigaExpTransformerMHC(nn.Module):
         self.rope = SpacetimeRoPE(dim // heads, rope_theta, rope_axes_dims)
         self.blocks = nn.ModuleList([
             GigaBlockMHC(dim, heads, ffn_dim, n_streams=self.n_streams,
-                         sinkhorn_iters=sinkhorn_iters, mhc_mapping_fp32=mhc_mapping_fp32)
+                         sinkhorn_iters=sinkhorn_iters, mhc_mapping_fp32=mhc_mapping_fp32,
+                         mod_adaln=self.mod_adaln)
             for _ in range(layers)
         ])
         self.norm = RMSNorm(dim)
@@ -152,6 +188,7 @@ class GigaExpTransformerMHC(nn.Module):
             "patch_size": list(self.patch_size),
             "rope_theta": self.rope.theta,
             "rope_axes": list(self.rope.axes_dims),
+            "mod_adaln": self.mod_adaln,
             "implementation": {
                 "version": "giga_semantics_v1_mhc",
                 "rope": "fp32_cos_sin_and_rotation",
@@ -206,7 +243,7 @@ class GigaExpTransformerMHC(nn.Module):
         # mHC 接入点: 唯一的 stream 扩展与收缩
         h = stack_stream(h, self.n_streams)                     # [B, N, S, C]
         for block in self.blocks:
-            h = block(h, cond, cos, sin, attention_mask, pack)
+            h = block(h, cond, cos, sin, attention_mask, pack, n_img)
         image = self.out(self.norm(read_out(h[:, :t * gh * gw], self.readout)))
         image = image.reshape(b, t, gh, gw, pt, ph, pw, self.out_channels)
         out = image.permute(0, 7, 1, 4, 2, 5, 3, 6).reshape(b, self.out_channels, t * pt, H_px, W_px)

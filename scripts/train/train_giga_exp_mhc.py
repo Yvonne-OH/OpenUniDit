@@ -12,6 +12,7 @@
 """
 from __future__ import annotations
 
+import argparse
 import json
 import logging
 import math
@@ -38,12 +39,14 @@ from transformers import AutoTokenizer
 
 from data.lmdb_dataset import GigaLMDBDataset
 from data.samplers.bucket_sampler import BucketBatchSampler
+from models.giga_transformer import apply_mod_adaln_migration
 from models.giga_transformer_mhc import GigaExpTransformerMHC
 from train_giga_exp import (  # noqa: E402  主分支可复用组件
     SIGMA_BUCKETS,
     _blue_print,
     _data_error_category,
     _loud_phase,
+    _report_mod_adaln_migration,
     _semantic_metadata,
     build_text_encoder,
     collate,
@@ -131,7 +134,9 @@ def load_mhc_init_weights(engine, output_dir, checkpoint_path=None):
     from safetensors.torch import load_file
     state = load_file(str(target)) if target.suffix == ".safetensors" else torch.load(str(target), map_location="cpu")
     if target.name.startswith("converted"):
-        # 转换权重: 键集合必须与模型完全一致 (strict), 杜绝静默吞键
+        # 转换权重: 键集合必须与模型完全一致 (strict), 杜绝静默吞键;
+        # mod_adaln 开启时先把旧 blocks.*.mod.* 迁移成 mod_img/mod_txt 再 strict
+        _report_mod_adaln_migration(apply_mod_adaln_migration(engine.module.state_dict(), state))
         engine.module.load_state_dict(state)  # strict=True
         engine.optimizer.refresh_fp32_params()
         step = 0
@@ -147,6 +152,7 @@ def print_banner(cfg, rank):
     model = cfg["model"]
     print(f"🧠 Giga-Exp mHC stage_1 | dim={model['dim']} layers={model['layers']} "
           f"n_streams={model['n_streams']} sinkhorn_iters={model.get('sinkhorn_iters', 20)}", flush=True)
+    print(f"🎚️  AdaLN: {'dual-branch (mod_img/mod_txt, MiniMax H3 风格)' if model.get('mod_adaln') else 'shared (全序列一个 mod)'}", flush=True)
     print(f"⚙️  optimizer=adamw+adamw | base_lr={cfg['training']['learning_rate']} "
           f"mhc_lr={cfg['training'].get('mhc_lr')} | mhc.enabled={cfg['mhc']['enabled']} "
           f"init_mode={cfg['mhc'].get('init_mode')}", flush=True)
@@ -415,6 +421,8 @@ def _init_model_weights(model, init_path, logger):
         path = max(candidates, key=lambda p: int(p.name.split("-")[1].split(".")[0]) if "-" in p.name else 0)
     from safetensors.torch import load_file
     state = load_file(str(path)) if path.suffix == ".safetensors" else torch.load(str(path), map_location="cpu")
+    # mod_adaln 开启时先把旧 blocks.*.mod.* 迁移成 mod_img/mod_txt 再 strict
+    _report_mod_adaln_migration(apply_mod_adaln_migration(model.state_dict(), state))
     model.load_state_dict(state)  # strict=True: 缺键/多键直接报错
     logger.info("strict 加载 mHC 初始化权重: %s (%d tensors)", path, len(state))
 

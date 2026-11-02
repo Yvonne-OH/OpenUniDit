@@ -35,7 +35,7 @@ from transformers import AutoModel, AutoTokenizer
 
 from data.lmdb_dataset import GigaLMDBDataset, collate_image_batch
 from data.samplers.bucket_sampler import BucketBatchSampler
-from models.giga_transformer import GigaExpTransformer
+from models.giga_transformer import GigaExpTransformer, apply_mod_adaln_migration
 import models.giga_transformer as _giga_transformer
 
 
@@ -378,9 +378,37 @@ def latest_state_tag(checkpoint_dir):
     return max(tags)[1] if tags else None
 
 
+def _report_mod_adaln_migration(migration, logger=None):
+    """mod-adaln 迁移结果播报 (rank0): 拷贝继承 / 随机初始化 / 孤儿双分支三种情况。"""
+    if _dist_rank() != 0:
+        return
+    logger = logger or logging.getLogger("giga_exp")
+    if migration["copied"]:
+        message = (f"⚠️ mod-adaln: checkpoint 缺少 mod_img/mod_txt 双分支权重, "
+                   f"已把旧 blocks.*.mod.* 拷贝初始化到两个分支 (层 {migration['copied']})。"
+                   f"拷贝复用而非权重共享: step0 forward 与 shared AdaLN 完全等价, 训练后两分支独立分化")
+        logger.warning(message)
+        print(f"\033[1;33m{message}\033[0m", flush=True)
+    if migration["missing"]:
+        message = (f"⚠️ mod-adaln: 层 {migration['missing']} 的 mod_img/mod_txt 在 checkpoint 中不存在"
+                   f"且无旧 mod.* 可拷贝, 这部分保持重新随机初始化")
+        logger.warning(message)
+        print(f"\033[1;31m{message}\033[0m", flush=True)
+    if migration["orphan_dual"]:
+        message = (f"⚠️ mod-adaln: checkpoint 含 dual-branch AdaLN 权重 (层 {migration['orphan_dual']}) "
+                   f"但模型为 shared mod (yaml model.mod_adaln 未开启), mod.* 保持随机初始化 — "
+                   f"如需继承请在 config 的 model 下设置 mod_adaln: true")
+        logger.warning(message)
+        print(f"\033[1;31m{message}\033[0m", flush=True)
+
+
 def load_compatible_state_dict(model, state):
-    """只加载名称和 shape 都匹配的参数，其余参数保留当前初始化值。"""
+    """只加载名称和 shape 都匹配的参数，其余参数保留当前初始化值。
+
+    mod_adaln 开启时自动迁移: 旧 ckpt 的 blocks.*.mod.* 被拷贝初始化到 mod_img/mod_txt
+    双分支 (拷贝复用而非权重共享), step0 forward 与 shared AdaLN 完全等价, 无损热启动。"""
     current = model.state_dict()
+    _report_mod_adaln_migration(apply_mod_adaln_migration(current, state))
     matched = {key: value for key, value in state.items()
                if key in current and current[key].shape == value.shape}
     patch_volume = math.prod(model.patch_size)
@@ -610,6 +638,7 @@ def print_banner(cfg, rank):
     print(f"{red}{'=' * 74}{reset}", flush=True)
     print("🧠 Giga-Exp stage_1 | T2V-only flow matching (T=1, video-ready)", flush=True)
     print(f"📐 DiT: dim={model['dim']} layers={model['layers']} heads={model['heads']} ffn={model['ffn_dim']} head_dim={model['dim'] // model['heads']}", flush=True)
+    print(f"🎚️  AdaLN: {'dual-branch (mod_img/mod_txt, MiniMax H3 风格)' if model.get('mod_adaln') else 'shared (全序列一个 mod)'}", flush=True)
     print(f"⚡ 加速: torch.compile={'ON (dynamic)' if cfg['training'].get('torch_compile') else 'off'} | FA3={'READY (varlen 支持右 padding)' if _giga_transformer._FA3 else 'MISSING (SDPA 回退)'}", flush=True)
     print(f"🌀 RoPE: axes(t/h/w)={model['rope_axes_dims']} theta={model['rope_theta']} — time axis retained for video", flush=True)
     print(f"📝 Text encoder: {cfg['components']['text_encoder']['pretrained_path']}", flush=True)

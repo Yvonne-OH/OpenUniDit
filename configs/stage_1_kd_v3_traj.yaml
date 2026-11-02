@@ -28,6 +28,9 @@ distributed:
 
 # student 结构 (与 stage_1.yaml 完全一致)
 model:
+  # dual-branch AdaLN (MiniMax H3 风格): image token 用 mod_img, text token 用 mod_txt;
+  # 旧 ckpt 的 blocks.*.mod.* 加载时自动拷贝到两分支 (无损等价热启动, 训练后独立分化)。
+  mod_adaln: true
   in_channels: 48
   out_channels: 48
   text_dim: 2560

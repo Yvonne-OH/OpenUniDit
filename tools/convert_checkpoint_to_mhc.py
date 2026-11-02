@@ -26,7 +26,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from models.giga_transformer import GigaExpTransformer
+from models.giga_transformer import GigaExpTransformer, apply_mod_adaln_migration
 from models.giga_transformer_mhc import GigaExpTransformerMHC
 
 
@@ -71,6 +71,12 @@ def convert(checkpoint_path: Path, config_path: Path, output_path: Path) -> dict
     # ---- 2. mHC 模型: 载入原参数 (strict), mHC 新参数保持初始化 ---- #
     mhc_model = GigaExpTransformerMHC(**model_cfg)
     mhc_state = mhc_model.state_dict()
+    # mod_adaln 开启时先把旧 blocks.*.mod.* 拷贝初始化到 mod_img/mod_txt 双分支
+    # (拷贝复用而非权重共享), 再参与 strict 核对; 缺失且无旧 mod.* 的层保持随机初始化
+    migration = apply_mod_adaln_migration(mhc_state, original)
+    if migration["copied"] or migration["missing"] or migration["orphan_dual"]:
+        print(f"⚠️ mod-adaln 迁移: copied_layers={migration['copied']} "
+              f"missing_layers={migration['missing']} orphan_dual={migration['orphan_dual']}")
     mhc_new_keys = sorted(set(mhc_state) - set(original))
     load_result = mhc_model.load_state_dict(original, strict=False)
     # strict=False 后必须人工核对: missing 只允许 mhc 新增键, unexpected 必须为空

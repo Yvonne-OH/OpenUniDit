@@ -83,10 +83,46 @@ class SpacetimeRoPE(nn.Module):
         return phase.cos(), phase.sin()        # 保持 fp32, 旋转在 block 内以 fp32 完成后再 cast
 
 
+def apply_mod_adaln_migration(current, state):
+    """mod-adaln checkpoint 迁移: 把旧 shared-AdaLN ckpt 的 blocks.*.mod.* 拷贝初始化到
+    mod_img/mod_txt 双分支 (拷贝复用而非权重共享, 加载后两分支独立接收梯度)。
+
+    - current: 模型期望的 state_dict (只读, 判断模型是否双分支);
+    - state:   checkpoint state_dict (就地修改: 补齐 mod_img/mod_txt, 移除已拷贝的旧 mod.*);
+    - 返回 {"model_dual": bool, "copied": [层号], "missing": [层号], "orphan_dual": [层号]}
+      copied:       旧 mod.* 已拷贝到双分支的层 (step0 forward 与 shared AdaLN 逐位等价);
+      missing:      期望双分支但 ckpt 既无 mod_img/mod_txt 也无旧 mod.* (保持随机初始化);
+      orphan_dual:  模型为 shared mod 但 ckpt 是双分支 (mod.* 无法恢复, 保持随机初始化)。
+    """
+    result = {"model_dual": False, "copied": [], "missing": [], "orphan_dual": []}
+    if any(".mod_img." in key for key in current):
+        result["model_dual"] = True
+        layers = sorted({int(key.split(".")[1]) for key in current if ".mod_img." in key})
+        for i in layers:
+            if f"blocks.{i}.mod_img.weight" in state and f"blocks.{i}.mod_txt.weight" in state:
+                continue  # 新格式 ckpt, 直接加载, 无需迁移
+            old = {part: state.get(f"blocks.{i}.mod.{part}") for part in ("weight", "bias")}
+            if old["weight"] is None:
+                result["missing"].append(i)
+                continue
+            for branch in ("mod_img", "mod_txt"):
+                for part in ("weight", "bias"):
+                    key = f"blocks.{i}.{branch}.{part}"
+                    if key in current and key not in state and old[part] is not None:
+                        state[key] = old[part]
+            state.pop(f"blocks.{i}.mod.weight", None)
+            state.pop(f"blocks.{i}.mod.bias", None)
+            result["copied"].append(i)
+    else:
+        result["orphan_dual"] = sorted({int(key.split(".")[1]) for key in state if ".mod_img." in key})
+    return result
+
+
 class GigaBlock(nn.Module):
-    def __init__(self, dim, heads, ffn_dim):
+    def __init__(self, dim, heads, ffn_dim, mod_adaln=False):
         super().__init__()
         self.heads = heads
+        self.mod_adaln = bool(mod_adaln)
         self.norm1 = RMSNorm(dim)
         self.norm2 = RMSNorm(dim)
         self.qkv = nn.Linear(dim, dim * 3, bias=False)
@@ -95,11 +131,17 @@ class GigaBlock(nn.Module):
         self.k_norm = RMSNorm(head_dim)
         self.out = nn.Linear(dim, dim, bias=False)
         self.ff = nn.Sequential(nn.Linear(dim, ffn_dim, bias=False), nn.SiLU(), nn.Linear(ffn_dim, dim, bias=False))
-        self.mod = nn.Linear(dim, dim * 6)
+        if self.mod_adaln:
+            # dual-branch AdaLN (MiniMax H3 风格): image token 用 mod_img, text token 用 mod_txt。
+            # 旧 ckpt 恢复时由 apply_mod_adaln_migration 把旧 mod.* 拷贝初始化到两分支
+            # (拷贝复用而非权重共享), step0 forward 与 shared AdaLN 完全等价, 无损热启动。
+            self.mod_img = nn.Linear(dim, dim * 6)
+            self.mod_txt = nn.Linear(dim, dim * 6)
+        else:
+            self.mod = nn.Linear(dim, dim * 6)
 
-    def forward(self, x, cond, cos, sin, attention_mask=None, pack=None):
-        shift_a, scale_a, gate_a, shift_f, scale_f, gate_f = self.mod(cond).chunk(6, -1)
-        y = self.norm1(x) * (1 + scale_a[:, None]) + shift_a[:, None]
+    def _attend(self, y, cos, sin, attention_mask, pack):
+        """qkv -> RoPE -> attention, 返回 [b, n, dim]; shared/dual 两条路径共用。"""
         q, k, v = self.qkv(y).chunk(3, -1)
         b, n, _ = q.shape
         q = self.q_norm(q.view(b, n, self.heads, -1)).view(b, n, -1)
@@ -139,28 +181,57 @@ class GigaBlock(nn.Module):
             q = (qf * cos4 + rotate_half(qf) * sin4).to(v.dtype)
             k = (kf * cos4 + rotate_half(kf) * sin4).to(v.dtype)
             a = F.scaled_dot_product_attention(q, k, v, attn_mask=attention_mask).transpose(1, 2).reshape(b, n, -1)
-        x = x + self.out(a) * gate_a[:, None]
+        return a
+
+    def forward(self, x, cond, cos, sin, attention_mask=None, pack=None, n_img=None):
+        if self.mod_adaln:
+            if n_img is None or not 0 < n_img < x.shape[1]:
+                raise ValueError(f"mod_adaln 需要 0 < n_img < seq_len, got n_img={n_img}, seq_len={x.shape[1]}")
+            return self._forward_dual(x, cond, cos, sin, attention_mask, pack, n_img)
+        # shared AdaLN 路径 (与原实现逐行等价)
+        shift_a, scale_a, gate_a, shift_f, scale_f, gate_f = self.mod(cond).chunk(6, -1)
+        y = self.norm1(x) * (1 + scale_a[:, None]) + shift_a[:, None]
+        x = x + self.out(self._attend(y, cos, sin, attention_mask, pack)) * gate_a[:, None]
         y = self.norm2(x) * (1 + scale_f[:, None]) + shift_f[:, None]
         return x + self.ff(y) * gate_f[:, None]
+
+    def _forward_dual(self, x, cond, cos, sin, attention_mask, pack, n_img):
+        """dual-branch AdaLN: image 前缀用 mod_img, text 后缀用 mod_txt, 两分支梯度独立。"""
+        sa_i, sca_i, ga_i, sf_i, scf_i, gf_i = self.mod_img(cond).chunk(6, -1)
+        sa_t, sca_t, ga_t, sf_t, scf_t, gf_t = self.mod_txt(cond).chunk(6, -1)
+        img, txt = x[:, :n_img], x[:, n_img:]
+        y = torch.cat((self.norm1(img) * (1 + sca_i[:, None]) + sa_i[:, None],
+                       self.norm1(txt) * (1 + sca_t[:, None]) + sa_t[:, None]), 1)
+        a = self.out(self._attend(y, cos, sin, attention_mask, pack))
+        x = torch.cat((img + a[:, :n_img] * ga_i[:, None],
+                       txt + a[:, n_img:] * ga_t[:, None]), 1)
+        img, txt = x[:, :n_img], x[:, n_img:]
+        y = torch.cat((self.norm2(img) * (1 + scf_i[:, None]) + sf_i[:, None],
+                       self.norm2(txt) * (1 + scf_t[:, None]) + sf_t[:, None]), 1)
+        f = self.ff(y)
+        return torch.cat((img + f[:, :n_img] * gf_i[:, None],
+                          txt + f[:, n_img:] * gf_t[:, None]), 1)
 
 
 class GigaExpTransformer(nn.Module):
     """~0.8B dense DiT: 1792 width, 16 blocks, 14 heads, temporal RoPE retained."""
     def __init__(self, in_channels=48, out_channels=48, text_dim=4096, dim=1792,
                  ffn_dim=4864, heads=14, layers=24, rope_theta=10000.0,
-                 rope_axes_dims=(32, 32, 32, 32), patch_size=(1, 1, 1)):
+                 rope_axes_dims=(32, 32, 32, 32), patch_size=(1, 1, 1), mod_adaln=False):
         super().__init__()
         self.patch_size = tuple(patch_size)
         if len(self.patch_size) != 3 or self.patch_size[0] != 1 or any(p < 1 for p in self.patch_size):
             raise ValueError("patch_size 必须是时间维为 1 的三个正整数")
         self.in_channels, self.out_channels, self.dim, self.heads = in_channels, out_channels, dim, heads
         self.text_dim, self.ffn_dim, self.layers = text_dim, ffn_dim, layers
+        self.mod_adaln = bool(mod_adaln)
         patch_volume = math.prod(self.patch_size)
         self.patch_in = nn.Linear(in_channels * patch_volume, dim)
         self.text_in = nn.Linear(text_dim, dim)
         self.time_in = nn.Sequential(nn.Linear(256, dim), nn.SiLU(), nn.Linear(dim, dim))
         self.rope = SpacetimeRoPE(dim // heads, rope_theta, rope_axes_dims)
-        self.blocks = nn.ModuleList([GigaBlock(dim, heads, ffn_dim) for _ in range(layers)])
+        self.blocks = nn.ModuleList([GigaBlock(dim, heads, ffn_dim, mod_adaln=self.mod_adaln)
+                                     for _ in range(layers)])
         self.norm = RMSNorm(dim)
         self.out = nn.Linear(dim, out_channels * patch_volume)
 
@@ -175,6 +246,7 @@ class GigaExpTransformer(nn.Module):
             "patch_size": list(self.patch_size),
             "rope_theta": self.rope.theta,
             "rope_axes": list(self.rope.axes_dims),
+            "mod_adaln": self.mod_adaln,
             "implementation": {
                 "version": "giga_semantics_v1",
                 "rope": "fp32_cos_sin_and_rotation",
@@ -239,7 +311,7 @@ class GigaExpTransformer(nn.Module):
         cos, sin = self.rope(t, h, w, text.shape[1], x.device, x.dtype)
         features = [] if feature_layers is not None else None
         for block_idx, block in enumerate(self.blocks):
-            x = block(x, cond, cos, sin, attention_mask, pack)
+            x = block(x, cond, cos, sin, attention_mask, pack, n_img)
             if features is not None and block_idx in feature_layers:
                 features.append(x)  # [B, n_img+n_text, D] 全序列, KD 侧再切 image 前缀
         image = self.out(self.norm(x[:, :t * h * w]))
