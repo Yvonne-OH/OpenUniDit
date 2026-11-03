@@ -1,0 +1,158 @@
+# Giga-Exp Image stage_1 (tiny 0.5B): 参考 configs/stage_1.yaml 缩小模型规模, 其余设置一致。
+# 参数量估算 (mod_adaln 双分支): 每 block 16*dim^2 + 2*dim*ffn = 22.55M,
+# 22 layers ≈ 496M + embed/text_refiner ~28M ≈ 0.51B (对照: 28层 dim=1536 ≈ 1.4B)。
+stage: stage_1
+output_dir: /home/jovyan/pfs/users/zhanqian.wu/exp/giga_exp_image/stage_1_tiny
+seed: 42
+
+# DeepSpeed launcher: bash scripts/train/train_giga_exp_stage_1_tiny.sh
+distributed:
+  backend: deepspeed
+  config: configs/zero1.json
+  world_size: 8
+  timeout_seconds: 7200
+
+model:
+  # dual-branch AdaLN (MiniMax H3 风格): image token 用 mod_img, text token 用 mod_txt。
+  mod_adaln: true
+  # Text Refiner (MOSS-Image 风格): 2 层残差自注意力+FFN, 恒等初始化。
+  text_trans:
+    enabled: true
+    layers: 2
+    heads: 8         # 同主 DiT heads
+  in_channels: 48
+  out_channels: 48
+  text_dim: 2560
+  dim: 1024          # head_dim = 1024/8 = 128 = sum(rope_axes_dims), 与 28 层版一致
+  ffn_dim: 2816
+  heads: 8
+  layers: 22
+  rope_theta: 10000.0
+  rope_axes_dims: [16, 48, 48, 16]
+  patch_size: [1, 2, 2]
+
+components:
+  text_encoder:
+    type: qwen3_vl
+    pretrained_path: /mnt/nfs/models/huggingface/Qwen/Qwen3-VL-4B-Instruct
+    tokenizer_path: /mnt/nfs/models/huggingface/Qwen/Qwen3-VL-4B-Instruct
+    local_files_only: true
+    layer: -2                     # 取倒数第二层 hidden states (对齐 gigaworld stage1 约定)
+    max_length: 512
+  wan_vae:
+    type: AutoencoderKLWan
+    pretrained_path: /mnt/nfs/models/huggingface/models--Wan-AI--Wan2.2-TI2V-5B-Diffusers
+    subfolder: vae
+    local_files_only: true
+
+scheduler:
+  type: flow_matching
+  num_train_timesteps: 1000
+  shift: 3.0
+  timestep_sampling: uniform
+  validation_shift: 3.0
+
+dataset:
+  dataset_type: lmdb_parquet
+  image_training_enabled: true
+  edit_training_enabled: false
+  database_path: /home/jovyan/pfs/users/zhanqian.wu/pfs_data/unified_images_lmdb
+  image_database_path: /home/jovyan/pfs/users/zhanqian.wu/pfs_data/unified_images_lmdb
+  lmdb_root: /home/jovyan/pfs/users/zhanqian.wu/pfs_data/unified_images_lmdb
+  image_root: /home/jovyan/pfs/users/zhanqian.wu/pfs_data/unified_images_lmdb
+  image_sources:
+    - 4KLSDB
+    - Aesthetic-4K
+    - HumanCaption-10M
+    - LAION_Aesthetics_1024
+    - Poster100K
+    - anime_captions
+    - bg_photo_concepts
+    - blip3o-long-caption-wds
+    - blip3o-long-caption
+    - caption3o-xl-v4
+    - ffhq_captioned_1024
+    - fine_t2i
+    - pexels-advertisement-photography
+    - pexels_aesth_2_1024
+    - qwen-synth-characters-fused
+    - sa1b_en
+    - anyword_3m
+    - pixelprose_cc12m
+    - pixelprose_commonpool
+    - pixelprose_redcaps
+    - monet_cc12m
+    - monet_commoncatalog_cc_by
+    - monet_coyo
+  contract: "[B,C,T,H,W]"
+  num_frames: 1
+  preprocess_style: cover   # 短边贴桶+中心裁剪, 无黑边
+  resolution: 512
+  long_edge: 512
+  max_upscale_ratio: 1.2
+  max_retries: 16
+  refresh_index_cache: false
+  index_cache_dir: /home/jovyan/pfs/users/zhanqian.wu/exp/giga_exp_image/stage_1_tiny/dataset_index_cache
+  buckets:
+    - 512_square
+    - 512x384
+    - 384x512
+  bucket_sampling_weights:
+    512_square: 0.45
+    512x384: 0.275
+    384x512: 0.275
+
+validation:
+  enabled: true
+  every_n_steps: 1000
+  per_rank: true
+  use_next_batch: true
+  num_inference_steps: 20
+  seed: 42
+  guidance_scale: 3.0
+
+training:
+  enabled: true
+  t2v_only: true
+  cfg_dropout: 0.1
+  batch_size_per_device: 8
+  num_workers: 4
+  max_epochs: 6
+  mixed_precision: bf16
+  optimizer: adamw
+  torch_compile: false
+  muon:
+    enabled: false
+    momentum: 0.95
+    learning_rate: 3x
+    adjust_lr_fn: match_rms_adamw
+    weight_decay: 0.0
+  adam:
+    enabled: true
+    betas: [0.9, 0.95]
+    epsilon: 1.0e-8
+  learning_rate: 1.0e-4
+  weight_decay: 0.0
+  lr_scheduler: cosine
+  lr_warmup_steps: 200
+  gradient_accumulation_steps: 1
+  checkpointing_steps: 2500
+  state_checkpoints_keep: 2
+  # 从 0 训练, auto 在新目录无 checkpoint 时从 0 开始, 崩溃重启自动续训
+  resume_mode: auto
+  resume_optimizer: false
+  resume_lr_scheduler: true
+
+logging:
+  report_to: [console, swanlab]
+  log_every_n_steps: 1
+  save_samples: true
+  swanlab:
+    enabled: true
+    project: giga-exp-image
+    name: giga_exp_image_stage_1_tiny
+    api_key: Dit2ngq8iuiGfUkI88e5b
+  wandb:
+    enabled: false
+    project: giga-exp-image
+    name: giga_exp_image_stage_1_tiny
