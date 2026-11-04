@@ -123,7 +123,7 @@ training:
   enabled: true
   t2v_only: true
   cfg_dropout: 0.1
-  batch_size_per_device: 64
+  batch_size_per_device: 4
   num_workers: 4
   max_epochs: 6
   mixed_precision: bf16
