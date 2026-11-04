@@ -17,6 +17,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+# FA3 (flash_attn_3) 位于 thirdparty: 必须在 import models.* 之前注入,
+# 否则 giga_transformer_mhc 顶层 `from models.giga_transformer import _fa3_func` 会失败
+# (注入方式与 train_giga_exp_mhc.py 一致)
+_THIRDPARTY = str(ROOT / "thirdparty")
+if Path(_THIRDPARTY).is_dir() and _THIRDPARTY not in sys.path:
+    sys.path.insert(0, _THIRDPARTY)
 
 import torch
 import yaml
@@ -24,7 +30,7 @@ from diffusers import AutoencoderKLWan
 from safetensors.torch import load_file
 from transformers import AutoTokenizer, Qwen3VLForConditionalGeneration
 
-from models.giga_transformer import GigaExpTransformer
+from models.giga_transformer import GigaExpTransformer, apply_mod_adaln_migration
 
 try:
     from tqdm import tqdm, trange
@@ -132,8 +138,18 @@ def resolve_checkpoint(path, output_dir):
 
 
 def load_compatible_state_dict(model, state):
-    """只加载名称和 shape 都匹配的参数, 其余保留初始化值; 含 patchify 迁移 (对齐训练脚本)."""
+    """只加载名称和 shape 都匹配的参数, 其余保留初始化值; 含 patchify 迁移 (对齐训练脚本).
+
+    与训练脚本一致: 先做 mod-AdaLN 迁移, 否则旧 shared-AdaLN ckpt 加载进 dual-branch
+    (mod_adaln: true) 模型时 mod_img/mod_txt 保持随机初始化, 推理质量静默崩坏。"""
     current = model.state_dict()
+    migration = apply_mod_adaln_migration(current, state)
+    if migration["copied"]:
+        print(f"mod-AdaLN 迁移: {len(migration['copied'])} 层旧 mod.* 已拷贝到 mod_img/mod_txt", flush=True)
+    if migration["missing"]:
+        print(f"⚠️ mod-AdaLN: {len(migration['missing'])} 层 ckpt 缺失调制权重, 保持随机初始化", flush=True)
+    if migration["orphan_dual"]:
+        print(f"⚠️ mod-AdaLN: 模型为 shared 但 ckpt 是 dual-branch, {len(migration['orphan_dual'])} 层保持随机初始化", flush=True)
     matched = {key: value for key, value in state.items()
                if key in current and current[key].shape == value.shape}
     patch_volume = math.prod(model.patch_size)
@@ -254,7 +270,13 @@ def main():
     vae = AutoencoderKLWan.from_pretrained(
         dc["pretrained_path"], subfolder=dc.get("subfolder", "vae"),
         torch_dtype=torch.float32, local_files_only=True).eval().to(device)
-    model = GigaExpTransformer(**cfg["model"]).to(device, dtype=dtype)
+    # mHC 配置 (mhc.enabled=true 或 model 含 n_streams) 构建 GigaExpTransformerMHC,
+    # 输入输出接口与 GigaExpTransformer 完全一致, 采样循环无需改动
+    if cfg.get("mhc", {}).get("enabled") or "n_streams" in cfg["model"]:
+        from models.giga_transformer_mhc import GigaExpTransformerMHC
+        model = GigaExpTransformerMHC(**cfg["model"]).to(device, dtype=dtype)
+    else:
+        model = GigaExpTransformer(**cfg["model"]).to(device, dtype=dtype)
     state = load_file(str(checkpoint)) if checkpoint.suffix == ".safetensors" \
         else torch.load(str(checkpoint), map_location="cpu")
     load_compatible_state_dict(model, state)
