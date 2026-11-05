@@ -130,6 +130,17 @@ if [[ -n "${CHECKPOINT}" ]]; then
   ARGS+=(--checkpoint "${CHECKPOINT}")
 fi
 
+# ── attention profiling (可选: ATTN_PROFILE=1 开启, 旁路统计不改采样结果) ──
+if [[ "${ATTN_PROFILE:-0}" == "1" ]]; then
+  ARGS+=(--attn-profile --attn-profile-stride "${ATTN_PROFILE_STRIDE:-4}")
+  if [[ -n "${ATTN_PROFILE_LAYERS:-}" ]]; then
+    ARGS+=(--attn-profile-layers "${ATTN_PROFILE_LAYERS}")
+  fi
+  if [[ -n "${ATTN_PROFILE_BRANCH:-}" ]]; then
+    ARGS+=(--attn-profile-branch "${ATTN_PROFILE_BRANCH}")
+  fi
+fi
+
 if [[ -z "${GPU}" ]]; then
   GPU=$(( $(nvidia-smi -L | wc -l) - 1 ))
 fi

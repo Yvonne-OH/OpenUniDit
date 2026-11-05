@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import math
 import os
@@ -109,6 +110,15 @@ def parse_args():
     parser.add_argument("--batch-size", type=int, default=4, help="list input 的分批大小")
     parser.add_argument("--device", default="cuda", choices=["cuda", "cpu"],
                         help="cuda 缺省自动选最后一张可见 GPU; cpu 用于调试")
+    # ── attention profiling (旁路 hook, 不改变 forward 数值) ──
+    parser.add_argument("--attn-profile", action="store_true",
+                        help="推理时同步做 attention profiling, 结果存 <output>/attn_profile/batch_*/")
+    parser.add_argument("--attn-profile-layers", default=None,
+                        help="只统计这些层: 逗号分隔 (如 0,7,14,21,27) 或 'all'; 缺省每隔 5 层 (0,5,10,...)")
+    parser.add_argument("--attn-profile-branch", default="cond", choices=["cond", "uncond", "both"],
+                        help="统计哪个 CFG 分支 (batch 后半 = cond); 默认 cond")
+    parser.add_argument("--attn-profile-stride", type=int, default=1,
+                        help="每 N 个 ODE step 采样一次 (默认 1 = 每步都采)")
     return parser.parse_args()
 
 
@@ -261,6 +271,7 @@ def main():
         ("prompts", str(len(prompts))),
         ("device", str(device)),
         ("output_dir", str(output_dir)),
+        ("attn_profile", str(args.attn_profile)),
     ]), flush=True)
 
     log_info(f"🧩 加载组件: encoder={tc['pretrained_path']} · vae={dc['pretrained_path']}")
@@ -287,6 +298,27 @@ def main():
     mean, std_inv = wan_latent_stats(vae, device)
     layer = tc.get("layer")
     max_length = tc.get("max_length", 512)
+    # ── attention profiling 初始化 (attn_profile=None 时零开销) ──
+    prof_kwargs = None
+    if args.attn_profile:
+        from tools.attn_profile import DiTAttentionProfiler
+        spec = (args.attn_profile_layers or "").strip()
+        if spec.lower() == "all":
+            prof_layers = None                       # 全部层
+        elif spec:
+            prof_layers = [int(x) for x in spec.split(",") if x.strip()]
+        else:
+            prof_layers = list(range(0, len(model.blocks), 5))   # 缺省每隔 5 层
+        ps_t, ps_h, ps_w = model.patch_size
+        prof_grid = (ps_t, (args.height // compress) // ps_h, (args.width // compress) // ps_w)
+        prof_kwargs = dict(layers=prof_layers, branch=args.attn_profile_branch,
+                           stride=args.attn_profile_stride, grid=prof_grid,
+                           meta={"checkpoint": f"{checkpoint.name} (step {step})",
+                                 "size": f"{args.height}x{args.width}",
+                                 "steps": args.steps, "guidance": args.guidance_scale,
+                                 "shift": shift, "seed": args.seed})
+        log_info(f"📊 attention profiling: layers={'all' if prof_layers is None else prof_layers}, "
+                 f"branch={args.attn_profile_branch}, stride={args.attn_profile_stride}")
     manifest = {
         "checkpoint": str(checkpoint), "step": step, "config": str(args.config),
         "height": args.height, "width": args.width, "num_inference_steps": args.steps,
@@ -310,8 +342,19 @@ def main():
             noises.append(torch.randn(1, z_dim, 1, args.height // compress, args.width // compress,
                                       device=device, dtype=torch.float32, generator=generator))
         x = torch.cat(noises, 0)
-        x = sample_batch(model, x, text, mask, neg, neg_mask,
-                         steps=args.steps, guidance=args.guidance_scale, shift=shift, dtype=dtype)
+        # 每个 batch 独立 profiler (统计状态按 batch 隔离, 逐 prompt 可对比)
+        batch_profiler = None
+        if prof_kwargs is not None:
+            batch_profiler = DiTAttentionProfiler(model, **prof_kwargs)
+        with (batch_profiler if batch_profiler is not None else contextlib.nullcontext()):
+            x = sample_batch(model, x, text, mask, neg, neg_mask,
+                             steps=args.steps, guidance=args.guidance_scale, shift=shift, dtype=dtype)
+        if batch_profiler is not None:
+            prof_dir = output_dir / "attn_profile" / f"batch_{start:03d}"
+            prof_summary = batch_profiler.save(prof_dir)
+            print(DiTAttentionProfiler.render_summary(prof_summary, max_steps=4), flush=True)
+            log_ok(f"📊 attention profiling 已保存 → {prof_dir}")
+            manifest.setdefault("attn_profile_dirs", []).append(str(prof_dir))
         with torch.no_grad():  # VAE 解码不需要梯度
             images = vae.decode(x / std_inv + mean).sample
         for local_i, idx in enumerate(batch_index):
