@@ -4,7 +4,9 @@
 
 ## 1. 总体结构
 
-Giga-Exp 是一个 **0.80B 稠密 DiT** 的文本到图像 Flow Matching 模型，采用**单流（single-stream）**设计：图像 token 与文本 token 拼接后进同一组 Transformer Block 联合注意力。时间轴（T）在结构上完整保留，图像只是 T=1 的特例，因此可直接扩展到视频训练。latent 在进入 Transformer 前做 **(1,2,2) patchify**（时间维不合并、空间 2x2 合并），以 1/4 的图像 token 数换取训练吞吐。推理使用 **Classifier-Free Guidance（CFG）**：条件分支与空文本 unconditional 分支共享同一个 DiT，批量前向后按 guidance scale 合并。
+Giga-Exp 是一个 **0.71B 稠密 DiT** 的文本到图像 Flow Matching 模型（stage_1_28layers：28 层 / dim 1536 / 12 头 / FFN 4096，basis AdaLN 结构；bf16 权重约 1.43GB），采用**单流（single-stream）**设计：图像 token 与文本 token 拼接后进同一组 Transformer Block 联合注意力。文本 token 在投影后先经过一个 **Text Refiner**（MOSS-Image 风格，2 层残差自注意力+FFN，恒等初始化）再进主 DiT。时间轴（T）在结构上完整保留，图像只是 T=1 的特例，因此可直接扩展到视频训练。latent 在进入 Transformer 前做 **(1,2,2) patchify**（时间维不合并、空间 2x2 合并），以 1/4 的图像 token 数换取训练吞吐。推理使用 **Classifier-Free Guidance（CFG）**：条件分支与空文本 unconditional 分支共享同一个 DiT，批量前向后按 guidance scale 合并。
+
+> 历史：早期配置为 16 层 / 1792 宽 / 0.80B（shared AdaLN），后扩到 28 层并引入 dual-branch（MiniMax H3 风格）与 basis 共享基结构，见 §4。
 
 ```mermaid
 flowchart TB
@@ -16,7 +18,7 @@ flowchart TB
     TE --> TXT["文本隐藏状态 + mask<br/>形状 [B, S, 2560]"]
     SIGMA["sigma 采样: U(0,1) 后接 shift=3 变换<br/>sigma = 3u / (1 + 2u)"] --> DIT
     XT --> PATCH["(1,2,2) patchify<br/>空间 2x2 合并 latent patch<br/>token 特征 = 48 x 4 = 192"]
-    PATCH --> DIT["GigaExpTransformer<br/>16 层单流 DiT, 0.80B"]
+    PATCH --> DIT["GigaExpTransformer<br/>28 层单流 DiT, 0.71B"]
     TXT --> DIT
     DIT --> UNPATCH["unpatchify 还原<br/>[B, 48, T, H, W]"]
     UNPATCH --> V_PRED["预测速度 v = eps - z<br/>形状 [B, 48, 1, H/16, W/16]"]
@@ -45,32 +47,34 @@ sigma 采样: u ~ U(0,1), sigma = shift * u / (1 + (shift-1) * u), shift = 3.0
 | Text Encoder | Qwen3-VL-4B-Instruct（`Qwen3VLForConditionalGeneration`，纯文本输入） | 输出 2560 维隐藏状态（hidden_states[-2]），bf16，max_length=512，pad token 被 mask 掉 |
 | Tokenizer | Qwen2Tokenizer | 空 prompt 回退为 eos_token |
 | VAE | AutoencoderKLWan（Wan2.2 TI2V-5B） | 48 通道 latent，16x 空间压缩，`z_norm = (z - mean) / std` 对齐官方约定 |
-| DiT | GigaExpTransformer | 1792 宽度、16 层、14 头、单流联合注意力，(1,2,2) patchify |
+| DiT | GigaExpTransformer | 1536 宽度、28 层、12 头、单流联合注意力，(1,2,2) patchify，basis r=64 AdaLN + 2 层 Text Refiner |
 | Attention 后端 | FlashAttention 3（`thirdparty/flash_attn_interface.py`）优先，回退 SDPA | FA3 仅在无 padding mask 且 bf16/fp16 CUDA 时启用 |
 | 调度器 | 代码内实现（无 diffusers 依赖） | Flow Matching，训练 shift=3.0，验证 shift=3.0 |
-| 优化器 | Muon(2D 参数) + AdamW(输出头/1D) | DeepSpeed ZeRO-2，Muon 参数被 flatten 为 1D 分片，step 时 all-gather 重组后逐矩阵执行 Newton-Schulz，bf16 混合精度 |
+| 优化器 | AdamW（默认）；Muon+AdamW 实现保留但 `muon.enabled: false` | DeepSpeed ZeRO-2（configs/zero1.json，8 卡），bf16 混合精度，lr=1e-4 cosine + 200 warmup |
 
 ## 3. GigaExpTransformer 内部结构
 
 ```mermaid
 flowchart TB
     X["图像 latent<br/>形状 [B, 48, T, H, W]"] --> PATCH["(1,2,2) patchify<br/>空间 2x2 合并, 时间不合并<br/>token 网格 [B, T*(H/2)*(W/2), 192]"]
-    PATCH --> PI["patch_in<br/>Linear 192 -> 1792"]
-    TXT["文本隐藏状态<br/>形状 [B, S, 2560]"] --> TI["text_in<br/>Linear 2560 -> 1792"]
+    PATCH --> PI["patch_in<br/>Linear 192 -> 1536"]
+    TXT["文本隐藏状态<br/>形状 [B, S, 2560]"] --> TI["text_in<br/>Linear 2560 -> 1536"]
+    TI --> TR["text_refiner<br/>2 层残差自注意力+FFN<br/>恒等初始化, 只处理文本 token"]
     PI --> CAT["拼接<br/>seq = image tokens + text tokens"]
-    TI --> CAT
+    TR --> CAT
     TS["timestep = sigma * 1000"] --> FR["256 维 sin/cos<br/>128 个频率"]
-    FR --> TIN["time_in<br/>MLP 256 -> 1792 -> 1792"]
-    TIN --> MOD["cond<br/>每层 AdaLN 调制源"]
+    FR --> TIN["time_in<br/>MLP 256 -> 1536 -> 1536"]
+    TIN --> BAS["adaln_basis<br/>共享 Linear 1536 -> 64<br/>z = P·cond, 全模型只算一次"]
+    BAS --> MOD["z<br/>每层双分支系数头的调制源"]
     POS["T, H/2, W/2, L 坐标 (patchify 后网格)"] --> ROPE["SpacetimeRoPE<br/>4 轴: 16 + 48 + 48 + 16 = 128"]
     ROPE --> B0["GigaBlock 0"]
     CAT --> B0
     MOD --> B0
     B0 --> B1["GigaBlock 1"]
     B1 --> BD["......"]
-    BD --> B15["GigaBlock 15"]
-    B15 --> NORM["final RMSNorm<br/>只取 image tokens"]
-    NORM --> OUT["out<br/>Linear 1792 -> 192"]
+    BD --> B27["GigaBlock 27"]
+    B27 --> NORM["final RMSNorm<br/>只取 image tokens"]
+    NORM --> OUT["out<br/>Linear 1536 -> 192"]
     OUT --> UNPATCH["unpatchify<br/>reshape 回 [B, 48, T, H, W]"]
 ```
 
@@ -82,13 +86,12 @@ flowchart TB
 - 图像 token 的四元坐标为 `(t, h, w, l=0)`；文本 token 的坐标为 `(t=0, h=0, w=0, l=1..S)`，文本拥有独立递增的位置编码，**不复用图像位置**。
 - 文本位置轴 `l` 在不同视频帧数下保持独立于 `(t,h,w)`，因此图像与视频使用同一套 4D 坐标规则。
 
-各训练分辨率的 image token 数（不含文本，方形 bucket；非方形 bucket 按网格直积计算）：
+当前 stage_1 使用 512p 三桶（512_square 0.45 / 512x384 0.275 / 384x512 0.275，cover 裁剪无黑边）：
 
-| 阶段 | 分辨率 | latent (H/16 x W/16) | patchify 后网格 | image tokens |
-|---|---|---|---|---|
-| stage_1 | 192p | 12 x 12 | 6 x 6 | 36 (旧配置无 patchify 为 144) |
-| stage_1_1 | 256p | 16 x 16 | 8 x 8 | 64 |
-| stage_1_2 / stage_2_0 | 512p | 32 x 32 | 16 x 16 | 256 |
+| bucket | latent (H/16 x W/16) | patchify 后网格 | image tokens |
+|---|---|---|---|
+| 512_square | 32 x 32 | 16 x 16 | 256 |
+| 512x384 / 384x512 | 32 x 24 / 24 x 32 | 16 x 12 / 12 x 16 | 192 |
 
 加上最长 512 个文本 token，最长序列约 768。
 
@@ -104,23 +107,38 @@ text_mask 全有效 (无 padding):
 
 两条路径均先做 `q = q * cos + rotate_half(q) * sin` 的 RoPE 旋转，非因果（双向）注意力。
 
-## 4. GigaBlock：单层结构
+## 4. GigaBlock：单层结构与 AdaLN
 
-采用 **adaLN-zero 风格的每层独立调制**：每层有自己的 `mod` 层，从全局时间条件 `cond` 生成 6 组调制参数，分别作用于 attention 与 FFN 支路。
+调制采用 **basis 结构（默认，`model.adaln_type: basis`，r=64）**：全模型共享一个 `adaln_basis` Linear(dim→r) 把时间条件投影为 `z = P·cond`（每次前向只算一次），每层再各有 `mod_img` / `mod_txt` 两个 Linear(r→6·dim) 系数头——image token 吃 `mod_img` 的 6 组调制，text token 吃 `mod_txt` 的 6 组，分别作用于 attention 与 FFN 支路。
+
+`adaln_type` 三选一（yaml 显式注明；未注明时按旧 `mod_adaln` bool 推导，向后兼容）：
+
+| 类型 | 结构 | adaLN 参数（28 层实测） |
+|---|---|---|
+| `shared` | 每层一个 Linear(1536→9216)，img/text 共用 | 406.6M |
+| `dual` | 每层 mod_img/mod_txt 两个全秩 Linear（MiniMax H3 风格） | 793.2M（占模型 53.8%） |
+| `basis` | 共享 Linear(1536→64) + 每层双分支 Linear(64→9216) | **33.6M（占模型 4.7%）** |
+
+basis 的依据：调制只依赖 timestep，输入永远落在曲线 c(t) 张成的低维子空间（实测 56 条调制曲线有效秩 ~32-64）。转换取曲线协方差 top-r 主方向为 P、`A_i = W_i Pᵀ`，在 t 网格上实测 r=64 调制曲线 RMS 误差 **0.19%**（曲线能量捕获 99.994%）。
+
+**旧 ckpt 兼容**：训练/推理加载时 `apply_adaln_basis_migration` 自动检测 ckpt 结构——已是 basis 直接加载；dual/shared 全秩 ckpt 就地低秩转换后加载（**先转换再训练**），并打印红字警告；basis 模型之外回退原 `apply_mod_adaln_migration`（shared→dual 拷贝无损热启动）。推理端调制为 GEMV，可整条 t 网格预计算，成本可忽略。
 
 ```mermaid
 flowchart TB
-    IN["x: 输入序列<br/>形状 [B, L, 1792]"] --> N1["RMSNorm"]
-    COND["cond: 时间条件<br/>形状 [B, 1792]"] --> M["mod<br/>Linear 1792 -> 10752<br/>切 6 份: shift_a scale_a gate_a<br/>shift_f scale_f gate_f"]
+    IN["x: 输入序列<br/>形状 [B, L, 1536]"] --> N1["RMSNorm"]
+    Z["z = P·cond<br/>形状 [B, 64] (adaln_basis, 全模型共享)"] --> MI["mod_img<br/>Linear 64 -> 9216 (image token)"]
+    Z --> MT["mod_txt<br/>Linear 64 -> 9216 (text token)"]
+    MI --> M["按 token 类型取用<br/>切 6 份: shift_a scale_a gate_a<br/>shift_f scale_f gate_f"]
+    MT --> M
     M -->|"scale_a shift_a"| N1
-    N1 --> QKV["qkv<br/>Linear 1792 -> 5376, no bias"]
-    QKV --> ATT["RoPE + 双向注意力<br/>14 heads x 128 dim"]
-    ATT --> AO["out<br/>Linear 1792 -> 1792, no bias"]
+    N1 --> QKV["qkv<br/>Linear 1536 -> 4608, no bias"]
+    QKV --> ATT["RoPE + 双向注意力<br/>12 heads x 128 dim"]
+    ATT --> AO["out<br/>Linear 1536 -> 1536, no bias"]
     M -->|gate_a| ARES["残差: x + out(a) * gate_a"]
     IN --> ARES
     ARES --> N2["RMSNorm"]
     M -->|"scale_f shift_f"| N2
-    N2 --> FF["FFN<br/>1792 -> 4864 -> 1792<br/>SiLU 激活, no bias"]
+    N2 --> FF["FFN<br/>1536 -> 4096 -> 1536<br/>SiLU 激活, no bias"]
     M -->|gate_f| FRES["残差: x + ff(y) * gate_f"]
     ARES --> FRES
     FRES --> NEXT["x: 输出序列"]
@@ -129,43 +147,51 @@ flowchart TB
 要点：
 
 1. **调制**：`shift/scale` 作用于 Norm 之后（`norm(x) * (1 + scale) + shift`），`gate` 以零初始化风险的残差门控方式相加——本实现 gate 未做零初始化，直接由 `nn.Linear` 常规初始化输出。
-2. **QKV/FFN 均无 bias**，仅 `mod`、`patch_in`、`text_in`、`time_in`、`out` 保留 bias。
-3. **FFN** 为 `Linear(1792→4864) → SiLU → Linear(4864→1792)`（门控仅在外层残差，FFN 内部无 GLU）。
+2. **QKV/FFN 均无 bias**，`adaln_basis` 也无 bias；`mod_img`/`mod_txt` 系数头与 `patch_in`、`text_in`、`time_in`、`out` 保留 bias。
+3. **FFN** 为 `Linear(1536→4096) → SiLU → Linear(4096→1536)`（门控仅在外层残差，FFN 内部无 GLU）。
+4. **Text Refiner**（`text_trans`）：text_in 投影后、进主 DiT 前的 2 层残差自注意力+FFN（12 头，仅文本序列、无 AdaLN），残差支路输出层零初始化 → step0 恒等，旧 ckpt 无 `text_refiner.*` 时自动恒等初始化。
 
-## 5. 参数量明细（实测，(1,2,2) patchify 配置）
+## 5. 参数量明细（实测，stage_1.yaml：28 层 / dim 1536 / basis r=64 / (1,2,2) patchify）
 
-总量 **801,907,648 ≈ 0.80B**，bf16 权重约 1.6 GB。
+总量 **714,245,824 ≈ 0.71B**，bf16 权重约 1.43 GB。（对照：同结构改 `adaln_type: dual` 为 1,473,840,832 ≈ 1.47B / 2.95 GB——adaLN 差异全部来自调制参数。）
 
 | 部分 | 参数量 | 占比 |
 |---|---|---|
-| 16 x GigaBlock | 792,952,832 (49,559,552/层) | 98.9% |
-| patch_in (192→1792, 含 bias) | 345,856 | 0.04% |
-| text_in (2560→1792, 含 bias) | 4,589,312 | 0.57% |
-| time_in (256→1792→1792) | 3,673,600 | 0.46% |
-| final norm (1792) + out (1792→192) | 346,048 | 0.04% |
+| 28 x GigaBlock 主干 (qkv/attn-out/ff/norm) | 616,655,872 (22,023,424/层) | 86.3% |
+| adaLN 系数头 (blocks.*.mod_img/mod_txt, 含 bias) | 33,546,240 (1,198,080/层) | 4.7% |
+| text_refiner (2 层) | 56,663,040 (28,331,520/层) | 7.9% |
+| text_in (2560→1536, 含 bias) | 3,933,696 | 0.55% |
+| time_in (256→1536→1536) | 2,755,584 | 0.39% |
+| patch_in (192→1536) / out (1536→192) / final norm | 593,088 | 0.08% |
+| adaln_basis (1536→64, 全模型共享) | 98,304 | 0.01% |
 
-单层 GigaBlock 内部（共 49.56M）：
+单层 GigaBlock 内部（共 23.22M）：
 
 | 子层 | 参数量 |
 |---|---|
-| mod (1792→10752 + bias) | 19,278,336 |
-| ff (1792→4864→1792) | 17,432,576 |
-| qkv (1792→5376) | 9,633,792 |
-| attn out (1792→1792) | 3,211,264 |
-| norm1 + norm2 | 3,584 |
+| ff (1536→4096→1536) | 12,582,912 |
+| qkv (1536→4608) | 7,077,888 |
+| attn out (1536→1536) | 2,359,296 |
+| mod_img + mod_txt (64→9216, 含 bias) | 1,198,080 |
+| norm1 + norm2 + q_norm + k_norm | 3,712 |
+
+注：adaLN 系数头 + adaln_basis 合计 33.6M（4.7%）。dual 全秩时每层 mod 为 2×(1536×9216+9216)=28.4M/层、共 793.2M（53.8%），是旧 0.80B 配置换成 28 层后参数膨胀的主因；basis 结构把这部分压缩回 1/24。
 
 ## 6. 关键配置速查
 
 ```text
-hidden dimension        1792
-FFN dimension           4864
-attention heads         14  (head_dim = 128)
-main DiT layers         16
+hidden dimension        1536
+FFN dimension           4096
+attention heads         12  (head_dim = 128)
+main DiT layers         28
+text refiner layers     2   (text_trans: dim 1536, ffn 4096, heads 12)
+adaln_type              basis   # shared | dual | basis (旧 ckpt 加载时自动转换)
+adaln_rank              64      # 共享基维度, adaLN 793M -> 33.6M
 latent channels         48  (Wan2.2 VAE)
 patch size (t/h/w)      (1, 2, 2)  时间不合并, 空间 2x2
-patch_in / out          Linear 192->1792 / Linear 1792->192
+patch_in / out          Linear 192->1536 / Linear 1536->192
 text hidden dimension   2560  (Qwen3-VL-4B-Instruct, hidden_states[-2])
-timestep embedding      256 (128 频率 sin/cos) -> 1792
+timestep embedding      256 (128 频率 sin/cos) -> 1536
 RoPE axes (t/h/w/l)     16 / 48 / 48 / 16, theta = 10000 (patchify 后网格)
 RoPE for image tokens   (t, h, w, l=0)
 RoPE for text tokens    (t=0, h=0, w=0, l=1..S)
@@ -173,11 +199,13 @@ CFG guidance scale      3.0 (validation/inference)
 CFG training dropout    0.1 (empty-text unconditional training)
 scheduler               flow matching, shift = 3.0 (uniform u)
 attention               bidirectional, FA3 优先 / SDPA 回退
-optimizer               Muon(2D, lr=3x, match_rms_adamw, wd=0) + AdamW(out.*/1D)
-precision               bf16 mixed, DeepSpeed ZeRO-2, grad clip 1.0
+optimizer               AdamW (lr 1e-4, cosine, warmup 200, wd 0.01); Muon 实现保留但默认关闭
+precision               bf16 mixed, DeepSpeed ZeRO-2 (zero1.json), grad clip 1.0
 ```
 
-## 7. 优化器与 ZeRO-2 分片 Muon
+## 7. 优化器与 ZeRO-2 分片 Muon（实现保留，默认关闭）
+
+当前 `stage_1.yaml` 默认使用**纯 AdamW**（`optimizer.type: adamw`，`muon.enabled: false`）。Muon 路径的实现如下，需要时在 yaml 打开：
 
 优化器为 `MuonAdamW` 封装（`train_giga_exp.py`）：hidden 2D 矩阵交给 **Muon**（`torch.optim.Muon`，`momentum=0.95`、`weight_decay=0.0`、`adjust_lr_fn=match_rms_adamw`、lr = AdamW base lr 的 3 倍系数 `"3x"`），输出头 `out.*` 与全部 1D 参数（bias/norm）交给 **AdamW**（betas 0.9/0.95, eps 1e-8）。
 
@@ -201,6 +229,10 @@ DeepSpeed ZeRO-2 会把 Muon 组的全部 2D 参数按顺序 flatten 成一个 *
 1. 完整 DeepSpeed state (模型 + Muon/AdamW state + lr scheduler + step)
 2. 兼容纯权重恢复: load_compatible_state_dict
    - 形状一致参数逐位继承
+   - AdaLN 结构自动迁移 (先转换再训练, 红字警告):
+     basis 模型遇 dual/shared 全秩 ckpt -> apply_adaln_basis_migration
+     低秩转换 (曲线主方向 top-r, r=64 曲线 RMS 误差 ~0.2%);
+     dual 模型遇 shared ckpt -> apply_mod_adaln_migration 拷贝无损热启动
    - patchify 形状变化时迁移: patch_in 旧输入权重扩展 2x2,
      out 旧权重/bias 复制到每个 patch 位置
    - step 从文件名继承 (step-00036000.safetensors -> step=36000),
@@ -208,7 +240,7 @@ DeepSpeed ZeRO-2 会把 Muon 组的全部 2D 参数按顺序 flatten 成一个 *
 3. 从 0 开始
 ```
 
-结构变更（如引入 patchify）后的重启即走路径 2：权重与 step 继承、optimizer 重置。
+结构变更（如引入 patchify、AdaLN 切 basis）后的重启即走路径 2：权重与 step 继承、optimizer 重置。注意 optimizer 状态跨 AdaLN 结构不可恢复（参数形状已变），必须走纯权重路径。
 
 ### 7.2 验证产物
 
@@ -218,11 +250,11 @@ DeepSpeed ZeRO-2 会把 Muon 组的全部 2D 参数按顺序 flatten 成一个 *
 
 | 维度 | MOSS-Image-SFT | Giga-Exp |
 |---|---|---|
-| 规模 | 42 层 / 3072 宽 | 16 层 / 1792 宽（0.80B） |
+| 规模 | 42 层 / 3072 宽（≈4.9B） | 28 层 / 1536 宽（0.71B） |
 | VAE | FLUX.2 VAE，128ch | Wan2.2 TI2V VAE，48ch |
-| 结构 | 双流（文本有独立 TextBlock） | **单流**联合注意力 |
+| 结构 | 双流（文本有独立 TextBlock） | **单流**联合注意力 + 2 层 Text Refiner |
 | latent patchify | 无（每 latent 像素 1 token） | **(1,2,2) patchify**，空间 token x1/4 |
 | 文本位置编码 | 4D RoPE 含文本位置 | 4D RoPE 含文本位置 |
 | CFG | guidance 3.0，空文本 unconditional 分支 | guidance 3.0，空文本 unconditional 分支 |
 | 时间维 | 图像专用 | **T 保留**，RoPE 含时间轴，可平移到视频 |
-| 时间调制 | shared modulation | 每层独立 mod 层（adaLN-zero 风格） |
+| 时间调制 | 全模型 1 个 shared_block_modulation（42 层共用，占 1.6%） | basis r=64：共享基 + 每层 img/txt 双分支系数头（占 4.7%），保留每层调制曲线 |

@@ -69,7 +69,8 @@ from transformers import AutoModel, AutoTokenizer
 from data.lmdb_dataset import GigaLMDBDataset, collate_image_batch
 from data.samplers.bucket_sampler import BucketBatchSampler
 from data.traj_cache_dataset import TeacherTrajCacheDataset, collate_traj_batch
-from models.giga_transformer import GigaExpTransformer, apply_mod_adaln_migration
+from models.giga_transformer import (GigaExpTransformer, apply_adaln_basis_migration,
+                                     apply_mod_adaln_migration)
 import models.giga_transformer as _giga_transformer
 from pipeline.giga_pipeline_6b_teacher import build_gwp6b_teacher, encode_prompts_6b_teacher
 
@@ -459,10 +460,16 @@ def _report_text_trans_reinit(model, state, logger=None):
 def load_compatible_state_dict(model, state):
     """只加载名称和 shape 都匹配的参数，其余参数保留当前初始化值。
 
-    mod_adaln 开启时自动迁移: 旧 ckpt 的 blocks.*.mod.* 被拷贝初始化到 mod_img/mod_txt
-    双分支 (拷贝复用而非权重共享), step0 forward 与 shared AdaLN 完全等价, 无损热启动。"""
+    AdaLN 结构自动迁移 (yaml model.adaln_type 注明目标结构):
+    - basis 模型 + 旧 shared/dual 全秩 ckpt → 低秩转换 (r=64, 误差 ~3.2%) 后加载;
+    - dual 模型 + 旧 shared ckpt → 拷贝初始化到 mod_img/mod_txt, 无损热启动。"""
     current = model.state_dict()
-    _report_mod_adaln_migration(apply_mod_adaln_migration(current, state))
+    basis = apply_adaln_basis_migration(current, state)
+    if basis["source"] is None:
+        _report_mod_adaln_migration(apply_mod_adaln_migration(current, state))
+    elif basis["converted"] and _dist_rank() == 0:
+        print(f"\033[1;31m⚠️ adaln-basis: checkpoint 为旧 {basis['source']} 全秩 AdaLN, 已低秩转换"
+              f" (rank={basis['rank']}, 捕获能量 {basis['energy']:.1%}), 先转换再训练\033[0m", flush=True)
     _report_text_trans_reinit(model, state)
     matched = {key: value for key, value in state.items()
                if key in current and current[key].shape == value.shape}
@@ -734,7 +741,12 @@ def print_banner(cfg, rank):
     print(f"{red}{'=' * 74}{reset}", flush=True)
     print("🧠 Giga-Exp stage_1 | T2V-only flow matching (T=1, video-ready)", flush=True)
     print(f"📐 DiT: dim={model['dim']} layers={model['layers']} heads={model['heads']} ffn={model['ffn_dim']} head_dim={model['dim'] // model['heads']}", flush=True)
-    print(f"🎚️  AdaLN: {'dual-branch (mod_img/mod_txt, MiniMax H3 风格)' if model.get('mod_adaln') else 'shared (全序列一个 mod)'}", flush=True)
+    atype = model.get("adaln_type") or ("dual" if model.get("mod_adaln") else "shared")
+    arank = model.get("adaln_rank", 64)
+    adaln_desc = {"shared": "shared (每层全序列一个 mod)",
+                  "dual": "dual-branch (mod_img/mod_txt 全秩, MiniMax H3 风格)",
+                  "basis": f"basis r={arank} (共享基 adaln_basis + 每层双分支系数头)"}[atype]
+    print(f"🎚️  AdaLN: {adaln_desc}", flush=True)
     tt = model.get("text_trans")
     if isinstance(tt, dict) and tt.get("enabled", True):
         tt_desc = f"ON (layers={tt.get('layers', 2)}, heads={tt.get('heads', model['heads'])}, 恒等零初始化热启动)"

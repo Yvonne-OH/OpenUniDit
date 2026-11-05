@@ -31,7 +31,8 @@ from diffusers import AutoencoderKLWan
 from safetensors.torch import load_file
 from transformers import AutoTokenizer, Qwen3VLForConditionalGeneration
 
-from models.giga_transformer import GigaExpTransformer, apply_mod_adaln_migration
+from models.giga_transformer import (GigaExpTransformer, apply_adaln_basis_migration,
+                                     apply_mod_adaln_migration)
 
 try:
     from tqdm import tqdm, trange
@@ -150,16 +151,25 @@ def resolve_checkpoint(path, output_dir):
 def load_compatible_state_dict(model, state):
     """只加载名称和 shape 都匹配的参数, 其余保留初始化值; 含 patchify 迁移 (对齐训练脚本).
 
-    与训练脚本一致: 先做 mod-AdaLN 迁移, 否则旧 shared-AdaLN ckpt 加载进 dual-branch
-    (mod_adaln: true) 模型时 mod_img/mod_txt 保持随机初始化, 推理质量静默崩坏。"""
+    与训练脚本一致: 先做 AdaLN 结构迁移, 否则旧全秩 ckpt 加载进新结构时调制权重
+    保持随机初始化, 推理质量静默崩坏。
+    - basis 模型 (adaln_type: basis): 旧 shared/dual 全秩 ckpt 低秩转换 (r=64 误差 ~3.2%);
+    - dual 模型: 旧 shared ckpt 拷贝初始化到 mod_img/mod_txt。"""
     current = model.state_dict()
-    migration = apply_mod_adaln_migration(current, state)
-    if migration["copied"]:
-        print(f"mod-AdaLN 迁移: {len(migration['copied'])} 层旧 mod.* 已拷贝到 mod_img/mod_txt", flush=True)
-    if migration["missing"]:
-        print(f"⚠️ mod-AdaLN: {len(migration['missing'])} 层 ckpt 缺失调制权重, 保持随机初始化", flush=True)
-    if migration["orphan_dual"]:
-        print(f"⚠️ mod-AdaLN: 模型为 shared 但 ckpt 是 dual-branch, {len(migration['orphan_dual'])} 层保持随机初始化", flush=True)
+    basis = apply_adaln_basis_migration(current, state)
+    if basis["source"] is None:
+        migration = apply_mod_adaln_migration(current, state)
+        if migration["copied"]:
+            print(f"mod-AdaLN 迁移: {len(migration['copied'])} 层旧 mod.* 已拷贝到 mod_img/mod_txt", flush=True)
+        if migration["missing"]:
+            print(f"⚠️ mod-AdaLN: {len(migration['missing'])} 层 ckpt 缺失调制权重, 保持随机初始化", flush=True)
+        if migration["orphan_dual"]:
+            print(f"⚠️ mod-AdaLN: 模型为 shared 但 ckpt 是 dual-branch, {len(migration['orphan_dual'])} 层保持随机初始化", flush=True)
+    elif basis["converted"]:
+        print(f"\033[1;31m⚠️ adaln-basis 迁移: 旧 {basis['source']} 全秩 ckpt 已低秩转换 "
+              f"(rank={basis['rank']}, 捕获能量 {basis['energy']:.1%}, {len(basis['layers'])} 层)\033[0m", flush=True)
+    else:
+        print("adaln-basis: ckpt 已是共享基结构, 直接加载", flush=True)
     matched = {key: value for key, value in state.items()
                if key in current and current[key].shape == value.shape}
     patch_volume = math.prod(model.patch_size)

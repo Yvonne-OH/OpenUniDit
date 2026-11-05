@@ -35,7 +35,8 @@ from transformers import AutoModel, AutoTokenizer
 
 from data.lmdb_dataset import GigaLMDBDataset, collate_image_batch
 from data.samplers.bucket_sampler import BucketBatchSampler
-from models.giga_transformer import GigaExpTransformer, apply_mod_adaln_migration
+from models.giga_transformer import (GigaExpTransformer, apply_adaln_basis_migration,
+                                     apply_mod_adaln_migration)
 import models.giga_transformer as _giga_transformer
 
 
@@ -421,13 +422,38 @@ def _report_text_trans_reinit(model, state, logger=None):
     print(f"\033[1;33m{message}\033[0m", flush=True)
 
 
+def _report_adaln_basis_migration(migration, logger=None):
+    """basis (r=64 共享基) 迁移结果播报 (rank0): 低秩转换 / 已是 basis / 非 basis 模型回退。"""
+    if _dist_rank() != 0:
+        return
+    logger = logger or logging.getLogger("giga_exp")
+    if migration["converted"]:
+        message = (f"⚠️ adaln-basis: checkpoint 为旧 {migration['source']} 全秩 AdaLN, "
+                   f"已低秩转换到共享基结构 (rank={migration['rank']}, "
+                   f"捕获差异能量 {migration['energy']:.1%}, 层 {len(migration['layers'])} 个)。"
+                   f"调制输出误差 ~{max(0.0, (1 - migration['energy']) ** 0.5):.1%} RMS, 先转换再训练")
+        logger.warning(message)
+        print(f"\033[1;31m{message}\033[0m", flush=True)
+    elif migration["source"] == "basis":
+        message = "adaln-basis: checkpoint 已是共享基结构, 直接加载"
+        logger.info(message)
+        print(f"\033[1;32m{message}\033[0m", flush=True)
+
+
 def load_compatible_state_dict(model, state):
     """只加载名称和 shape 都匹配的参数，其余参数保留当前初始化值。
 
-    mod_adaln 开启时自动迁移: 旧 ckpt 的 blocks.*.mod.* 被拷贝初始化到 mod_img/mod_txt
-    双分支 (拷贝复用而非权重共享), step0 forward 与 shared AdaLN 完全等价, 无损热启动。"""
+    AdaLN 结构自动迁移 (yaml model.adaln_type 注明目标结构):
+    - basis 模型 + 旧 shared/dual 全秩 ckpt → apply_adaln_basis_migration 低秩转换后加载;
+    - dual 模型 + 旧 shared ckpt → apply_mod_adaln_migration 拷贝初始化到双分支,
+      step0 forward 与 shared AdaLN 完全等价, 无损热启动。"""
     current = model.state_dict()
-    _report_mod_adaln_migration(apply_mod_adaln_migration(current, state))
+    basis = apply_adaln_basis_migration(current, state)
+    if basis["source"] is None:
+        # 模型不是 basis (shared/dual): 走原有 mod-adaln 拷贝迁移
+        _report_mod_adaln_migration(apply_mod_adaln_migration(current, state))
+    else:
+        _report_adaln_basis_migration(basis)
     _report_text_trans_reinit(model, state)
     matched = {key: value for key, value in state.items()
                if key in current and current[key].shape == value.shape}
@@ -658,7 +684,12 @@ def print_banner(cfg, rank):
     print(f"{red}{'=' * 74}{reset}", flush=True)
     print("🧠 Giga-Exp stage_1 | T2V-only flow matching (T=1, video-ready)", flush=True)
     print(f"📐 DiT: dim={model['dim']} layers={model['layers']} heads={model['heads']} ffn={model['ffn_dim']} head_dim={model['dim'] // model['heads']}", flush=True)
-    print(f"🎚️  AdaLN: {'dual-branch (mod_img/mod_txt, MiniMax H3 风格)' if model.get('mod_adaln') else 'shared (全序列一个 mod)'}", flush=True)
+    atype = model.get("adaln_type") or ("dual" if model.get("mod_adaln") else "shared")
+    arank = model.get("adaln_rank", 64)
+    adaln_desc = {"shared": "shared (每层全序列一个 mod)",
+                  "dual": "dual-branch (mod_img/mod_txt 全秩, MiniMax H3 风格)",
+                  "basis": f"basis r={arank} (共享基 adaln_basis + 每层双分支系数头)"}[atype]
+    print(f"🎚️  AdaLN: {adaln_desc}", flush=True)
     tt = model.get("text_trans")
     if isinstance(tt, dict) and tt.get("enabled", True):
         tt_desc = f"ON (layers={tt.get('layers', 2)}, heads={tt.get('heads', model['heads'])}, 恒等零初始化热启动)"

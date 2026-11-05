@@ -14,7 +14,8 @@ distributed:
 
 model:
   # dual-branch AdaLN (MiniMax H3 风格): image token 用 mod_img, text token 用 mod_txt。
-  mod_adaln: true
+  adaln_type: basis   # AdaLN 结构: shared | dual | basis (旧 ckpt 加载时自动低秩转换)
+  adaln_rank: 64      # basis 共享基维度
   # Text Refiner (MOSS-Image 风格): 2 层残差自注意力+FFN, 恒等初始化。
   text_trans:
     enabled: true

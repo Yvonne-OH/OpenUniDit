@@ -27,7 +27,8 @@ from diffusers import AutoencoderKLWan
 from safetensors.torch import load_file
 from transformers import AutoTokenizer, Qwen3VLForConditionalGeneration
 
-from models.giga_transformer import GigaExpTransformer
+from models.giga_transformer import (GigaExpTransformer, apply_adaln_basis_migration,
+                                     apply_mod_adaln_migration)
 
 try:
     from tqdm import tqdm, trange
@@ -141,8 +142,17 @@ def resolve_checkpoint(path, output_dir):
 
 
 def load_compatible_state_dict(model, state):
-    """只加载名称和 shape 都匹配的参数, 其余忽略 (KD projector 等挂载权重自动过滤); 含 patchify 迁移."""
+    """只加载名称和 shape 都匹配的参数, 其余忽略 (KD projector 等挂载权重自动过滤); 含 patchify 迁移.
+
+    AdaLN 结构自动迁移 (与 infer_giga_exp.py 一致): basis 模型遇旧全秩 ckpt 先低秩转换,
+    dual 模型遇旧 shared ckpt 先拷贝初始化, 否则调制权重随机初始化导致质量静默崩坏."""
     current = model.state_dict()
+    basis = apply_adaln_basis_migration(current, state)
+    if basis["source"] is None:
+        apply_mod_adaln_migration(current, state)
+    elif basis["converted"]:
+        print(f"\033[1;31m⚠️ adaln-basis 迁移: 旧 {basis['source']} 全秩 ckpt 已低秩转换 "
+              f"(rank={basis['rank']}, 捕获能量 {basis['energy']:.1%})\033[0m", flush=True)
     matched = {key: value for key, value in state.items()
                if key in current and current[key].shape == value.shape}
     ignored = sorted(set(state) - set(matched))

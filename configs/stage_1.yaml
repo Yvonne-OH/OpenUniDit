@@ -11,9 +11,14 @@ distributed:
   timeout_seconds: 7200
 
 model:
-  # dual-branch AdaLN (MiniMax H3 风格): image token 用 mod_img, text token 用 mod_txt;
-  # 旧 ckpt 的 blocks.*.mod.* 加载时自动拷贝到两分支 (无损等价热启动, 训练后独立分化)。
-  mod_adaln: true
+  # AdaLN 结构 (adaln_type: shared | dual | basis), 旧 shared/dual 全秩 ckpt 加载时自动转换:
+  #   basis (默认): 全模型共享 Linear(dim→r) 投影 P + 每层 mod_img/mod_txt 各一个 Linear(r, 6·dim)
+  #     系数头。调制只依赖 timestep, 56 条调制曲线在 t 流形上秩 ~32-64, r=64 事后低秩转换
+  #     误差 ~3.2% RMS, adaLN 参数 793M→34M (模型 2.95GB→1.43GB bf16)。
+  #   dual  : 每层 mod_img/mod_txt 全秩 Linear (MiniMax H3 风格)
+  #   shared: 每层一个全序列共用 mod
+  adaln_type: basis
+  adaln_rank: 64
   # Text Refiner (MOSS-Image 风格): text_in 投影后的文本 token 先过 2 层残差自注意力+FFN 再进主 DiT;
   # 残差支路输出层零初始化 → 初始为恒等映射, step0 与原版逐位一致; 旧 ckpt 无 text_refiner.* 时
   # 自动恒等初始化并给出警告, 平滑增量学习。设为 false 或删除即回到原版直通。
@@ -161,7 +166,7 @@ training:
   checkpointing_steps: 2500
   state_checkpoints_keep: 2      # DeepSpeed 完整 state 只保留最近 2 个, 纯 weights 快照全部保留
   # auto: 自动恢复 output_dir 下最新 state/weights；none: 不恢复；也可填 .safetensors/.pt 文件或 weights 目录路径，强制从指定纯权重恢复。
-  resume_mode: auto #/home/jovyan/pfs/users/zhanqian.wu/exp/giga_exp_image/stage_1_28layers/checkpoints/weights/step-00035000.safetensors #auto
+  resume_mode: /home/jovyan/pfs/users/zhanqian.wu/code/model_exp/outputs/bos_ckpt/giga_exp_image/stage_1_28layers/step-00397500.safetensors
   resume_optimizer: false 
   resume_lr_scheduler: true
 

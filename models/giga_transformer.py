@@ -118,6 +118,79 @@ def apply_mod_adaln_migration(current, state):
     return result
 
 
+def _adaln_time_curve(state, num_t=512):
+    """按 ckpt 的 time_in 权重重建 t∈[0,1000] 上的条件曲线 c(t) [num_t, dim]。
+
+    与 GigaExpTransformer.forward 的 timestep embedding 完全一致
+    (freq = 10000^(-arange(128)/128), emb = cat(cos, sin), time_in = Linear-SiLU-Linear)。"""
+    w0, b0 = state.get("time_in.0.weight"), state.get("time_in.0.bias")
+    w1, b1 = state.get("time_in.2.weight"), state.get("time_in.2.bias")
+    if w0 is None or w1 is None:
+        return None
+    half = w0.shape[1] // 2
+    ts = torch.linspace(0.0, 1000.0, num_t)
+    freq = 10000.0 ** (-torch.arange(half, dtype=torch.float32) / half)
+    emb = torch.cat(((ts[:, None] * freq).cos(), (ts[:, None] * freq).sin()), -1)
+    x = F.silu(F.linear(emb, w0.float(), b0.float()))
+    return F.linear(x, w1.float(), b1.float())
+
+
+def apply_adaln_basis_migration(current, state):
+    """basis (r=64 共享基) ckpt 迁移: 把旧全秩 AdaLN ckpt 低秩转换到共享基结构。
+
+    数学: 调制只依赖 timestep, 输入永远落在曲线 c(t) 张成的低维子空间上
+    (实测 56 条调制曲线有效秩 ~32-64)。取曲线协方差 Σ = cᵀc 的 top-r 特征向量作
+    共享基 P (r×d, 即 adaln_basis.weight), 每分支系数头 A_i = W_i Pᵀ
+    (即 blocks.{i}.mod_{img,txt}.weight [6d, r]), 则 A_i·P·c(t) = W_i·Π_r·c(t) ≈ W_i·c(t),
+    在曲线上的误差只取决于被丢弃的曲线尾部能量 (实测 r=64 全模型 ~3.2% RMS)。
+    注意必须用曲线主方向而非 W_all 的 SVD: 后者按矩阵 Frobenius 能量截断,
+    对 t 流形上的实际误差是错位的。bias 逐字保留。
+
+    - current: basis 模型期望的 state_dict (须含 adaln_basis.weight [r, dim]);
+    - state:   checkpoint state_dict (就地修改);
+    - 返回 {"converted": bool, "source": "basis"|"dual"|"shared"|None,
+            "rank": int, "energy": float (t 曲线能量捕获率), "layers": [层号]}
+      source=None 表示模型不是 basis (调用方应回退 apply_mod_adaln_migration) 或
+      ckpt 无任何可转换的全秩 mod 权重 (随机初始化)。"""
+    basis_key = "adaln_basis.weight"
+    if basis_key not in current:
+        return {"converted": False, "source": None, "rank": None, "energy": None, "layers": []}
+    rank, dim = current[basis_key].shape
+    if state.get(basis_key) is not None and state[basis_key].shape == (rank, dim):
+        return {"converted": False, "source": "basis", "rank": rank, "energy": 1.0, "layers": []}
+    # 旧 shared ckpt: 先按拷贝迁移到 dual 双分支, 再统一走低秩转换
+    source = "dual"
+    if not any(f"blocks.0.{b}.weight" in state for b in ("mod_img", "mod_txt")):
+        if not any(key.startswith("blocks.") and ".mod.weight" in key for key in state):
+            return {"converted": False, "source": None, "rank": rank, "energy": None, "layers": []}
+        source = "shared"
+        apply_mod_adaln_migration(current, state)
+    full_keys = [(key, w) for key, w in state.items()
+                 if (".mod_img.weight" in key or ".mod_txt.weight" in key)
+                 and w.ndim == 2 and w.shape[1] == dim]
+    if not full_keys:
+        return {"converted": False, "source": None, "rank": rank, "energy": None, "layers": []}
+    dtype = full_keys[0][1].dtype
+    curve = _adaln_time_curve(state)
+    if curve is not None and curve.shape[1] == dim:
+        cov = curve.T @ curve
+        evals, evecs = torch.linalg.eigh(cov)
+        proj = evecs[:, -rank:].T.flip(0).contiguous()        # P: [r, dim] 曲线 top-r 主方向
+        energy = (evals[-rank:].sum() / evals.sum().clamp_min(1e-12)).item()
+    else:  # 无 time_in (理论上不该发生): 退化为堆叠 SVD
+        w_all = torch.cat([w.float() for _, w in full_keys], 0)
+        svd = torch.linalg.svd(w_all, full_matrices=False)
+        proj = svd[2][:rank].contiguous()
+        energy = (svd[1][:rank].pow(2).sum() / svd[1].pow(2).sum()).item()
+    state[basis_key] = proj.to(dtype)
+    layers = set()
+    for key, w in full_keys:
+        state[key] = (w.float() @ proj.T).to(dtype)           # A_i: [6d, r]
+        layers.add(int(key.split(".")[1]))
+    return {"converted": True, "source": source, "rank": rank, "energy": energy,
+            "layers": sorted(layers)}
+
+
 class TextRefinerBlock(nn.Module):
     """文本侧残差自注意力+FFN block (MOSS-Image Text Refiner)。
 
@@ -162,10 +235,11 @@ class TextRefiner(nn.Module):
 
 
 class GigaBlock(nn.Module):
-    def __init__(self, dim, heads, ffn_dim, mod_adaln=False):
+    def __init__(self, dim, heads, ffn_dim, mod_adaln=False, adaln_rank=None):
         super().__init__()
         self.heads = heads
         self.mod_adaln = bool(mod_adaln)
+        self.adaln_rank = None if adaln_rank is None else int(adaln_rank)
         self.norm1 = RMSNorm(dim)
         self.norm2 = RMSNorm(dim)
         self.qkv = nn.Linear(dim, dim * 3, bias=False)
@@ -178,8 +252,12 @@ class GigaBlock(nn.Module):
             # dual-branch AdaLN (MiniMax H3 风格): image token 用 mod_img, text token 用 mod_txt。
             # 旧 ckpt 恢复时由 apply_mod_adaln_migration 把旧 mod.* 拷贝初始化到两分支
             # (拷贝复用而非权重共享), step0 forward 与 shared AdaLN 完全等价, 无损热启动。
-            self.mod_img = nn.Linear(dim, dim * 6)
-            self.mod_txt = nn.Linear(dim, dim * 6)
+            # adaln_rank 非 None 时为 basis 模式 (r=64 共享基): 调制输入是 transformer 级
+            # adaln_basis 投影后的 r 维向量 z=P·cond, 每分支只存 Linear(r, 6·dim) 系数头;
+            # 旧全秩 ckpt 由 apply_adaln_basis_migration 做 W_i ≈ (W_i Pᵀ)·P 低秩转换后加载。
+            mod_in = dim if self.adaln_rank is None else self.adaln_rank
+            self.mod_img = nn.Linear(mod_in, dim * 6)
+            self.mod_txt = nn.Linear(mod_in, dim * 6)
         else:
             self.mod = nn.Linear(dim, dim * 6)
 
@@ -261,14 +339,29 @@ class GigaExpTransformer(nn.Module):
     def __init__(self, in_channels=48, out_channels=48, text_dim=4096, dim=1792,
                  ffn_dim=4864, heads=14, layers=24, rope_theta=10000.0,
                  rope_axes_dims=(32, 32, 32, 32), patch_size=(1, 1, 1), mod_adaln=False,
-                 text_trans=False):
+                 text_trans=False, adaln_type=None, adaln_rank=64):
         super().__init__()
         self.patch_size = tuple(patch_size)
         if len(self.patch_size) != 3 or self.patch_size[0] != 1 or any(p < 1 for p in self.patch_size):
             raise ValueError("patch_size 必须是时间维为 1 的三个正整数")
         self.in_channels, self.out_channels, self.dim, self.heads = in_channels, out_channels, dim, heads
         self.text_dim, self.ffn_dim, self.layers = text_dim, ffn_dim, layers
-        self.mod_adaln = bool(mod_adaln)
+        # AdaLN 类型三选一 (yaml model.adaln_type 显式注明; 缺省按旧 mod_adaln bool 推导):
+        #   shared : 每层一个 Linear(dim, 6·dim), img/text 共用 (原版)
+        #   dual   : 每层 mod_img/mod_txt 两个全秩 Linear (MiniMax H3 风格)
+        #   basis  : 全模型共享 Linear(dim, r) 投影 + 每层双分支 Linear(r, 6·dim) 系数头。
+        #            调制只依赖 timestep, 全部 56 条调制曲线在 t 流形上秩 ~32-64,
+        #            r=64 时事后低秩转换误差 ~3.2% RMS, adaLN 参数 793M → ~34M。
+        #            旧 shared/dual 全秩 ckpt 由 apply_adaln_basis_migration 转换后加载。
+        if adaln_type is None:
+            adaln_type = "dual" if mod_adaln else "shared"
+        if adaln_type not in ("shared", "dual", "basis"):
+            raise ValueError(f"adaln_type 必须是 shared/dual/basis, got {adaln_type!r}")
+        self.adaln_type = adaln_type
+        self.adaln_rank = int(adaln_rank) if adaln_type == "basis" else None
+        self.mod_adaln = adaln_type in ("dual", "basis")
+        self.adaln_basis = (nn.Linear(dim, self.adaln_rank, bias=False)
+                            if adaln_type == "basis" else None)
         # Text Refiner (MOSS-Image 风格): text_in 投影后的文本 token 先过恒等初始化的残差
         # 自注意力+FFN 再 concat 进主 DiT; text_trans 可为 bool 或 dict({enabled, layers, heads})。
         refiner_cfg = None
@@ -287,7 +380,8 @@ class GigaExpTransformer(nn.Module):
         self.text_in = nn.Linear(text_dim, dim)
         self.time_in = nn.Sequential(nn.Linear(256, dim), nn.SiLU(), nn.Linear(dim, dim))
         self.rope = SpacetimeRoPE(dim // heads, rope_theta, rope_axes_dims)
-        self.blocks = nn.ModuleList([GigaBlock(dim, heads, ffn_dim, mod_adaln=self.mod_adaln)
+        self.blocks = nn.ModuleList([GigaBlock(dim, heads, ffn_dim, mod_adaln=self.mod_adaln,
+                                               adaln_rank=self.adaln_rank)
                                      for _ in range(layers)])
         self.norm = RMSNorm(dim)
         self.out = nn.Linear(dim, out_channels * patch_volume)
@@ -304,6 +398,8 @@ class GigaExpTransformer(nn.Module):
             "rope_theta": self.rope.theta,
             "rope_axes": list(self.rope.axes_dims),
             "mod_adaln": self.mod_adaln,
+            "adaln_type": self.adaln_type,
+            "adaln_rank": self.adaln_rank,
             "text_trans": self.text_trans,
             "implementation": {
                 "version": "giga_semantics_v1",
@@ -369,6 +465,9 @@ class GigaExpTransformer(nn.Module):
         freq = 10000 ** (-torch.arange(half, device=x.device, dtype=torch.float32) / half)
         emb = torch.cat(((ts[:, None] * freq).cos(), (ts[:, None] * freq).sin()), -1)
         cond = self.time_in(emb.to(self.time_in[0].weight.dtype))
+        if self.adaln_basis is not None:
+            # basis 模式: 全模型一次投影 z = P·cond, blocks 的双分支系数头只吃 r 维 z
+            cond = self.adaln_basis(cond.to(self.adaln_basis.weight.dtype))
         cos, sin = self.rope(t, h, w, text.shape[1], x.device, x.dtype)
         features = [] if feature_layers is not None else None
         for block_idx, block in enumerate(self.blocks):
