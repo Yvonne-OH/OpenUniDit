@@ -931,12 +931,12 @@ def main():
                 logger.info("🆕 未发现 checkpoint, 从 step=0 开始训练")
 
     with _loud_phase(rank, logger, "📦 数据集索引加载",
-                     hint="(每 rank 独立构建, 34M 记录级别索引首次扫描约数分钟, 命中缓存约 1 分钟)"):
+                     hint="(mmap 列式索引: rank0 构建/加载, 其余 rank 只读映射共享; 首次构建约数分钟, 命中缓存秒级)"):
         data = GigaLMDBDataset(cfg["dataset"], seed=int(cfg.get("seed", 42)), index_cache_dir=str(output_dir / "dataset_index_cache"))
     if rank == 0:
         _blue_print(f"📦 dataset ready: records={len(data.records)}")
         logger.info("dataset ready: records=%d buckets=%s", len(data.records), {key: len(value) for key, value in data.bucket_indices.items()})
-    batch_sampler = BucketBatchSampler(data.bucket_indices, cfg["training"]["batch_size_per_device"], weights=cfg["dataset"].get("bucket_sampling_weights"), seed=int(cfg.get("seed", 42)), rank=rank, world_size=dist.get_world_size(), randomize_order_on_start=True, drop_last=True)
+    batch_sampler = BucketBatchSampler(data.bucket_indices, cfg["training"]["batch_size_per_device"], weights=cfg["dataset"].get("bucket_sampling_weights"), bucket_batch_sizes=cfg["dataset"].get("bucket_batch_sizes"), seed=int(cfg.get("seed", 42)), rank=rank, world_size=dist.get_world_size(), randomize_order_on_start=True, drop_last=True)
     steps_per_epoch = len(batch_sampler)
     if steps_per_epoch <= 0:
         raise ValueError("数据集没有可训练的完整 batch")

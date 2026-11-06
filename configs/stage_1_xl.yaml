@@ -95,6 +95,15 @@ dataset:
     - monet_cc12m
     - monet_commoncatalog_cc_by
     - monet_coyo
+    # 2026-10-31 新增: 数据库已入库但此前未启用白名单的两个源
+    # GenPoster100K: 102,651 张海报 (261GB, 96% 短边>=427px 合格 512 桶)
+    - GenPoster100K
+    # Text-Render-2M: 2,323,502 张文本渲染图 (957GB, 短边已统一 512)。
+    # 2026-10-31 曾因 BOS mdb 分片不全 (413/464) 触发分片校验崩溃, 已从 pfs 补传
+    # 51 个分片并校验 mdb=464/464 通过。
+    - Text-Render-2M
+    # 2026-11-02 新增: BOS 扫描发现 8 个完整源 (mdb==parquet 分片数校验通过) 未入白名单。
+    # 估算总量 ~190 万; pixelprose 需关注与已有 pixelprose_* 子集的重复, imagenet_1k
   contract: "[B,C,T,H,W]"
   num_frames: 1
   preprocess_style: cover   # 短边贴桶+中心裁剪, 无黑边 (实测 resize_long_edge 加权后 37% 样本补黑 >1%)
@@ -104,16 +113,29 @@ dataset:
   max_retries: 16
   refresh_index_cache: false   # 索引指纹不含 buckets, 换桶复用缓存; 桶归属在加载后按 width/height 重算
   index_cache_dir: /home/jovyan/pfs/users/zhanqian.wu/exp/giga_exp_image/stage_1_xl/dataset_index_cache
+  # 256/512 混合分辨率训练: patch(1,1,1) 下 token 数 256px=256, 512px=1024。
+  # 桶归属在加载后按 width/height 重算, 256 桶要求源图短边 >= 213px (max_upscale_ratio 1.2);
+  # 同比例高分桶 (512→256) 自动借图降采样, 桶耗尽不回绕重复。
   buckets:
+    - 256_square
+    - 256x192
+    - 192x256
     - 512_square
     - 512x384
     - 384x512
-  # 桶耗尽后不再回绕重复: 不足的 batch 由同比例高分桶借图降采样补足,
-  # 单一分辨率层无同比例高分桶时, 整批自动切换到仍有余量的桶。
+  # 采样权重: 256 组合计 ~30%, 512 组 ~70% (按 512 层内比例分配, 可调)
   bucket_sampling_weights:
-    512_square: 0.45
-    512x384: 0.275
-    384x512: 0.275
+    256_square: 0.14
+    256x192: 0.08
+    192x256: 0.08
+    512_square: 0.315
+    512x384: 0.1925
+    384x512: 0.1925
+  # 每桶 per-device batch: 256 桶 batch x4 (16) 与 512 桶 x4 对齐 token 负载 (16*256 = 4*1024)
+  bucket_batch_sizes:
+    256_square: 16
+    256x192: 16
+    192x256: 16
 
 validation:
   enabled: true
@@ -152,15 +174,15 @@ training:
     betas: [0.9, 0.95]
     epsilon: 1.0e-8
   # XL 从零训练: lr 相对 stage_1 (1e-4) 下调, warmup 拉长适配更大模型
-  learning_rate: 6.0e-5
-  weight_decay: 0.0
+  learning_rate: 8.0e-5
+  weight_decay: 0.005
   lr_scheduler: cosine
   lr_warmup_steps: 1000
   gradient_accumulation_steps: 1
   checkpointing_steps: 2500
   state_checkpoints_keep: 2      # DeepSpeed 完整 state 只保留最近 2 个, 纯 weights 快照全部保留
   # auto: 自动恢复 output_dir 下最新 state/weights；none: 不恢复；也可填 .safetensors/.pt 文件或 weights 目录路径，强制从指定纯权重恢复。
-  resume_mode: none   # XL 全新结构, 从零训练 (不继承 stage_1_28layers 权重)
+  resume_mode: auto   # XL 全新结构, 从零训练 (不继承 stage_1_28layers 权重)
   resume_optimizer: false
   resume_lr_scheduler: true
 

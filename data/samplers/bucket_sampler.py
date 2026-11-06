@@ -12,7 +12,10 @@ class BucketBatchSampler(Sampler[list[int]]):
                  randomize_order_on_start: bool = True,
                  bucket_batch_sizes: dict[str, int] | None = None,
                  max_repeat_per_epoch: float | None = None):
-        self.bucket_indices = {key: list(value) for key, value in bucket_indices.items() if value}
+        # mmap 列式后端传入 numpy CSR 切片 (truth 值有歧义), 统一转 python int 列表;
+        # .tolist() 比 list(ndarray) 快 ~5x 且元素为原生 int, 后续索引转换零开销。
+        self.bucket_indices = {key: value if isinstance(value, list) else value.tolist()
+                               for key, value in bucket_indices.items() if len(value)}
         self.batch_size = int(batch_size)
         if self.batch_size <= 0:
             raise ValueError(f"batch_size 必须为正整数, 当前: {batch_size}")

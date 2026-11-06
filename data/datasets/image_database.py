@@ -10,8 +10,11 @@ import sqlite3
 import struct
 import threading
 import time
+import logging
+import resource
 from typing import Any
 
+import numpy as np
 from PIL import Image
 # 4K source 存在 100-144MP 大图，默认阈值(89MP)会刷 DecompressionBomb 警告；本地可信数据直接关闭
 Image.MAX_IMAGE_PIXELS = None
@@ -21,6 +24,15 @@ from torch.distributed.distributed_c10d import _get_default_store
 import torch.nn.functional as F
 from torch.utils.data import Dataset
 from tqdm import tqdm
+
+_LOG = logging.getLogger(__name__)
+
+
+def _debug_index_event(event: str, **fields):
+    fields.update(pid=os.getpid(), rss_gib=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024**2,
+                  rank=(dist.get_rank() if dist.is_available() and dist.is_initialized() else -1),
+                  world=(dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1))
+    _LOG.warning("[index-debug] %s %s", event, " ".join(f"{k}={v}" for k, v in fields.items()))
 
 # ─── lmdb:// URI 支持: 图片字节存于 unified_*_images_lmdb 的 mdb 中 ───
 # URI 格式: lmdb://{数据集绝对目录}/{分片stem}/{sample_id}[:before|:after]
@@ -42,8 +54,12 @@ def _lmdb_env(dataset_dir: str, stem: str):
     env = _LMDB_ENV_CACHE.get(path)
     if env is None:
         import lmdb  # 延迟导入: 仅使用 lmdb:// 数据集时需要
-        env = lmdb.open(path, readonly=True, lock=False, subdir=False,
-                         max_readers=1024)
+        try:
+            import bos_data  # BOS 镜像: 在线读 (BOS_LMDB_ONLINE=1) 或物化后打开
+            env = bos_data.open_lmdb(path, lmdb)
+        except ImportError:
+            env = lmdb.open(path, readonly=True, lock=False, subdir=False,
+                            max_readers=1024)
         with _LMDB_LOCK:
             _LMDB_ENV_CACHE[path] = env
     return env
@@ -406,7 +422,6 @@ class ImageDatabaseDataset(Dataset):
         record = dict(self.records[index])
         context = f'{context} uri={record["image_path"]}'
         from data.datasets.video_decode import decode_isolated
-        import numpy as np
         # bucket_override: 高分桶借图时按目标低分桶分辨率加载 (纯降采样)
         bucket = bucket_override or record.get("bucket") or self._nearest_bucket(record.get("width"), record.get("height"))
         width, height = parse_bucket(bucket)
@@ -463,7 +478,10 @@ class ImageDatabaseDataset(Dataset):
         record = self.records[index]
         bucket = bucket_override or record.get("bucket") or self._nearest_bucket(record.get("width"), record.get("height"))
         mode = "edit" if record.get("is_edit") else "image"
-        pool = self.mode_bucket_indices.get(f"{mode}:{bucket}") or [index]
+        # numpy 桶池 (mmap int32 数组) 不能用 `or` 真值判断, 多元素数组会抛 ValueError
+        pool = self.mode_bucket_indices.get(f"{mode}:{bucket}")
+        if pool is None or len(pool) == 0:
+            pool = [index]
         candidates = candidate_indices(index, pool, self.max_retries, random.Random(self.seed + index))
         last_error = None
         attempted = 0
@@ -503,8 +521,295 @@ class ImageDatabaseDataset(Dataset):
         ) from last_error
 
 
+# ─── 列式索引存储 (mmap 只读共享) ───
+# 旧格式是整份 pickle 的 list[dict] + list[int]: 每个 rank 进程反序列化一份 25-35GB 的
+# Python 对象 (8 rank 约 200-300GB), 且 DataLoader fork worker 因 refcount 写页持续
+# 触发 COW 复制。新格式把索引拆成列式 .npy + 原始字节缓冲, 加载侧全部 mmap_mode='r'
+# 只读映射: 同节点 8 rank + 32 worker 物理共享同一份文件页 (clean page 可被内核回收)。
+#
+# 目录布局 (每个 fingerprint 一个目录, 由 _cache_paths 给出; meta.json 最后写入作为完成标记):
+#   sid.npy int64[N] / w.npy,h.npy int32[N] (0=缺失, 取样时还原 None)
+#   src.npy uint16[N] / stem.npy uint32[N]   → meta.json 里的字符串表下标
+#   is_edit.npy bool[N]
+#   cap_off.npy int64[N+1] + captions.bin (utf8 原始缓冲) → caption 切片解码
+#   meta_off.npy int64[N+1] + metadata.bin + meta_kind.npy (0=无/1=原始str/2=json还原)
+# 行序: image 行 [0, n_image) 在前, edit 行 [n_image, n_image+n_edit) 在后。
+# 旧记录里的 text/edit_prompt/instruction/w_after/h_after/split 仅在构建期
+# (_read_parquet 的 caption 回退/split 过滤/宽高覆写) 被消费, 缓存后全仓库无读取点,
+# 不再存储 (见 _read_parquet 白名单注释)。
+_INDEX_FORMAT_VERSION = 2
+
+
+def _madvise_random(arr: np.ndarray) -> np.ndarray:
+    """随机访问的 mmap 只读数组关闭内核预读 (MADV_RANDOM)。
+
+    默认预读在 NFS 上是每次缺页 128KB 的 ~32x 放大流量; 索引列全部按随机下标
+    访问, 关闭预读后只取按需页, 多节点并发时显著降低 NFS 压力。
+    仅对 np.memmap 生效 (堆内存数组的地址段可能混布其他对象, 不得改其 VMA 行为);
+    地址按页对齐 (npy 头部只保证 64B 对齐), 失败静默跳过。"""
+    try:
+        if not isinstance(arr, np.memmap) or arr.nbytes == 0:
+            return arr
+        import ctypes
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        page = 4096
+        addr = arr.__array_interface__["data"][0]
+        base, end = addr & ~(page - 1), addr + arr.nbytes
+        if libc.madvise(ctypes.c_void_p(base), ctypes.c_size_t(end - base), 1) != 0:
+            pass  # EINVAL/ENOMEM 等仅损失预读优化, 不影响语义
+    except Exception:
+        pass
+    return arr
+
+
+class _ColumnarIndex:
+    """mmap 只读列式索引。加载后所有数组保持文件映射, 不得整份读取或 .copy()。"""
+
+    def __init__(self, n_image, n_edit, arrays, sources, stems, source_dirs):
+        self.n_image = int(n_image)
+        self.n_edit = int(n_edit)
+        (self.sid, self.w, self.h, self.src, self.stem, self.is_edit,
+         self.cap_off, self.captions, self.meta_off, self.metadata, self.meta_kind) = arrays
+        self.sources = list(sources)
+        self.stems = list(stems)
+        self.source_dirs = list(source_dirs)
+
+    def __len__(self):
+        return self.n_image + self.n_edit
+
+    @staticmethod
+    def _split_image_uri(image_path) -> tuple[str, str]:
+        """lmdb://{dataset_dir}/{stem}/{sid}:{kind} → (dataset_dir, stem)。
+        载入侧按列重组 image_path, 必须与构建时的 URI 逐字节一致。"""
+        if not isinstance(image_path, str) or not image_path.startswith("lmdb://"):
+            raise RuntimeError(f"列式索引要求 lmdb:// 形式的 image_path, 收到: {image_path!r}")
+        dataset_dir, stem, _ = image_path[len("lmdb://"):].rsplit("/", 2)
+        return dataset_dir, stem
+
+    @classmethod
+    def build_from_rows(cls, records: list, edits: list) -> "_ColumnarIndex":
+        """rank0 构建期: list[dict] 行 → 内存列式数组。行序 image 在前 edit 在后。"""
+        n = len(records) + len(edits)
+        sid = np.empty(n, np.int64)
+        w = np.empty(n, np.int32)
+        h = np.empty(n, np.int32)
+        src = np.empty(n, np.uint16)
+        stem_col = np.empty(n, np.uint32)
+        is_edit = np.empty(n, bool)
+        cap_off = np.empty(n + 1, np.int64)
+        meta_off = np.empty(n + 1, np.int64)
+        meta_kind = np.empty(n, np.uint8)
+        cap_buf = bytearray()
+        meta_buf = bytearray()
+        source_ids: dict[str, int] = {}
+        sources: list[str] = []
+        source_dirs: list[str] = []
+        stem_ids: dict[str, int] = {}
+        stems: list[str] = []
+        cap_off[0] = meta_off[0] = 0
+        pos = 0
+        for edit_row, rows in ((False, records), (True, edits)):
+            for item in rows:
+                sid[pos] = int(item["sample_id"])
+                width, height = item.get("width"), item.get("height")
+                w[pos] = int(width) if width else 0   # 0 = None/缺失, row_dict 时还原
+                h[pos] = int(height) if height else 0
+                is_edit[pos] = edit_row
+                source = str(item["source"])
+                if source not in source_ids:
+                    source_ids[source] = len(sources)
+                    sources.append(source)
+                    source_dirs.append(cls._split_image_uri(item["image_path"])[0])
+                src[pos] = source_ids[source]
+                stem = cls._split_image_uri(item["image_path"])[1]
+                if stem not in stem_ids:
+                    stem_ids[stem] = len(stems)
+                    stems.append(stem)
+                stem_col[pos] = stem_ids[stem]
+                caption = item.get("caption")
+                cap_buf += ("" if caption is None else
+                            caption if isinstance(caption, str) else str(caption)).encode("utf-8")
+                cap_off[pos + 1] = len(cap_buf)
+                meta_value = item.get("metadata")
+                if meta_value is None:
+                    meta_kind[pos] = 0
+                elif isinstance(meta_value, str):
+                    meta_kind[pos] = 1
+                    meta_buf += meta_value.encode("utf-8")
+                else:
+                    # parquet struct/list 列等非 str 元数据: json 编码落盘, row_dict 时还原原类型
+                    meta_kind[pos] = 2
+                    try:
+                        meta_bytes = json.dumps(meta_value, ensure_ascii=False).encode("utf-8")
+                    except (TypeError, ValueError):
+                        meta_bytes, meta_kind[pos] = str(meta_value).encode("utf-8"), 1
+                    meta_buf += meta_bytes
+                meta_off[pos + 1] = len(meta_buf)
+                pos += 1
+        empty = np.empty(0, np.uint8)
+        arrays = (
+            sid, w, h, src, stem_col, is_edit, cap_off,
+            np.frombuffer(cap_buf, dtype=np.uint8) if len(cap_buf) else empty,
+            meta_off,
+            np.frombuffer(meta_buf, dtype=np.uint8) if len(meta_buf) else empty,
+            meta_kind,
+        )
+        return cls(len(records), len(edits), arrays, sources, stems, source_dirs)
+
+    def save(self, index_dir: Path, fingerprint: str, created: float, stats) -> None:
+        """逐文件原子写 (tmp + rename); meta.json 最后写, 作为目录构建完成的标记。"""
+        columns = (
+            ("sid.npy", self.sid), ("w.npy", self.w), ("h.npy", self.h),
+            ("src.npy", self.src), ("stem.npy", self.stem), ("is_edit.npy", self.is_edit),
+            ("cap_off.npy", self.cap_off), ("meta_off.npy", self.meta_off),
+            ("meta_kind.npy", self.meta_kind),
+        )
+        for name, payload in columns:
+            self._atomic_write_npy(index_dir / name, payload)
+        # .bin 是无 npy 头的原始 utf8 字节流, 加载侧 np.memmap 整文件映射, 必须裸写
+        for name, payload in (("captions.bin", self.captions), ("metadata.bin", self.metadata)):
+            if payload.size == 0:
+                payload = b"\x00"   # 0 字节文件无法 mmap (全空 caption/metadata 场景), 补 1 字节占位
+            self._atomic_write_bytes(index_dir / name, payload)
+        meta = {
+            "format_version": _INDEX_FORMAT_VERSION,
+            "fingerprint": fingerprint,
+            "created": created,
+            "n_image": self.n_image,
+            "n_edit": self.n_edit,
+            "sources": self.sources,
+            "stems": self.stems,
+            "source_dirs": self.source_dirs,
+            "stats": stats,
+        }
+        self._atomic_write_bytes(index_dir / "meta.json",
+                                 json.dumps(meta, ensure_ascii=False).encode("utf-8"))
+
+    @staticmethod
+    def _atomic_write_npy(path: Path, payload: np.ndarray) -> None:
+        tmp = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+        try:
+            with open(tmp, "wb") as handle:
+                np.lib.format.write_array(handle, payload, allow_pickle=False)
+            os.replace(tmp, path)
+        finally:
+            if tmp.exists():
+                tmp.unlink()
+
+    @staticmethod
+    def _atomic_write_bytes(path: Path, payload) -> None:
+        tmp = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+        try:
+            with open(tmp, "wb") as handle:
+                handle.write(memoryview(payload) if isinstance(payload, np.ndarray) else payload)
+            os.replace(tmp, path)
+        finally:
+            if tmp.exists():
+                tmp.unlink()
+
+    @classmethod
+    def load(cls, index_dir: Path, meta: dict) -> "_ColumnarIndex":
+        """mmap 只读加载: 全部数组保持文件映射, 不做任何整份读取/复制。"""
+        def mmap_npy(name, dtype):
+            arr = np.load(index_dir / name, mmap_mode="r")
+            if arr.dtype != dtype:
+                raise ValueError(f"{name} dtype={arr.dtype} 期望 {dtype}")
+            return arr
+
+        n = int(meta["n_image"]) + int(meta["n_edit"])
+        sid = mmap_npy("sid.npy", np.int64)
+        w = mmap_npy("w.npy", np.int32)
+        h = mmap_npy("h.npy", np.int32)
+        src = mmap_npy("src.npy", np.uint16)
+        stem_col = mmap_npy("stem.npy", np.uint32)
+        is_edit = mmap_npy("is_edit.npy", np.bool_)
+        cap_off = mmap_npy("cap_off.npy", np.int64)
+        meta_off = mmap_npy("meta_off.npy", np.int64)
+        meta_kind = mmap_npy("meta_kind.npy", np.uint8)
+        captions = np.memmap(index_dir / "captions.bin", dtype=np.uint8, mode="r")
+        metadata = np.memmap(index_dir / "metadata.bin", dtype=np.uint8, mode="r")
+        if (sid.shape[0] != n or w.shape[0] != n or h.shape[0] != n or src.shape[0] != n
+                or stem_col.shape[0] != n or is_edit.shape[0] != n or meta_kind.shape[0] != n
+                or cap_off.shape[0] != n + 1 or meta_off.shape[0] != n + 1
+                or int(cap_off[-1]) > captions.shape[0] or int(meta_off[-1]) > metadata.shape[0]):
+            raise ValueError("列式索引各列行数/长度不一致")
+        return cls(meta["n_image"], meta["n_edit"],
+                   tuple(_madvise_random(a) for a in
+                         (sid, w, h, src, stem_col, is_edit, cap_off, captions, meta_off, metadata, meta_kind)),
+                   meta["sources"], meta["stems"], meta["source_dirs"])
+
+    def row_dict(self, i: int, bucket: str | None = None) -> dict[str, Any]:
+        """按行现拼 item dict (瞬态分配, 用完即弃, 不落任何常驻 Python 对象)。"""
+        sample_id = int(self.sid[i])
+        source_id = int(self.src[i])
+        dataset_dir = self.source_dirs[source_id]
+        stem = self.stems[int(self.stem[i])]
+        edit = bool(self.is_edit[i])
+        width, height = int(self.w[i]), int(self.h[i])
+        cap_start, cap_end = int(self.cap_off[i]), int(self.cap_off[i + 1])
+        kind = int(self.meta_kind[i])
+        if kind == 0:
+            metadata = None
+        else:
+            meta_bytes = bytes(self.metadata[int(self.meta_off[i]):int(self.meta_off[i + 1])])
+            metadata = meta_bytes.decode("utf-8") if kind == 1 else json.loads(meta_bytes)
+        item = {
+            "sample_id": sample_id,
+            "source": self.sources[source_id],
+            "is_edit": edit,
+            "image_path": f"lmdb://{dataset_dir}/{stem}/{sample_id}:{'after' if edit else 'single'}",
+            "caption": bytes(self.captions[cap_start:cap_end]).decode("utf-8"),
+            "width": width or None,
+            "height": height or None,
+            "metadata": metadata,
+        }
+        if edit:
+            item["input_image_path"] = f"lmdb://{dataset_dir}/{stem}/{sample_id}:before"
+        if bucket is not None:
+            item["bucket"] = bucket
+        return item
+
+
+class _KeptRecordView:
+    """self.records 的轻量列式代理: 只持有 mmap 数组引用。
+    __getitem__ 按行现拼 dict (瞬态), 绝不把整份索引物化成 Python 对象,
+    使 fork 出的 DataLoader worker 与各 rank 共享同一份 mmap 文件页。"""
+
+    def __init__(self, store: _ColumnarIndex, kept_rows, row_bucket, buckets):
+        self._store = store
+        self._kept_rows = kept_rows
+        self._row_bucket = row_bucket
+        self._buckets = buckets
+
+    def __len__(self):
+        return len(self._kept_rows)
+
+    def __getitem__(self, index):
+        row = int(self._kept_rows[index])
+        bucket = self._buckets[int(self._row_bucket[index])]
+        return self._store.row_dict(row, bucket=bucket)
+
+    def __iter__(self):
+        for index in range(len(self._kept_rows)):
+            yield self[index]
+
+    # ── 配比表向量化统计用的列访问 ──
+    def bucket_ids(self):
+        return self._row_bucket
+
+    def sources_table(self):
+        return self._store.sources
+
+    def source_ids(self):
+        # 花式索引产生瞬态副本 (仅配比表在 rank0 调用一次, 用完即释放)
+        return self._store.src[self._kept_rows]
+
+    def is_edit_flags(self):
+        return self._store.is_edit[self._kept_rows]
+
+
 class LmdbParquetDataset(ImageDatabaseDataset):
-    INDEX_CACHE_VERSION = 1  # 索引缓存格式版本，记录结构变化时递增使旧缓存失效
+    INDEX_CACHE_VERSION = 2  # 索引缓存格式版本，记录结构变化时递增使旧缓存失效
 
     def __init__(self, database_path: str, buckets: list[str], lmdb_root: str | None = None,
                  image_root: str | None = None, transform=None, max_upscale_ratio: float = 1.2,
@@ -553,66 +858,204 @@ class LmdbParquetDataset(ImageDatabaseDataset):
         self._bucket_weight_view = {
             str(key): float(value) for key, value in (bucket_sampling_weights or {}).items()
         }
-        records, edits = self._load_or_read_records(
+        index_store = self._load_or_read_records(
             bool(image_training_enabled), bool(edit_training_enabled),
             max_samples, max_edit_samples, edit_database_path,
         )
         # 索引加载后仍有数分钟的多轮 O(N) 处理 (bucket 索引/分片定位/校验), 必须提示
-        print(f"⏳ 图片记录就绪 (image={len(records):,}, edit={len(edits):,}), "
+        _debug_index_event("bucket-phase-enter", records=index_store.n_image,
+                           edits=index_store.n_edit, buckets=len(self.buckets))
+        print(f"⏳ 图片记录就绪 (image={index_store.n_image:,}, edit={index_store.n_edit:,}), "
               "正在构建 bucket 索引与分片定位 (约数分钟)...", flush=True)
-        if max_edit_samples is not None:
-            edits = edits[:int(max_edit_samples)]
-        edit_included = 0
-        if edit_ratio == "auto":
-            records += edits
-            edit_included = len(edits)
-        elif records and edits:
-            count = len(edits) if float(edit_ratio) >= 1 else round(len(records) * float(edit_ratio) / (1 - float(edit_ratio)))
-            records += edits[:count]
-            edit_included = min(count, len(edits))
-        elif edits:
-            records = edits
-            edit_included = len(edits)
-        if max_samples is not None and not edits:
-            records = records[:int(max_samples)]
-        self.records, self.bucket_indices = [], {bucket: [] for bucket in self.buckets}
-        self.mode_bucket_indices = {f"{mode}:{bucket}": [] for mode in ("image", "edit") for bucket in self.buckets}
-        bucket_filtered = 0
-        for record in records:
-            bucket = record.get("bucket")
-            if bucket not in self.buckets:
-                bucket = self._nearest_bucket(record.get("width"), record.get("height"))
+        self._build_bucket_index(index_store, max_samples, max_edit_samples, edit_ratio)
+        self._print_distribution_table()
+        # fork 共享收尾: 冻结 GC 追踪对象, DataLoader worker 子进程的 GC 扫描不再
+        # 触碰对象头引用计数页, 消除索引常驻结构的 COW 复制 (mmap 页本身无此问题)。
+        import gc
+        gc.collect()
+        gc.freeze()
+
+    # ─── 列式索引的合并与 bucket 派生 (运行期, 结果落盘为 mmap 只读文件) ───
+
+    def _runtime_cache_dir(self, max_samples, max_edit_samples, edit_ratio) -> Path:
+        """bucket 派生运行期数组的缓存子目录。指纹不含 buckets 与合并参数, 用它们
+        一起再散列, 换桶配置/换配比自动换目录互不覆盖。"""
+        import hashlib
+        spec = json.dumps({"buckets": self.buckets, "max_upscale_ratio": self.max_upscale_ratio,
+                           "max_samples": max_samples, "max_edit_samples": max_edit_samples,
+                           "edit_ratio": edit_ratio}, sort_keys=True)
+        digest = hashlib.sha1(spec.encode()).hexdigest()[:16]
+        return self.index_cache_dir / f"index_{self.index_fingerprint}" / f"runtime_{digest}"
+
+    def _ensure_mmap_array(self, path: Path, array: np.ndarray) -> np.ndarray:
+        """运行期数组落盘并转为 mmap 只读视图 (文件已存在则直接复用)。
+        各 rank 计算确定性一致, 原子 rename 保证可见文件始终完整;
+        落盘失败退回内存副本 (语义不变, 仅损失跨进程页共享)。"""
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if not path.exists():
+                tmp = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+                try:
+                    with open(tmp, "wb") as handle:
+                        np.lib.format.write_array(handle, np.ascontiguousarray(array), allow_pickle=False)
+                    os.replace(tmp, path)
+                finally:
+                    if tmp.exists():
+                        tmp.unlink()
+            return _madvise_random(np.load(path, mmap_mode="r"))
+        except Exception as exc:
+            print(f"⚠️ 运行期索引数组落盘失败, 退回内存副本: {path}: {exc}", flush=True)
+            return np.ascontiguousarray(array)
+
+    def _group_indices_mmap(self, runtime_dir: Path, name: str, ids: np.ndarray, groups: int):
+        """按 id 稳定分组收集下标 → CSR (off int64 + vals int32), 落盘为 mmap 文件。
+        稳定排序保证组内下标升序, 与旧 list.append 顺序一致。"""
+        vals = np.argsort(ids, kind="stable").astype(np.int32)
+        counts = np.bincount(ids, minlength=groups)
+        off = np.zeros(groups + 1, np.int64)
+        np.cumsum(counts, out=off[1:])
+        off = self._ensure_mmap_array(runtime_dir / f"{name}_off.npy", off)
+        vals = self._ensure_mmap_array(runtime_dir / f"{name}_vals.npy", vals)
+        return off, vals
+
+    def _load_runtime_cache(self, runtime_dir: Path, index_store: _ColumnarIndex) -> bool:
+        """运行期 bucket 派生数组的命中快路径。
+
+        主循环产物 (kept_rows/row_bucket/edit_val/CSR 桶池) 与 指纹+桶配置+配比参数
+        一一对应且各 rank 确定性一致; done.json 标记存在 (所有 mmap 文件已落盘) 时
+        直接映射加载, 跳过 34M 行 Python 重建循环 (每 rank 省 ~2 分钟热启动)。
+        校验失败一律退回重建路径, 语义不变。"""
+        if not (runtime_dir / "done.json").exists():
+            return False
+        names = ("kept_rows", "row_bucket", "edit_val",
+                 "bucket_off", "bucket_vals", "mode_bucket_off", "mode_bucket_vals")
+        try:
+            arrs = {name: _madvise_random(np.load(runtime_dir / f"{name}.npy", mmap_mode="r"))
+                    for name in names}
+            n_buckets = len(self.buckets)
+            kept_rows, row_bucket, edit_val = arrs["kept_rows"], arrs["row_bucket"], arrs["edit_val"]
+            bucket_off, bucket_vals = arrs["bucket_off"], arrs["bucket_vals"]
+            mode_bucket_off, mode_bucket_vals = arrs["mode_bucket_off"], arrs["mode_bucket_vals"]
+            if (kept_rows.shape[0] != row_bucket.shape[0]
+                    or bucket_off.shape[0] != n_buckets + 1 or mode_bucket_off.shape[0] != 2 * n_buckets + 1
+                    or bucket_off[-1] != bucket_vals.shape[0] or mode_bucket_off[-1] != mode_bucket_vals.shape[0]
+                    or int(row_bucket.max()) >= n_buckets):
+                raise ValueError("运行期缓存形状不一致")
+        except Exception as exc:
+            print(f"⚠️ 运行期 bucket 缓存校验失败, 走重建路径: {runtime_dir}: {exc}", flush=True)
+            return False
+        self.records = _KeptRecordView(index_store, kept_rows, row_bucket, list(self.buckets))
+        self.edit_val_indices = edit_val
+        self.bucket_indices = {
+            bucket: bucket_vals[bucket_off[bid]:bucket_off[bid + 1]]
+            for bid, bucket in enumerate(self.buckets)
+        }
+        self.mode_bucket_indices = {
+            f"{mode}:{bucket}": mode_bucket_vals[
+                mode_bucket_off[mode_id * n_buckets + bid]:mode_bucket_off[mode_id * n_buckets + bid + 1]]
+            for mode_id, mode in enumerate(("image", "edit"))
+            for bid, bucket in enumerate(self.buckets)
+        }
+        self.read_stats["edit_val_pool"] = len(edit_val)
+        _debug_index_event("runtime-cache-hit", kept=int(kept_rows.shape[0]))
+        print(f"📦 运行期 bucket 索引缓存命中 (跳过 34M 行重建循环): {runtime_dir.name}", flush=True)
+        return True
+
+    def _build_bucket_index(self, index_store: _ColumnarIndex, max_samples, max_edit_samples, edit_ratio) -> None:
+        """列式合并 + bucket 索引构建, 与旧 list[dict] 实现的合并/过滤/验证池语义逐行对齐:
+        - edit 先按 max_edit_samples 截断, 再按 edit_ratio 并入前缀; max_samples 仅在无 edit 时截断;
+        - 无合格 bucket 的行被过滤, 但仍计入 merged 长度 (与旧 first_edit_pos 口径一致);
+        - edit_val_indices 追加因 edit_ratio 未入选的 edit, 不注册桶池, 训练采样不可见。"""
+        runtime_dir = self._runtime_cache_dir(max_samples, max_edit_samples, edit_ratio)
+        if self._load_runtime_cache(runtime_dir, index_store):
+            return
+        n_image, n_edit = index_store.n_image, index_store.n_edit
+        e_keep = n_edit if max_edit_samples is None else min(int(max_edit_samples), n_edit)
+        if edit_ratio == "auto" or n_image == 0:
+            e_used = e_keep
+        elif e_keep > 0:
+            count = e_keep if float(edit_ratio) >= 1 else round(n_image * float(edit_ratio) / (1 - float(edit_ratio)))
+            e_used = min(count, e_keep)
+        else:
+            e_used = 0
+        edit_included = e_used
+        i_keep = n_image if (max_samples is None or e_keep > 0) else min(int(max_samples), n_image)
+        merged_len = i_keep + e_used
+        bucket_ids = {bucket: bid for bid, bucket in enumerate(self.buckets)}
+        kept_rows = np.empty(i_keep + e_keep, np.int32)
+        row_bucket = np.empty(i_keep + e_keep, np.int32)
+        kept = bucket_filtered = 0
+        bucket_t0 = time.time()
+        _debug_index_event("bucket-loop-start", total=merged_len)
+        for pos in range(merged_len):
+            row = pos if pos < i_keep else n_image + pos - i_keep
+            bucket = self._nearest_bucket(index_store.w[row], index_store.h[row])
             if bucket is None:
                 bucket_filtered += 1
-                continue
-            record["bucket"] = bucket
-            index = len(self.records)
-            self.records.append(record)
-            self.bucket_indices[bucket].append(index)
-            mode = "edit" if record.get("is_edit") else "image"
-            self.mode_bucket_indices[f"{mode}:{bucket}"].append(index)
+            else:
+                kept_rows[kept] = row
+                row_bucket[kept] = bucket_ids[bucket]
+                kept += 1
+            if pos == 0 or (pos + 1) % 1_000_000 == 0:
+                _debug_index_event("bucket-loop-progress", done=pos + 1, total=merged_len,
+                                   seconds=round(time.time() - bucket_t0, 1), filtered=bucket_filtered)
+        _debug_index_event("bucket-loop-done", done=merged_len,
+                           seconds=round(time.time() - bucket_t0, 1), filtered=bucket_filtered)
         self.read_stats["bucket_filtered"] = bucket_filtered
         # ─── 验证专用 edit 池 ───
         # 训练集内的 edit + 因 edit_ratio 未入选的 edit。追加到 records 末尾但不注册
         # bucket_indices/mode_bucket_indices —— 训练采样完全不可见，训练分布不变；
         # validation 通过 edit_val_indices 取样本做 BEFORE|GEN|GT 对比。
-        first_edit_pos = len(records) - edit_included
-        self.edit_val_indices = [i for i in range(first_edit_pos, len(self.records)) if self.records[i].get("is_edit")]
-        for record in edits[edit_included:]:
-            bucket = record.get("bucket")
-            if bucket not in self.buckets:
-                bucket = self._nearest_bucket(record.get("width"), record.get("height"))
+        first_edit_pos = merged_len - edit_included
+        kept_main = kept   # 主合并循环保留的行数; 之后的 leftover edit 不进任何桶池
+        edit_val = [i for i in range(first_edit_pos, kept) if bool(index_store.is_edit[kept_rows[i]])]
+        for row in range(n_image + e_used, n_image + e_keep):
+            bucket = self._nearest_bucket(index_store.w[row], index_store.h[row])
             if bucket is None:
                 bucket_filtered += 1
                 continue
-            record = dict(record)
-            record["bucket"] = bucket
-            self.edit_val_indices.append(len(self.records))
-            self.records.append(record)
-        self.read_stats["edit_val_pool"] = len(self.edit_val_indices)
-        if not self.records:
-            raise RuntimeError(f"Parquet 数据没有合格 bucket 样本: {database_path}")
-        self._print_distribution_table()
+            edit_val.append(kept)
+            kept_rows[kept] = row
+            row_bucket[kept] = bucket_ids[bucket]
+            kept += 1
+        self.read_stats["edit_val_pool"] = len(edit_val)
+        if not kept:
+            raise RuntimeError(f"Parquet 数据没有合格 bucket 样本: {self.database_path}")
+        # 运行期派生数组 (kept 行映射/bucket id/edit_val/桶池 CSR) 落盘为 mmap 只读文件:
+        # 8 rank + 32 worker 共享同一份文件页, 避免 33M 级 int 列表常驻 + COW 复制;
+        # 全部落盘后写 done.json 标记, 供后续 rank/重启走 _load_runtime_cache 快路径。
+        kept_rows = self._ensure_mmap_array(runtime_dir / "kept_rows.npy", kept_rows[:kept])
+        row_bucket = self._ensure_mmap_array(runtime_dir / "row_bucket.npy", row_bucket[:kept])
+        self.edit_val_indices = self._ensure_mmap_array(
+            runtime_dir / "edit_val.npy", np.asarray(edit_val, np.int32))
+        n_buckets = len(self.buckets)
+        # 桶池/mode 池只按主合并循环的行分组 (row_bucket[:kept_main]),
+        # leftover edit 行仅在 records 末尾可见 (与旧 list 实现一致)
+        bucket_off, bucket_vals = self._group_indices_mmap(
+            runtime_dir, "bucket", row_bucket[:kept_main], n_buckets)
+        # mode 池 key = bucket_id + (edit ? n_buckets : 0), 键序与旧 dict 一致: image:* 在前 edit:* 在后
+        mode_flags = index_store.is_edit[kept_rows[:kept_main]]
+        mode_keys = row_bucket[:kept_main] + np.where(mode_flags, np.int32(n_buckets), np.int32(0))
+        mode_bucket_off, mode_bucket_vals = self._group_indices_mmap(
+            runtime_dir, "mode_bucket", mode_keys, 2 * n_buckets)
+        self.records = _KeptRecordView(index_store, kept_rows, row_bucket, list(self.buckets))
+        self.bucket_indices = {
+            bucket: bucket_vals[bucket_off[bid]:bucket_off[bid + 1]]
+            for bid, bucket in enumerate(self.buckets)
+        }
+        self.mode_bucket_indices = {
+            f"{mode}:{bucket}": mode_bucket_vals[
+                mode_bucket_off[mode_id * n_buckets + bid]:mode_bucket_off[mode_id * n_buckets + bid + 1]]
+            for mode_id, mode in enumerate(("image", "edit"))
+            for bid, bucket in enumerate(self.buckets)
+        }
+        try:  # 全部文件就绪后原子写完成标记, 快路径只信任该标记
+            marker = runtime_dir / "done.json"
+            tmp = marker.with_name(f".{marker.name}.tmp-{os.getpid()}")
+            tmp.write_text(json.dumps({"kept": int(kept), "n_buckets": n_buckets}))
+            os.replace(tmp, marker)
+        except OSError:
+            pass
 
     # ─── 索引缓存：首次读取后在 output 持久化，指纹不一致时才重建 ───
 
@@ -718,7 +1161,9 @@ class LmdbParquetDataset(ImageDatabaseDataset):
         return hashlib.sha256(blob.encode()).hexdigest()
 
     def _cache_paths(self, fingerprint: str) -> tuple[Path, Path]:
-        return (self.index_cache_dir / f"index_{fingerprint}.pkl",
+        # 列式缓存为每指纹一个目录 (meta.json + 各列 .npy/.bin); 旧版单文件
+        # index_{fp}.pkl 不再读写, 遗留文件随 INDEX_CACHE_VERSION 指纹变化自然淘汰。
+        return (self.index_cache_dir / f"index_{fingerprint}",
                 self.index_cache_dir / f"index_{fingerprint}.stats.txt")
 
     def _load_index_cache(self, fingerprint: str, allow_fresh: bool = False) -> dict[str, Any] | None:
@@ -729,67 +1174,116 @@ class LmdbParquetDataset(ImageDatabaseDataset):
             return None
         if os.environ.get("GWP_DATASET_INDEX_CACHE_DISABLE"):
             return None
-        pkl_path, _ = self._cache_paths(fingerprint)
-        if not pkl_path.exists():
+        index_dir, _ = self._cache_paths(fingerprint)
+        meta_path = index_dir / "meta.json"
+        if not meta_path.exists():
+            # 旧版 pkl 缓存与列式格式不兼容, 一律走重建路径
             return None
         try:
             t0 = time.time()
-            size_gib = pkl_path.stat().st_size / 1024**3
-            # 大索引 (24G 级) unpickle 需约 1 分钟; 加载前必须打印, 否则该阶段终端静默
-            print(f"⏳ [PID={os.getpid()}] 正在加载图片索引缓存: {pkl_path.name} "
-                  f"({size_gib:.2f} GiB) ...", flush=True)
-            with open(pkl_path, "rb") as handle:
-                payload = pickle.load(handle)
-            if not isinstance(payload, dict) or payload.get("fingerprint") != fingerprint:
-                print(f"⚠️ 索引缓存指纹不匹配，将重建: {pkl_path}", flush=True)
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            if (not isinstance(meta, dict) or meta.get("fingerprint") != fingerprint
+                    or int(meta.get("format_version") or 0) != _INDEX_FORMAT_VERSION):
+                print(f"⚠️ 索引缓存指纹/格式不匹配，将重建: {index_dir}", flush=True)
                 return None
+            size_gib = sum(entry.stat().st_size for entry in index_dir.iterdir() if entry.is_file()) / 1024**3
+            _debug_index_event("load-start", cache=index_dir.name, size_gib=round(size_gib, 2), allow_fresh=allow_fresh)
+            # 列式缓存只做 mmap 映射 (秒级), 无需整份反序列化; 加载前照常打印, 避免阶段静默
+            print(f"⏳ [PID={os.getpid()}] 正在加载图片索引缓存(mmap): {index_dir.name} "
+                  f"({size_gib:.2f} GiB) ...", flush=True)
+            store = _ColumnarIndex.load(index_dir, meta)
+            payload = {
+                "fingerprint": fingerprint,
+                "created": meta.get("created"),
+                "store": store,
+                "stats": meta.get("stats"),
+            }
+            _debug_index_event("load-done", cache=index_dir.name, seconds=round(time.time() - t0, 1),
+                               records=store.n_image, edits=store.n_edit)
             print(
-                f"📦 [PID={os.getpid()}] 数据集索引缓存命中: {pkl_path.name} "
+                f"📦 [PID={os.getpid()}] 数据集索引缓存命中(mmap 列式共享): {index_dir.name} "
                 f"({size_gib:.2f} GiB, {time.time() - t0:.1f}s), "
-                f"image={len(payload['image_records']):,}, edit={len(payload['edit_records']):,}",
+                f"image={store.n_image:,}, edit={store.n_edit:,}",
                 flush=True,
             )
             return payload
         except Exception as exc:
-            print(f"⚠️ 索引缓存加载失败，将重建: {pkl_path}: {exc}", flush=True)
+            _debug_index_event("load-error", cache=index_dir.name, error=repr(exc))
+            print(f"⚠️ 索引缓存加载失败，将重建: {index_dir}: {exc}", flush=True)
             return None
 
-    def _write_index_cache(self, fingerprint: str, records: list, edits: list) -> bool:
-        pkl_path, _ = self._cache_paths(fingerprint)
-        payload = {
-            "fingerprint": fingerprint,
-            "created": time.time(),
-            "image_records": records,
-            "edit_records": edits,
-            "stats": self.read_stats,
-        }
+    def _write_index_cache(self, fingerprint: str, records: list, edits: list) -> tuple[_ColumnarIndex, bool]:
+        """rank0 构建完成后把 list[dict] 行转列式并落盘 (mmap 列式缓存)。
+        返回 (索引对象, 是否成功落盘)。成功后调用方应立即释放传入的 rows 引用:
+        构建期 rank0 的 ~30GB 瞬态只在写缓存阶段存在, 训练期一律走 mmap 共享。"""
+        index_dir, _ = self._cache_paths(fingerprint)
+        index_store = None
         try:
-            pkl_path.parent.mkdir(parents=True, exist_ok=True)
-            tmp_path = pkl_path.with_name(f".{pkl_path.name}.tmp-{os.getpid()}")
             t0 = time.time()
-            with open(tmp_path, "wb") as handle:
-                pickle.dump(payload, handle, protocol=pickle.HIGHEST_PROTOCOL)
-            tmp_path.replace(pkl_path)
-            size_gib = pkl_path.stat().st_size / 1024**3
-            print(f"✅ 数据集索引缓存写入: {pkl_path} ({size_gib:.2f} GiB, {time.time() - t0:.1f}s)", flush=True)
-            return True
+            index_store = _ColumnarIndex.build_from_rows(records, edits)
+            index_dir.mkdir(parents=True, exist_ok=True)
+            index_store.save(index_dir, fingerprint=fingerprint, created=time.time(), stats=self.read_stats)
+            payload = self._load_index_cache(fingerprint, allow_fresh=True)
+            if payload is None:
+                raise RuntimeError("写盘后回读失败 (meta.json 缺失或校验不过)")
+            size_gib = sum(entry.stat().st_size for entry in index_dir.iterdir() if entry.is_file()) / 1024**3
+            print(f"✅ 数据集索引缓存写入(列式 mmap): {index_dir} "
+                  f"({size_gib:.2f} GiB, {time.time() - t0:.1f}s), "
+                  f"此后所有 rank/worker 只读映射共享", flush=True)
+            return payload["store"], True
         except Exception as exc:
-            print(f"⚠️ 索引缓存写入失败: {pkl_path}: {exc}", flush=True)
-            return False
+            print(f"⚠️ 索引缓存写入失败: {index_dir}: {exc}", flush=True)
+            if index_store is None:
+                raise
+            # 列式转换已成功但落盘失败: 退回内存数组包装, 行为与旧版"无缓存继续训练"一致
+            return index_store, False
 
     def _load_or_read_records(self, image_enabled: bool, edit_enabled: bool,
                               max_samples, max_edit_samples, edit_database_path):
-        """优先读 output 索引缓存；缓存缺失/指纹不一致时才扫描 parquet 重建。
+        """优先读 output 索引缓存 (mmap 列式)；缓存缺失/指纹不一致时才扫描 parquet 重建。
 
         分布式下仅 rank 0 重建并写缓存，其余 rank 在 barrier 后直接读缓存，
-        避免多 rank 同时扫描 NFS 上的数千个 parquet 分片。"""
+        避免多 rank 同时扫描 NFS 上的数千个 parquet 分片。返回 mmap 列式索引
+        (union 存储: image 行在前, edit 行在后)。"""
         fingerprint = self._index_fingerprint(image_enabled, edit_enabled,
                                               max_samples, max_edit_samples, edit_database_path)
         self.index_fingerprint = fingerprint
-        payload = self._load_index_cache(fingerprint)
+        distributed = dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
+        rank = dist.get_rank() if distributed else 0
+        _debug_index_event("phase-enter", cache_dir=str(self.index_cache_dir), fingerprint=fingerprint[:12], distributed=distributed)
+        cache_sync_key = f"yisu/image-index-cache/{fingerprint}"
+        if distributed and rank != 0:
+            _debug_index_event("store-wait-start", key=cache_sync_key)
+            # 先等 global rank 0 完成一次缓存探测，再逐 rank 读取同一缓存。
+            # 列式缓存为 mmap 只读映射, 多 rank 并发打开同一目录也只是各自建立
+            # 映射, 共享同一份物理页, 不再有 21 GiB pickle 的逐 rank 反序列化。
+            _get_default_store().wait([cache_sync_key])
+            _debug_index_event("store-wait-done", key=cache_sync_key)
+        if distributed and rank == 0:
+            _debug_index_event("rank0-load-before")
+            payload = self._load_index_cache(fingerprint)
+            _get_default_store().set(cache_sync_key, b"hit" if payload is not None else b"miss")
+            _debug_index_event("rank0-store-set", result=("hit" if payload is not None else "miss"))
+        elif distributed:
+            payload = None
+            result = _get_default_store().get(cache_sync_key)
+            _debug_index_event("store-get", result=result.decode(errors="replace"))
+            if result == b"hit":
+                # 同一节点上的 rank 串行建立 mmap 映射；对象仍由各 rank 保持自己的只读映射。
+                import fcntl
+                lock_path = self.index_cache_dir / f".index-load-{fingerprint}.lock"
+                lock_path.parent.mkdir(parents=True, exist_ok=True)
+                _debug_index_event("rank-load-lock-wait", lock=str(lock_path))
+                with open(lock_path, "w") as lock_file:
+                    fcntl.flock(lock_file, fcntl.LOCK_EX)
+                    _debug_index_event("rank-load-lock-acquired", lock=str(lock_path))
+                    payload = self._load_index_cache(fingerprint, allow_fresh=True)
+                    _debug_index_event("rank-load-after", loaded=(payload is not None))
+        else:
+            payload = self._load_index_cache(fingerprint)
         if payload is not None:
             self.read_stats = payload.get("stats") or {"image": {}, "edit": {}}
-            return payload["image_records"], payload["edit_records"]
+            return payload["store"]
 
         def _read_all():
             rows = (self._read_parquet(self.database_path, self.sources, False,
@@ -800,10 +1294,12 @@ class LmdbParquetDataset(ImageDatabaseDataset):
 
         distributed = dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
         rank = dist.get_rank() if distributed else 0
-        records, edits = [], []
+        index_store = None
         if not distributed or rank == 0:
             records, edits = _read_all()
-            cache_written = self._write_index_cache(fingerprint, records, edits)
+            index_store, cache_written = self._write_index_cache(fingerprint, records, edits)
+            # 释放构建期 list[dict] 的 ~30GB 瞬态 (rank0 已转为 mmap 列式索引)
+            records = edits = None
         if distributed:
             sync_key = f"yisu/image-index/{fingerprint}"
             if rank == 0:
@@ -823,9 +1319,9 @@ class LmdbParquetDataset(ImageDatabaseDataset):
                         f"global rank0 未生成图片索引缓存: {self._cache_paths(fingerprint)[0]}"
                     )
                 self.read_stats = payload.get("stats") or {"image": {}, "edit": {}}
-                records, edits = payload["image_records"], payload["edit_records"]
+                index_store = payload["store"]
                 print(f"📦 rank {rank} 复用 global rank0 图片索引: {self.index_cache_dir}", flush=True)
-        return records, edits
+        return index_store
 
     def _print_distribution_table(self):
         if dist.is_available() and dist.is_initialized() and dist.get_rank() != 0:
@@ -840,17 +1336,30 @@ class LmdbParquetDataset(ImageDatabaseDataset):
         read_stats = getattr(self, "read_stats", {}) or {}
         total_final = len(self.records)
 
-        # 最终配比: (source, mode) -> 训练样本数
+        # 最终配比: (source, mode) -> 训练样本数。列式索引走向量化统计, 结果与旧的
+        # 逐行 record.get 统计完全一致, 但省去 3300 万行逐行拼 dict 的分钟级开销。
+        records_view = self.records
+        bucket_ids = records_view.bucket_ids()
+        bucket_counts = {
+            bucket: int(count)
+            for bucket, count in zip(self.buckets, np.bincount(bucket_ids, minlength=len(self.buckets)))
+        }
+        is_edit_flags = records_view.is_edit_flags()
+        mode_counts = {
+            "image": int(np.count_nonzero(~is_edit_flags)),
+            "edit": int(np.count_nonzero(is_edit_flags)),
+        }
+        source_ids = records_view.source_ids()
+        sources_table = records_view.sources_table()
+        source_total = np.bincount(source_ids, minlength=len(sources_table))
+        source_edit = np.bincount(source_ids[is_edit_flags], minlength=len(sources_table))
         final_counts: dict[tuple[str, str], int] = {}
-        bucket_counts = {bucket: 0 for bucket in self.buckets}
-        mode_counts = {"image": 0, "edit": 0}
-        for record in self.records:
-            source = str(record.get("source", "unknown"))
-            mode = "edit" if record.get("is_edit") else "image"
-            final_counts[(source, mode)] = final_counts.get((source, mode), 0) + 1
-            if record.get("bucket") in bucket_counts:
-                bucket_counts[record["bucket"]] += 1
-            mode_counts[mode] += 1
+        for source_id, source in enumerate(sources_table):
+            image_count = int(source_total[source_id]) - int(source_edit[source_id])
+            if image_count:
+                final_counts[(str(source), "image")] = image_count
+            if int(source_edit[source_id]):
+                final_counts[(str(source), "edit")] = int(source_edit[source_id])
 
         # 读取阶段统计: (source, mode) -> parquet 行数等
         load_info: dict[tuple[str, str], dict] = {}
@@ -937,7 +1446,13 @@ class LmdbParquetDataset(ImageDatabaseDataset):
         import lmdb
         ranges = []
         for mdb_path in sorted((Path(source_dir) / "mdb").glob("*.mdb")):
-            env = lmdb.open(str(mdb_path), readonly=True, lock=False, subdir=False, max_readers=1024)
+            real = str(mdb_path)
+            try:
+                import bos_data  # BOS 镜像: 占位 mdb 按需下载
+                real = bos_data.materialize(real)
+            except ImportError:
+                pass
+            env = lmdb.open(real, readonly=True, lock=False, subdir=False, max_readers=1024)
             minimum = maximum = None
             with env.begin() as txn:
                 for key, _ in txn.cursor():
@@ -958,6 +1473,7 @@ class LmdbParquetDataset(ImageDatabaseDataset):
 
     def _read_parquet(self, path, sources, is_edit, lmdb_root, limit=None):
         import pyarrow.parquet as parquet
+        import pyarrow.compute as pc
         root = Path(path)
         if root.is_file():
             files = [(root, root.parent.parent)]
@@ -973,8 +1489,13 @@ class LmdbParquetDataset(ImageDatabaseDataset):
             for source_dir in source_dirs:
                 if not source_dir.is_dir():
                     continue
-                files.extend((file, source_dir) for file in sorted(
-                    (source_dir / "parquet").glob("meta_*.parquet")))
+                shard_parquets = sorted((source_dir / "parquet").glob("meta_*.parquet"))
+                if shard_parquets:
+                    files.extend((file, source_dir) for file in shard_parquets)
+                elif (source_dir / "mdb").is_dir() and \
+                        (source_dir / "parquet" / "meta.parquet").exists():
+                    # BOS 上传形态: 单个合并 meta.parquet + 多个 mdb 分片
+                    files.append((source_dir / "parquet" / "meta.parquet", source_dir))
 
         rows = []
         source_counts = {}
@@ -1000,36 +1521,94 @@ class LmdbParquetDataset(ImageDatabaseDataset):
                 unit="shard",
                 dynamic_ncols=True,
             )
+        def _item_from_row(row, sid, stem, source, is_edit, dataset_dir):
+            # 白名单复制: 只保留训练读取路径实际访问的列。parquet 里 url/
+            # aesthetic/水印等几十个分析列不进索引缓存（曾致缓存 29GB、
+            # 每 rank 反序列化 10 分钟）。
+            item = {
+                key: row[key]
+                for key in ("caption", "text", "edit_prompt", "instruction", "width", "height",
+                            "w_after", "h_after", "split", "metadata")
+                if key in row
+            }
+            item.update(sample_id=sid, source=source, is_edit=is_edit)
+            if is_edit:
+                item["image_path"] = f"lmdb://{dataset_dir}/{stem}/{sid}:after"
+                item["input_image_path"] = f"lmdb://{dataset_dir}/{stem}/{sid}:before"
+                item["caption"] = row.get("edit_prompt") or row.get("instruction") or row.get("edit") or ""
+                item["width"] = row.get("w_after")
+                item["height"] = row.get("h_after")
+            else:
+                item["image_path"] = f"lmdb://{dataset_dir}/{stem}/{sid}:single"
+                item["caption"] = row.get("caption") or row.get("text") or ""
+                item["width"] = row.get("width")
+                item["height"] = row.get("height")
+            return item
+
         for file, source_dir in file_iterator:
             if source_dir not in source_shards:
                 parquet_files = sorted((source_dir / "parquet").glob("meta_*.parquet"))
                 mdb_files = sorted((source_dir / "mdb").glob("*.mdb"))
                 if not mdb_files:
                     continue
-                if len(parquet_files) != len(mdb_files):
-                    raise RuntimeError(
-                        f"Parquet/LMDB 分片数量不一致: {source_dir} "
-                        f"parquet={len(parquet_files)} mdb={len(mdb_files)}"
-                    )
-                source_shards[source_dir] = {
-                    parquet_file: mdb_file.stem
-                    for parquet_file, mdb_file in zip(parquet_files, mdb_files)
-                }
-            stem = source_shards[source_dir].get(file)
-            if stem is None:
-                continue
-            if file.name == "meta.parquet" or not file.exists():
-                continue
+                if not parquet_files:
+                    merged = source_dir / "parquet" / "meta.parquet"
+                    if not merged.exists():
+                        print(f"⚠️ {source_dir.name}: 缺 parquet 元数据 (meta_*.parquet/"
+                              f"meta.parquet 都没有), 已跳过该源", flush=True)
+                        continue
+                    # BOS 上传形态: 单个合并 meta.parquet + 多个 mdb 分片,
+                    # 按 mdb 分片键范围把行对齐到分片
+                    source_shards[source_dir] = {
+                        "merged": merged, "ranges": self._mdb_ranges(source_dir)}
+                else:
+                    if len(parquet_files) != len(mdb_files):
+                        raise RuntimeError(
+                            f"Parquet/LMDB 分片数量不一致: {source_dir} "
+                            f"parquet={len(parquet_files)} mdb={len(mdb_files)}"
+                        )
+                    source_shards[source_dir] = {
+                        parquet_file: mdb_file.stem
+                        for parquet_file, mdb_file in zip(parquet_files, mdb_files)
+                    }
+            shard_info = source_shards[source_dir]
             source = source_dir.name
             if sources and source not in sources:
                 continue
             if limit is not None and source_counts.get(source, 0) >= int(limit):
                 continue
-            dataset_dir = (Path(lmdb_root) / source).resolve()
             source_stats = stats.setdefault(source, {
                 "shards": 0, "total": 0, "valid": 0,
                 "filtered_split": 0, "filtered_no_id": 0, "limit_stopped": False,
             })
+            dataset_dir = str((Path(lmdb_root) / source).resolve())
+
+            if isinstance(shard_info, dict) and "merged" in shard_info:
+                # 合并元数据模式: 只读需要的列, 按 sid 区间切到各分片
+                source_stats["shards"] += 1
+                table = parquet.read_table(str(file))
+                sid_col = "sample_id" if "sample_id" in table.column_names else "id"
+                sids = table.column(sid_col)
+                for mn, mx, stem in shard_info["ranges"]:
+                    mask = pc.and_(pc.greater_equal(sids, mn), pc.less_equal(sids, mx))
+                    for row in table.filter(mask).to_pylist():
+                        if limit is not None and source_counts.get(source, 0) >= int(limit):
+                            source_stats["limit_stopped"] = True
+                            break
+                        source_stats["total"] += 1
+                        sid = int(row.get(sid_col))
+                        rows.append(_item_from_row(row, sid, stem, source, is_edit, dataset_dir))
+                        source_counts[source] = source_counts.get(source, 0) + 1
+                        source_stats["valid"] += 1
+                continue
+
+            stem = shard_info.get(file)
+            if stem is None:
+                continue
+            if file.name == "meta.parquet" or not file.exists():
+                continue
+            if limit is not None and source_counts.get(source, 0) >= int(limit):
+                continue
             source_stats["shards"] += 1
             table = parquet.read_table(file)
             for row in table.to_pylist():
@@ -1048,29 +1627,7 @@ class LmdbParquetDataset(ImageDatabaseDataset):
                 sid = int(sid)
                 # URI 必须指向实际包含 mdb/ 的 source 目录；lmdb_root 用于
                 # database_path 是 parquet 路径、但载荷位于另一根目录的情况。
-                dataset_dir = str(dataset_dir)
-                # 白名单复制: 只保留训练读取路径实际访问的列。parquet 里 url/
-                # aesthetic/水印等几十个分析列不进索引缓存（曾致缓存 29GB、
-                # 每 rank 反序列化 10 分钟）。
-                item = {
-                    key: row[key]
-                    for key in ("caption", "text", "edit_prompt", "instruction", "width", "height",
-                                "w_after", "h_after", "split", "metadata")
-                    if key in row
-                }
-                item.update(sample_id=sid, source=source, is_edit=is_edit)
-                if is_edit:
-                    item["image_path"] = f"lmdb://{dataset_dir}/{stem}/{sid}:after"
-                    item["input_image_path"] = f"lmdb://{dataset_dir}/{stem}/{sid}:before"
-                    item["caption"] = row.get("edit_prompt") or row.get("instruction") or row.get("edit") or ""
-                    item["width"] = row.get("w_after")
-                    item["height"] = row.get("h_after")
-                else:
-                    item["image_path"] = f"lmdb://{dataset_dir}/{stem}/{sid}:single"
-                    item["caption"] = row.get("caption") or row.get("text") or ""
-                    item["width"] = row.get("width")
-                    item["height"] = row.get("height")
-                rows.append(item)
+                rows.append(_item_from_row(row, sid, stem, source, is_edit, dataset_dir))
                 source_counts[source] = source_counts.get(source, 0) + 1
                 source_stats["valid"] += 1
         if not rows:
