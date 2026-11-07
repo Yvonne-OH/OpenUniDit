@@ -7,3 +7,12 @@ outputs/*
 thirdparty/
 diffusers/
 wandb/
+
+# 本地运行产物
+checkpoints/
+logs/
+datapipeline/logs/
+tools/data_tools/logs/
+*.log
+*.bak
+*.error

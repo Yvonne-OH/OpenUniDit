@@ -78,14 +78,15 @@ OUTPUT_DIR="${OUTPUT_DIR:-}"   # 空 = outputs/pretrain_v2/vis_token_exp/<ckpt �
 CHECKPOINT="${CHECKPOINT:-}"   # 空 = 自动取 stage_1 output_dir/checkpoints/weights 下最新 step-*
 CONFIG="${CONFIG:-${ROOT}/configs/stage_1.yaml}"
 
-# ── 采样参数 (固定 shift=6, 只扫 CFG, 对比 short/mid/long 三组 prompt 长度) ──
-HEIGHT=512      # 必须是 32 的倍数; 默认横屏 192x128 (WxH, 对应训练桶 192x128)
-WIDTH=512
-STEPS=40        # 训练验证用 20; 质量优先可加到 40+
-CFGS=(3 6 9 12) # guidance scale 组合
-NEGATIVE_PROMPT="blurry, distorted, deformed, low quality"
-SHIFTS=(6)      # 固定 shift=6
-SEED=42         # 所有 prompt 固定同一噪声种子
+# ── 采样参数 (默认固定 shift=6, 只扫 CFG, 对比 short/mid/long 三组 prompt 长度;
+#    HEIGHT/WIDTH/STEPS/CFGS/SHIFTS 均可用环境变量覆盖, CFGS/SHIFTS 为空格分隔的列表) ──
+HEIGHT="${HEIGHT:-512}"      # 必须是 32 的倍数; 缺省 512x512
+WIDTH="${WIDTH:-512}"
+STEPS="${STEPS:-40}"         # 训练验证用 20; 质量优先可加到 40+
+IFS=' ' read -ra CFGS <<< "${CFGS:-3 6 9 12}"   # guidance scale 组合
+NEGATIVE_PROMPT="${NEGATIVE_PROMPT:-blurry, distorted, deformed, low quality}"
+IFS=' ' read -ra SHIFTS <<< "${SHIFTS:-6}"       # 默认固定 shift=6
+SEED="${SEED:-42}"           # 所有 prompt 固定同一噪声种子
 BATCH_SIZE="${BATCH_SIZE:-4}"   # 越大越快(结果与 batch 大小无关)
 GPU=""          # 空 = 自动用最后一张 GPU (如 8 卡机为 7)
 

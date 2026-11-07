@@ -104,6 +104,8 @@ dataset:
     - Text-Render-2M
     # 2026-11-02 新增: BOS 扫描发现 8 个完整源 (mdb==parquet 分片数校验通过) 未入白名单。
     # 估算总量 ~190 万; pixelprose 需关注与已有 pixelprose_* 子集的重复, imagenet_1k
+    # 2026-11-06 新增: moss_synth_sa1b_10h 合并入库 (56GB, 152 分片, SA-1B 合成图 1024px)
+    - moss_synth_sa1b_10h
   contract: "[B,C,T,H,W]"
   num_frames: 1
   preprocess_style: cover   # 短边贴桶+中心裁剪, 无黑边 (实测 resize_long_edge 加权后 37% 样本补黑 >1%)
