@@ -440,13 +440,51 @@ def _report_adaln_basis_migration(migration, logger=None):
         print(f"\033[1;32m{message}\033[0m", flush=True)
 
 
-def load_compatible_state_dict(model, state):
+def _report_patchify_reinit(model, state, current, matched, metadata, logger=None):
+    """patchify 配置变化 → patchify 入口/出口层无法继承时红字警告 (rank0)。
+
+    兼容语义: shape 匹配的参数全部正常继承 (其他保留), patchify 入口/出口
+    (patch_in.weight / out.weight / out.bias) 保持重新随机初始化 (这部分重新弄)。"""
+    if _dist_rank() != 0:
+        return
+    dropped = [key for key in ("patch_in.weight", "out.weight", "out.bias")
+               if key in state and key in current and key not in matched]
+    if not dropped:
+        return
+    logger = logger or logging.getLogger("giga_exp")
+    new_ps = list(model.patch_size)
+    old_ps = metadata.get("patch_size") if isinstance(metadata, dict) else None
+    if old_ps is not None:
+        origin = f"checkpoint patch_size={list(old_ps)} → 当前 patch_size={new_ps}"
+    else:
+        # 旧格式 checkpoint 无 semantic metadata: 由 patch_in 输入维反推 patch volume
+        weight = state.get("patch_in.weight")
+        inferred = weight.shape[1] // model.in_channels if weight is not None and weight.ndim == 2 \
+            and model.in_channels and weight.shape[1] % model.in_channels == 0 else None
+        origin = (f"checkpoint 未记录 patch_size, 由 patch_in 输入维推断 patch volume={inferred} "
+                  f"→ 当前 patch_size={new_ps}")
+    message = (f"🚨 patchify 不兼容: {origin}。\n"
+               f"    patchify 入口/出口层无法继承 (shape 不匹配): {', '.join(dropped)}, "
+               f"共 {sum(state[k].numel() for k in dropped) / 1e6:.2f}M 参数保持重新随机初始化;\n"
+               f"    其余 {len(matched)}/{len(state)} 项参数全部正常继承, step 按权重文件延续。\n"
+               f"    patchify 层需要重新学习, 恢复初期 loss 会显著抬升, 属预期现象。")
+    logger.warning(message.replace("\n", " "))
+    print(f"\033[1;31m{message}\033[0m", flush=True)
+
+
+def load_compatible_state_dict(model, state, metadata=None):
     """只加载名称和 shape 都匹配的参数，其余参数保留当前初始化值。
 
     AdaLN 结构自动迁移 (yaml model.adaln_type 注明目标结构):
     - basis 模型 + 旧 shared/dual 全秩 ckpt → apply_adaln_basis_migration 低秩转换后加载;
     - dual 模型 + 旧 shared ckpt → apply_mod_adaln_migration 拷贝初始化到双分支,
-      step0 forward 与 shared AdaLN 完全等价, 无损热启动。"""
+      step0 forward 与 shared AdaLN 完全等价, 无损热启动。
+
+    patchify 兼容 (metadata 为 checkpoint semantic metadata, 可为 None):
+    - ckpt 与模型 patch_size 一致 → 全量继承;
+    - 模型 patchify、ckpt 未 patchify (patch_volume>1) → patch_in/out 权重复制扩展迁移;
+    - ckpt 与模型 patch_size 不兼容 → patchify 入口/出口保持重新随机初始化 (红字警告),
+      其余参数全部正常继承。"""
     current = model.state_dict()
     basis = apply_adaln_basis_migration(current, state)
     if basis["source"] is None:
@@ -469,6 +507,7 @@ def load_compatible_state_dict(model, state):
                 matched[key] = value.repeat(patch_volume, 1)
             elif key == "out.bias" and value.ndim == 1 and current[key].shape == (value.shape[0] * patch_volume,):
                 matched[key] = value.repeat(patch_volume)
+    _report_patchify_reinit(model, state, current, matched, metadata)
     result = model.load_state_dict(matched, strict=False)
     ignored = len(state) - len(matched)
     return len(matched), len(result.missing_keys), ignored
@@ -499,7 +538,7 @@ def load_pure_weights(engine, output_dir, checkpoint_path=None):
         state = load_file(str(target))
     else:
         state = torch.load(str(target), map_location="cpu")
-    matched, missing, unexpected = load_compatible_state_dict(engine.module, state)
+    matched, missing, unexpected = load_compatible_state_dict(engine.module, state, _read_weight_metadata(target))
     # ZeRO-2 的 FP32 主参数独立于模型权重；所有 rank 都必须同步自己的分片。
     engine.optimizer.refresh_fp32_params()
     if _dist_rank() == 0:
@@ -524,7 +563,7 @@ def load_init_weights(model, init_path):
         state = load_file(str(path))
     else:
         state = torch.load(str(path), map_location="cpu")
-    matched, missing, unexpected = load_compatible_state_dict(model, state)
+    matched, missing, unexpected = load_compatible_state_dict(model, state, _read_weight_metadata(path))
     logging.getLogger("giga_exp").info("兼容初始化权重: %s, matched=%d, reinitialized=%d, ignored=%d", path, matched, missing, unexpected)
     return path
 

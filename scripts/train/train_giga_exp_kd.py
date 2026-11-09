@@ -457,12 +457,50 @@ def _report_text_trans_reinit(model, state, logger=None):
     print(f"\033[1;33m{message}\033[0m", flush=True)
 
 
-def load_compatible_state_dict(model, state):
+def _report_patchify_reinit(model, state, current, matched, metadata, logger=None):
+    """patchify 配置变化 → patchify 入口/出口层无法继承时红字警告 (rank0)。
+
+    兼容语义: shape 匹配的参数全部正常继承 (其他保留), patchify 入口/出口
+    (patch_in.weight / out.weight / out.bias) 保持重新随机初始化 (这部分重新弄)。"""
+    if _dist_rank() != 0:
+        return
+    dropped = [key for key in ("patch_in.weight", "out.weight", "out.bias")
+               if key in state and key in current and key not in matched]
+    if not dropped:
+        return
+    logger = logger or logging.getLogger("giga_exp")
+    new_ps = list(model.patch_size)
+    old_ps = metadata.get("patch_size") if isinstance(metadata, dict) else None
+    if old_ps is not None:
+        origin = f"checkpoint patch_size={list(old_ps)} → 当前 patch_size={new_ps}"
+    else:
+        # 旧格式 checkpoint 无 semantic metadata: 由 patch_in 输入维反推 patch volume
+        weight = state.get("patch_in.weight")
+        inferred = weight.shape[1] // model.in_channels if weight is not None and weight.ndim == 2 \
+            and model.in_channels and weight.shape[1] % model.in_channels == 0 else None
+        origin = (f"checkpoint 未记录 patch_size, 由 patch_in 输入维推断 patch volume={inferred} "
+                  f"→ 当前 patch_size={new_ps}")
+    message = (f"🚨 patchify 不兼容: {origin}。\n"
+               f"    patchify 入口/出口层无法继承 (shape 不匹配): {', '.join(dropped)}, "
+               f"共 {sum(state[k].numel() for k in dropped) / 1e6:.2f}M 参数保持重新随机初始化;\n"
+               f"    其余 {len(matched)}/{len(state)} 项参数全部正常继承, step 按权重文件延续。\n"
+               f"    patchify 层需要重新学习, 恢复初期 loss 会显著抬升, 属预期现象。")
+    logger.warning(message.replace("\n", " "))
+    print(f"\033[1;31m{message}\033[0m", flush=True)
+
+
+def load_compatible_state_dict(model, state, metadata=None):
     """只加载名称和 shape 都匹配的参数，其余参数保留当前初始化值。
 
     AdaLN 结构自动迁移 (yaml model.adaln_type 注明目标结构):
     - basis 模型 + 旧 shared/dual 全秩 ckpt → 低秩转换 (r=64, 误差 ~3.2%) 后加载;
-    - dual 模型 + 旧 shared ckpt → 拷贝初始化到 mod_img/mod_txt, 无损热启动。"""
+    - dual 模型 + 旧 shared ckpt → 拷贝初始化到 mod_img/mod_txt, 无损热启动。
+
+    patchify 兼容 (metadata 为 checkpoint semantic metadata, 可为 None):
+    - ckpt 与模型 patch_size 一致 → 全量继承;
+    - 模型 patchify、ckpt 未 patchify (patch_volume>1) → patch_in/out 权重复制扩展迁移;
+    - ckpt 与模型 patch_size 不兼容 → patchify 入口/出口保持重新随机初始化 (红字警告),
+      其余参数全部正常继承。"""
     current = model.state_dict()
     basis = apply_adaln_basis_migration(current, state)
     if basis["source"] is None:
@@ -485,6 +523,7 @@ def load_compatible_state_dict(model, state):
                 matched[key] = value.repeat(patch_volume, 1)
             elif key == "out.bias" and value.ndim == 1 and current[key].shape == (value.shape[0] * patch_volume,):
                 matched[key] = value.repeat(patch_volume)
+    _report_patchify_reinit(model, state, current, matched, metadata)
     result = model.load_state_dict(matched, strict=False)
     ignored = len(state) - len(matched)
     return len(matched), len(result.missing_keys), ignored
@@ -515,7 +554,7 @@ def load_pure_weights(engine, output_dir, checkpoint_path=None):
         state = load_file(str(target))
     else:
         state = torch.load(str(target), map_location="cpu")
-    matched, missing, unexpected = load_compatible_state_dict(engine.module, state)
+    matched, missing, unexpected = load_compatible_state_dict(engine.module, state, _read_weight_metadata(target))
     # ZeRO-2 的 FP32 主参数独立于模型权重；所有 rank 都必须同步自己的分片。
     engine.optimizer.refresh_fp32_params()
     if _dist_rank() == 0:
@@ -540,7 +579,7 @@ def load_init_weights(model, init_path):
         state = load_file(str(path))
     else:
         state = torch.load(str(path), map_location="cpu")
-    matched, missing, unexpected = load_compatible_state_dict(model, state)
+    matched, missing, unexpected = load_compatible_state_dict(model, state, _read_weight_metadata(path))
     logging.getLogger("giga_exp").info("兼容初始化权重: %s, matched=%d, reinitialized=%d, ignored=%d", path, matched, missing, unexpected)
     return path
 
@@ -611,6 +650,23 @@ def feature_relation_kd(student_feats, teacher_feats, projectors, n_img, relatio
         rel_losses.append(F.mse_loss(gram_s, gram_t))
     return (torch.stack(feat_losses).mean(), torch.stack(rel_losses).mean(),
             torch.stack(cos_centered).mean(), torch.stack(cos_raw).mean())
+
+
+def pool_feats_to_grid(feats, grid_s, kh, kw):
+    """student image tokens 均值池化到 teacher 网格 (student 取消 patchify 后网格更细)。
+
+    image tokens 是序列前缀, 按 (t,h,w) 行主序排列 (与 GigaExpTransformer.patchify 一致);
+    每 (1,kh,kw) 块取均值 → 与 teacher patch (f=1, p=teacher_patch) 的 latent 网格逐位对齐,
+    text 后缀原样透传。"""
+    t_s, h_s, w_s = grid_s
+    h_t, w_t = h_s // kh, w_s // kw
+    n_img_s = t_s * h_s * w_s
+    pooled = []
+    for f in feats:
+        d = f.shape[-1]
+        img = f[:, :n_img_s].reshape(f.shape[0], t_s, h_t, kh, w_t, kw, d).mean(dim=(3, 5))
+        pooled.append(torch.cat([img.reshape(f.shape[0], -1, d), f[:, n_img_s:]], dim=1))
+    return pooled
 
 
 def sigma_bucket_loss_stats(sigma, per_sample_loss):
@@ -1212,14 +1268,24 @@ def main():
             # DeepSpeed 会在 gradient_accumulation_steps > 1 时自动缩放 backward loss；这里不要再次除以 grad_accum。
             loss = diff_sq.mean()
             if kd_feat_rel:
-                # student patch [1,2,2] ≡ teacher patch 2/f_patch 1: 同一 latent 网格, image token 逐位对齐。
-                # 不一致说明配置漂移, 直接报错而不是静默错位蒸馏。
+                # image token 网格对齐: student patch [1,2,2] ≡ teacher patch 2/f 1 → 逐位对齐;
+                # student 取消空间 patchify (1,1,1) 后网格比 teacher 细 kh×kw 倍, 先把 student
+                # 特征按 (1,kh,kw) 块均值池化到 teacher 网格再逐位蒸馏。
+                # 不能整除说明配置漂移, 直接报错而不是静默错位蒸馏。
                 s_pt, s_ph, s_pw = engine.module.patch_size
-                n_img = (xt.shape[2] // s_pt) * (xt.shape[3] // s_ph) * (xt.shape[4] // s_pw)
-                if set(teacher_img_lens) != {n_img}:
+                grid_s = (xt.shape[2] // s_pt, xt.shape[3] // s_ph, xt.shape[4] // s_pw)
+                grid_t = (xt.shape[2] // teacher_f_patch_size, xt.shape[3] // teacher_patch_size,
+                          xt.shape[4] // teacher_patch_size)
+                n_img = grid_t[0] * grid_t[1] * grid_t[2]
+                if (grid_s[0] != grid_t[0] or any(g % d for g, d in zip(grid_s[1:], grid_t[1:]))
+                        or set(teacher_img_lens) != {n_img}):
                     raise ValueError(
-                        f"teacher/student image token 网格不一致: teacher={teacher_img_lens} student={n_img} "
+                        f"teacher/student image token 网格无法对齐: teacher={teacher_img_lens} grid_t={grid_t} "
+                        f"grid_s={grid_s} "
                         f"(student patch={engine.module.patch_size}, teacher patch={teacher_patch_size}/f={teacher_f_patch_size})")
+                kh, kw = grid_s[1] // grid_t[1], grid_s[2] // grid_t[2]
+                if kh > 1 or kw > 1:
+                    student_feats = pool_feats_to_grid(student_feats, grid_s, kh, kw)
                 l_feat, l_rel, feat_cos, feat_cos_raw = feature_relation_kd(
                     student_feats, teacher_feats, engine.module.kd_projectors, n_img, kd_rel_tokens)
                 loss = loss + kd_feat_weight * l_feat + kd_rel_weight * l_rel
@@ -1369,7 +1435,8 @@ def main():
                                                 feature_layers=student_kd_layers)
                 probe_fm = (probe_pred.float() - (noise - latents).float()).square().mean()
                 probe_feat, probe_rel, _, _ = feature_relation_kd(
-                    probe_feats, teacher_feats, probe.kd_projectors, n_img, kd_rel_tokens)
+                    pool_feats_to_grid(probe_feats, grid_s, kh, kw) if (kh > 1 or kw > 1) else probe_feats,
+                    teacher_feats, probe.kd_projectors, n_img, kd_rel_tokens)
                 probe_params = [p for name, p in probe.named_parameters()
                                 if not name.startswith("kd_projectors")]
                 grad_fm = torch.autograd.grad(probe_fm, probe_params, retain_graph=True, allow_unused=True)

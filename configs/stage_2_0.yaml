@@ -32,7 +32,9 @@ model:
   rope_theta: 10000.0
   # 4D RoPE: (time, height, width, text_position).
   rope_axes_dims: [16, 48, 48, 16]
-  patch_size: [1, 2, 2]
+  # 2026-11-09: (1,2,2) → (1,1,1), 取消空间 patchify 压缩; 旧 (1,2,2) ckpt 的 patch_in/out
+  # 不兼容 → 红字警告 + 重新随机初始化, 其余参数正常继承, step 延续。
+  patch_size: [1, 1, 1]
 
 components:
   text_encoder:

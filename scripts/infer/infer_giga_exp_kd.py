@@ -35,9 +35,6 @@ try:
 except ImportError:  # 缺 tqdm 时退化为无进度条
     tqdm = trange = None
 
-# Wan VAE 空间压缩 16 × patch 2 ⇒ 像素宽高须被 32 整除
-PIXEL_MULTIPLE = 32
-
 # KD 标准推理口径 (与 teacher 验证 / 轨迹诊断一致)
 KD_DEFAULT_CONFIG = "configs/stage_1_kd_v3_traj.yaml"
 KD_DEFAULT_STEPS = 50
@@ -141,11 +138,59 @@ def resolve_checkpoint(path, output_dir):
     return target, int(match.group(1)) if match else 0
 
 
-def load_compatible_state_dict(model, state):
+def _read_weight_metadata(path):
+    """读取权重文件内嵌的 semantic metadata (safetensors 头 / .pt 旁路 .json); 无则返回 None。"""
+    path = Path(path)
+    if path.suffix == ".safetensors":
+        from safetensors import safe_open
+        with safe_open(str(path), framework="pt", device="cpu") as handle:
+            raw = (handle.metadata() or {}).get("giga_semantic_metadata")
+        return json.loads(raw) if raw else None
+    sidecar = path.with_suffix(".json")
+    if not sidecar.is_file():
+        return None
+    return json.loads(sidecar.read_text(encoding="utf-8")).get("giga_semantic_metadata")
+
+
+def _report_patchify_reinit(model, state, current, matched, metadata):
+    """patchify 配置变化 → patchify 入口/出口层无法继承时红字警告 (推理侧)。
+
+    兼容语义: shape 匹配的参数全部正常继承, patchify 入口/出口
+    (patch_in.weight / out.weight / out.bias) 保持重新随机初始化。"""
+    dropped = [key for key in ("patch_in.weight", "out.weight", "out.bias")
+               if key in state and key in current and key not in matched]
+    if not dropped:
+        return
+    new_ps = list(model.patch_size)
+    old_ps = metadata.get("patch_size") if isinstance(metadata, dict) else None
+    if old_ps is not None:
+        origin = f"checkpoint patch_size={list(old_ps)} → 当前 patch_size={new_ps}"
+    else:
+        # 旧格式 checkpoint 无 semantic metadata: 由 patch_in 输入维反推 patch volume
+        weight = state.get("patch_in.weight")
+        inferred = weight.shape[1] // model.in_channels if weight is not None and weight.ndim == 2 \
+            and model.in_channels and weight.shape[1] % model.in_channels == 0 else None
+        origin = (f"checkpoint 未记录 patch_size, 由 patch_in 输入维推断 patch volume={inferred} "
+                  f"→ 当前 patch_size={new_ps}")
+    message = (f"🚨 patchify 不兼容: {origin}。\n"
+               f"    patchify 入口/出口层无法继承 (shape 不匹配): {', '.join(dropped)}, "
+               f"共 {sum(state[k].numel() for k in dropped) / 1e6:.2f}M 参数保持重新随机初始化;\n"
+               f"    其余 {len(matched)}/{len(state)} 项参数全部正常继承。\n"
+               f"    patchify 层未经训练 (随机初始化), 推理质量会显著劣化, 属预期现象。")
+    print(f"\033[1;31m{message}\033[0m", flush=True)
+
+
+def load_compatible_state_dict(model, state, metadata=None):
     """只加载名称和 shape 都匹配的参数, 其余忽略 (KD projector 等挂载权重自动过滤); 含 patchify 迁移.
 
     AdaLN 结构自动迁移 (与 infer_giga_exp.py 一致): basis 模型遇旧全秩 ckpt 先低秩转换,
-    dual 模型遇旧 shared ckpt 先拷贝初始化, 否则调制权重随机初始化导致质量静默崩坏."""
+    dual 模型遇旧 shared ckpt 先拷贝初始化, 否则调制权重随机初始化导致质量静默崩坏。
+
+    patchify 兼容 (metadata 为 checkpoint semantic metadata, 可为 None):
+    - ckpt 与模型 patch_size 一致 → 全量继承;
+    - 模型 patchify、ckpt 未 patchify (patch_volume>1) → patch_in/out 权重复制扩展迁移;
+    - ckpt 与模型 patch_size 不兼容 → patchify 入口/出口保持重新随机初始化 (红字警告),
+      其余参数全部正常继承。"""
     current = model.state_dict()
     basis = apply_adaln_basis_migration(current, state)
     if basis["source"] is None:
@@ -168,6 +213,7 @@ def load_compatible_state_dict(model, state):
                 matched[key] = value.repeat(patch_volume, 1)
             elif key == "out.bias" and value.ndim == 1 and current[key].shape == (value.shape[0] * patch_volume,):
                 matched[key] = value.repeat(patch_volume)
+    _report_patchify_reinit(model, state, current, matched, metadata)
     result = model.load_state_dict(matched, strict=False)
     print(f"权重加载: matched={len(matched)}, reinitialized={len(result.missing_keys)}, "
           f"ignored={len(state) - len(matched)} (KD 附加权重: {ignored[:8]}{'...' if len(ignored) > 8 else ''})",
@@ -235,10 +281,13 @@ def main():
     if device.type == "cuda" and not torch.cuda.is_available():
         log_error("需要 CUDA GPU (或用 --device cpu 调试)")
         raise SystemExit(2)
-    if args.height % PIXEL_MULTIPLE or args.width % PIXEL_MULTIPLE:
-        log_error(f"height/width 必须是 {PIXEL_MULTIPLE} 的倍数, 当前 {args.height}x{args.width}")
-        raise SystemExit(2)
     cfg = yaml.safe_load((Path(args.config) if Path(args.config).is_absolute() else ROOT / args.config).read_text())
+    # Wan VAE 空间压缩 16 × 模型空间 patch ⇒ 像素宽高须被 16·max(ph,pw) 整除 (patch 111 → 16)
+    pixel_multiple = 16 * max(int(p) for p in cfg["model"].get("patch_size", [1, 2, 2])[1:])
+    if args.height % pixel_multiple or args.width % pixel_multiple:
+        log_error(f"height/width 必须是 {pixel_multiple} 的倍数 (patch_size={cfg['model'].get('patch_size')}), "
+                  f"当前 {args.height}x{args.width}")
+        raise SystemExit(2)
     prompts = collect_prompts(args)
     checkpoint, step = resolve_checkpoint(args.checkpoint, cfg["output_dir"])
     # 缺省输出: <output_dir>/vis/<ckpt 名>/
@@ -278,7 +327,7 @@ def main():
     model = GigaExpTransformer(**cfg["model"]).to(device, dtype=dtype)
     state = load_file(str(checkpoint)) if checkpoint.suffix == ".safetensors" \
         else torch.load(str(checkpoint), map_location="cpu")
-    load_compatible_state_dict(model, state)
+    load_compatible_state_dict(model, state, _read_weight_metadata(checkpoint))
     log_ok(f"📦 模型就绪: {checkpoint.name} (step {step})")
 
     z_dim = vae.config.z_dim
