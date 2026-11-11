@@ -537,7 +537,9 @@ class ImageDatabaseDataset(Dataset):
 # 旧记录里的 text/edit_prompt/instruction/w_after/h_after/split 仅在构建期
 # (_read_parquet 的 caption 回退/split 过滤/宽高覆写) 被消费, 缓存后全仓库无读取点,
 # 不再存储 (见 _read_parquet 白名单注释)。
-_INDEX_FORMAT_VERSION = 2
+# v3: 新增 kind.npy 行级 uri 后缀列 (0=single, 1=before) — edit 库 t2i_caption
+# 样本以 before 原图作为 image 行入索引, row_dict 重组 image_path 时按 kind 还原后缀。
+_INDEX_FORMAT_VERSION = 3
 
 
 def _madvise_random(arr: np.ndarray) -> np.ndarray:
@@ -568,7 +570,7 @@ class _ColumnarIndex:
     def __init__(self, n_image, n_edit, arrays, sources, stems, source_dirs):
         self.n_image = int(n_image)
         self.n_edit = int(n_edit)
-        (self.sid, self.w, self.h, self.src, self.stem, self.is_edit,
+        (self.sid, self.w, self.h, self.src, self.stem, self.is_edit, self.kind,
          self.cap_off, self.captions, self.meta_off, self.metadata, self.meta_kind) = arrays
         self.sources = list(sources)
         self.stems = list(stems)
@@ -596,6 +598,7 @@ class _ColumnarIndex:
         src = np.empty(n, np.uint16)
         stem_col = np.empty(n, np.uint32)
         is_edit = np.empty(n, bool)
+        kind = np.empty(n, np.uint8)
         cap_off = np.empty(n + 1, np.int64)
         meta_off = np.empty(n + 1, np.int64)
         meta_kind = np.empty(n, np.uint8)
@@ -615,6 +618,7 @@ class _ColumnarIndex:
                 w[pos] = int(width) if width else 0   # 0 = None/缺失, row_dict 时还原
                 h[pos] = int(height) if height else 0
                 is_edit[pos] = edit_row
+                kind[pos] = int(item.get("uri_kind", 0))
                 source = str(item["source"])
                 if source not in source_ids:
                     source_ids[source] = len(sources)
@@ -648,7 +652,7 @@ class _ColumnarIndex:
                 pos += 1
         empty = np.empty(0, np.uint8)
         arrays = (
-            sid, w, h, src, stem_col, is_edit, cap_off,
+            sid, w, h, src, stem_col, is_edit, kind, cap_off,
             np.frombuffer(cap_buf, dtype=np.uint8) if len(cap_buf) else empty,
             meta_off,
             np.frombuffer(meta_buf, dtype=np.uint8) if len(meta_buf) else empty,
@@ -661,6 +665,7 @@ class _ColumnarIndex:
         columns = (
             ("sid.npy", self.sid), ("w.npy", self.w), ("h.npy", self.h),
             ("src.npy", self.src), ("stem.npy", self.stem), ("is_edit.npy", self.is_edit),
+            ("kind.npy", self.kind),
             ("cap_off.npy", self.cap_off), ("meta_off.npy", self.meta_off),
             ("meta_kind.npy", self.meta_kind),
         )
@@ -723,19 +728,22 @@ class _ColumnarIndex:
         src = mmap_npy("src.npy", np.uint16)
         stem_col = mmap_npy("stem.npy", np.uint32)
         is_edit = mmap_npy("is_edit.npy", np.bool_)
+        kind = mmap_npy("kind.npy", np.uint8)
         cap_off = mmap_npy("cap_off.npy", np.int64)
         meta_off = mmap_npy("meta_off.npy", np.int64)
         meta_kind = mmap_npy("meta_kind.npy", np.uint8)
         captions = np.memmap(index_dir / "captions.bin", dtype=np.uint8, mode="r")
         metadata = np.memmap(index_dir / "metadata.bin", dtype=np.uint8, mode="r")
         if (sid.shape[0] != n or w.shape[0] != n or h.shape[0] != n or src.shape[0] != n
-                or stem_col.shape[0] != n or is_edit.shape[0] != n or meta_kind.shape[0] != n
+                or stem_col.shape[0] != n or is_edit.shape[0] != n or kind.shape[0] != n
+                or meta_kind.shape[0] != n
                 or cap_off.shape[0] != n + 1 or meta_off.shape[0] != n + 1
                 or int(cap_off[-1]) > captions.shape[0] or int(meta_off[-1]) > metadata.shape[0]):
             raise ValueError("列式索引各列行数/长度不一致")
         return cls(meta["n_image"], meta["n_edit"],
                    tuple(_madvise_random(a) for a in
-                         (sid, w, h, src, stem_col, is_edit, cap_off, captions, meta_off, metadata, meta_kind)),
+                         (sid, w, h, src, stem_col, is_edit, kind, cap_off, captions,
+                          meta_off, metadata, meta_kind)),
                    meta["sources"], meta["stems"], meta["source_dirs"])
 
     def row_dict(self, i: int, bucket: str | None = None) -> dict[str, Any]:
@@ -745,6 +753,7 @@ class _ColumnarIndex:
         dataset_dir = self.source_dirs[source_id]
         stem = self.stems[int(self.stem[i])]
         edit = bool(self.is_edit[i])
+        kind_code = int(self.kind[i])
         width, height = int(self.w[i]), int(self.h[i])
         cap_start, cap_end = int(self.cap_off[i]), int(self.cap_off[i + 1])
         kind = int(self.meta_kind[i])
@@ -753,11 +762,14 @@ class _ColumnarIndex:
         else:
             meta_bytes = bytes(self.metadata[int(self.meta_off[i]):int(self.meta_off[i + 1])])
             metadata = meta_bytes.decode("utf-8") if kind == 1 else json.loads(meta_bytes)
+        # uri 后缀: edit 行 image=after/input=before; image 行默认 single,
+        # kind=1 (t2i_caption 样本) 指向 before 原图
+        uri_kind = "after" if edit else ("before" if kind_code == 1 else "single")
         item = {
             "sample_id": sample_id,
             "source": self.sources[source_id],
             "is_edit": edit,
-            "image_path": f"lmdb://{dataset_dir}/{stem}/{sample_id}:{'after' if edit else 'single'}",
+            "image_path": f"lmdb://{dataset_dir}/{stem}/{sample_id}:{uri_kind}",
             "caption": bytes(self.captions[cap_start:cap_end]).decode("utf-8"),
             "width": width or None,
             "height": height or None,
@@ -809,7 +821,8 @@ class _KeptRecordView:
 
 
 class LmdbParquetDataset(ImageDatabaseDataset):
-    INDEX_CACHE_VERSION = 2  # 索引缓存格式版本，记录结构变化时递增使旧缓存失效
+    # v3: kind 列 (t2i_caption 行) + t2i_edit_sources_t2i_mode 配置进指纹
+    INDEX_CACHE_VERSION = 3
 
     def __init__(self, database_path: str, buckets: list[str], lmdb_root: str | None = None,
                  image_root: str | None = None, transform=None, max_upscale_ratio: float = 1.2,
@@ -820,7 +833,9 @@ class LmdbParquetDataset(ImageDatabaseDataset):
                  image_training_enabled: bool = True, edit_training_enabled: bool = False,
                  index_cache_dir: str | None = None, refresh_index_cache: bool = False,
                  bucket_sampling_weights: dict | None = None, max_decode_candidates: int = 3,
-                 preprocess_style: str = "cover", **kwargs):
+                 preprocess_style: str = "cover",
+                 t2i_edit_database_path: str | None = None, t2i_edit_sources_t2i_mode: list[str] | None = None,
+                 **kwargs):
         self.database_path = str(database_path)
         self.image_root = Path(image_root) if image_root else None
         self.transform = transform
@@ -828,6 +843,12 @@ class LmdbParquetDataset(ImageDatabaseDataset):
         self.edit_lmdb_root = str(kwargs.get("edit_lmdb_root") or lmdb_root or self.lmdb_root)
         self.sources = {str(value) for value in (sources or [])}
         self.edit_sources = {str(value) for value in (edit_sources or [])}
+        # t2i_caption 编辑库: 以 before 原图 + Qwen3-VL 描述 caption 作为普通 image 样本
+        # (读 <edit_root>/<source>/parquet_t2i/, 仅支持单图对源; 多参考图源自动跳过)
+        self.t2i_edit_database_path = str(t2i_edit_database_path) if t2i_edit_database_path else None
+        self.t2i_edit_sources_t2i_mode = {str(value) for value in (t2i_edit_sources_t2i_mode or [])}
+        if self.t2i_edit_sources_t2i_mode and not self.t2i_edit_database_path:
+            raise ValueError("配置 t2i_edit_sources_t2i_mode 时必须同时配置 t2i_edit_database_path")
         self.edit_split, self.edit_ratio = edit_split, edit_ratio
         self.max_retries, self.seed = max(1, int(max_retries)), int(seed)
         self.max_decode_candidates = max(1, int(max_decode_candidates))
@@ -1072,7 +1093,8 @@ class LmdbParquetDataset(ImageDatabaseDataset):
             return [item for item in (root / source for source in sorted(sources)) if item.is_dir()]
         return sorted(item for item in root.iterdir() if item.is_dir())
 
-    def _shard_signature(self, edit_database_path: str | None) -> dict[str, list[int]]:
+    def _shard_signature(self, edit_database_path: str | None,
+                         t2i_database_path: str | None = None) -> dict[str, list[int]]:
         """每个 source 的 (parquet分片数, mdb分片数)。
 
         作用：数据集在后台持续构建（如 monet）时，分片数变化会使指纹失效并触发重建，
@@ -1085,6 +1107,8 @@ class LmdbParquetDataset(ImageDatabaseDataset):
         roots = [("image", Path(self.database_path), self.sources)]
         if edit_database_path:
             roots.append(("edit", Path(edit_database_path), self.edit_sources))
+        if t2i_database_path:
+            roots.append(("t2i", Path(t2i_database_path), self.t2i_edit_sources_t2i_mode))
         ttl = float(os.environ.get("GWP_SHARD_SIGNATURE_TTL", 300))
         self.index_cache_dir.mkdir(parents=True, exist_ok=True)
         for label, root, sources in roots:
@@ -1095,8 +1119,9 @@ class LmdbParquetDataset(ImageDatabaseDataset):
                     signature[name] = snapshot[name]
                     continue
                 try:
+                    pq_subdir = "parquet_t2i" if label == "t2i" else "parquet"
                     parquet_count = sum(
-                        1 for entry in os.listdir(source_dir / "parquet")
+                        1 for entry in os.listdir(source_dir / pq_subdir)
                         if entry.startswith("meta_") and entry.endswith(".parquet")
                     )
                     mdb_count = sum(
@@ -1142,6 +1167,7 @@ class LmdbParquetDataset(ImageDatabaseDataset):
                            max_samples, max_edit_samples, edit_database_path) -> str:
         """yaml dataset 中影响加载行的配置 + 底层分片计数的 sha256 指纹。"""
         import hashlib
+        t2i_active = bool(image_enabled and self.t2i_edit_database_path and self.t2i_edit_sources_t2i_mode)
         spec = {
             "version": self.INDEX_CACHE_VERSION,
             "database_path": str(self.database_path),
@@ -1155,7 +1181,12 @@ class LmdbParquetDataset(ImageDatabaseDataset):
             "edit_lmdb_root": str(self.edit_lmdb_root),
             "edit_enabled": bool(edit_enabled),
             "max_edit_samples": None if max_edit_samples is None else int(max_edit_samples),
-            "shards": self._shard_signature(edit_database_path if edit_enabled else None),
+            "t2i_database_path": str(self.t2i_edit_database_path or ""),
+            "t2i_sources": sorted(self.t2i_edit_sources_t2i_mode) if t2i_active else [],
+            "shards": self._shard_signature(
+                edit_database_path if edit_enabled else None,
+                self.t2i_edit_database_path if t2i_active else None,
+            ),
         }
         blob = json.dumps(spec, sort_keys=True, ensure_ascii=False)
         return hashlib.sha256(blob.encode()).hexdigest()
@@ -1288,6 +1319,12 @@ class LmdbParquetDataset(ImageDatabaseDataset):
         def _read_all():
             rows = (self._read_parquet(self.database_path, self.sources, False,
                                        self.lmdb_root, max_samples) if image_enabled else [])
+            # t2i_caption 编辑库: before 原图 + 描述 caption 追加为普通 image 行
+            if image_enabled and self.t2i_edit_database_path and self.t2i_edit_sources_t2i_mode:
+                t2i_rows = self._read_parquet(
+                    self.t2i_edit_database_path, self.t2i_edit_sources_t2i_mode, False,
+                    self.t2i_edit_database_path, None, t2i=True)
+                rows = rows + t2i_rows
             edit_rows = (self._read_parquet(edit_database_path, self.edit_sources, True,
                                             self.edit_lmdb_root, max_edit_samples) if edit_enabled else [])
             return rows, edit_rows
@@ -1471,15 +1508,21 @@ class LmdbParquetDataset(ImageDatabaseDataset):
         ranges.sort()
         return ranges
 
-    def _read_parquet(self, path, sources, is_edit, lmdb_root, limit=None):
+    def _read_parquet(self, path, sources, is_edit, lmdb_root, limit=None, t2i: bool = False):
+        """扫描 parquet 元数据构建行记录。
+
+        t2i=True: 读 edit 库各 source 的 parquet_t2i/ (原 parquet + t2i_caption 列合并产物),
+        以 before 原图 (mdb img_before) + 描述 caption 生成普通 image 行 (uri_kind=1)。
+        多参考图源 (t2i_caption 为 list) 与空 caption (打标失败) 行跳过。"""
         import pyarrow.parquet as parquet
         import pyarrow.compute as pc
+        pq_subdir = "parquet_t2i" if t2i else "parquet"
         root = Path(path)
         if root.is_file():
             files = [(root, root.parent.parent)]
         else:
             # 支持 unified_*_lmdb 根目录和单个 source 目录两种配置。
-            if (root / "parquet").is_dir():
+            if (root / pq_subdir).is_dir():
                 source_dirs = [root]
             else:
                 source_dirs = [root / source for source in sorted(sources)] if sources else sorted(
@@ -1489,10 +1532,10 @@ class LmdbParquetDataset(ImageDatabaseDataset):
             for source_dir in source_dirs:
                 if not source_dir.is_dir():
                     continue
-                shard_parquets = sorted((source_dir / "parquet").glob("meta_*.parquet"))
+                shard_parquets = sorted((source_dir / pq_subdir).glob("meta_*.parquet"))
                 if shard_parquets:
                     files.extend((file, source_dir) for file in shard_parquets)
-                elif (source_dir / "mdb").is_dir() and \
+                elif not t2i and (source_dir / "mdb").is_dir() and \
                         (source_dir / "parquet" / "meta.parquet").exists():
                     # BOS 上传形态: 单个合并 meta.parquet + 多个 mdb 分片
                     files.append((source_dir / "parquet" / "meta.parquet", source_dir))
@@ -1525,6 +1568,17 @@ class LmdbParquetDataset(ImageDatabaseDataset):
             # 白名单复制: 只保留训练读取路径实际访问的列。parquet 里 url/
             # aesthetic/水印等几十个分析列不进索引缓存（曾致缓存 29GB、
             # 每 rank 反序列化 10 分钟）。
+            if t2i:
+                # t2i 行: before 原图 + Qwen3-VL 描述 caption (宽高取 w_before/h_before)。
+                # 多参考图源 t2i_caption 是 list[str] → 非 str 视为无效; 空 caption 同样跳过。
+                cap = row.get("t2i_caption")
+                if not isinstance(cap, str) or not cap.strip():
+                    return None
+                item = {"caption": cap, "width": row.get("w_before"), "height": row.get("h_before")}
+                item.update(sample_id=sid, source=source, is_edit=False)
+                item["image_path"] = f"lmdb://{dataset_dir}/{stem}/{sid}:before"
+                item["uri_kind"] = 1   # 行级 uri 后缀: 0=single, 1=before (列式索引 kind 列)
+                return item
             item = {
                 key: row[key]
                 for key in ("caption", "text", "edit_prompt", "instruction", "width", "height",
@@ -1547,7 +1601,7 @@ class LmdbParquetDataset(ImageDatabaseDataset):
 
         for file, source_dir in file_iterator:
             if source_dir not in source_shards:
-                parquet_files = sorted((source_dir / "parquet").glob("meta_*.parquet"))
+                parquet_files = sorted((source_dir / pq_subdir).glob("meta_*.parquet"))
                 mdb_files = sorted((source_dir / "mdb").glob("*.mdb"))
                 if not mdb_files:
                     continue
@@ -1577,6 +1631,9 @@ class LmdbParquetDataset(ImageDatabaseDataset):
                 continue
             if limit is not None and source_counts.get(source, 0) >= int(limit):
                 continue
+            if t2i and isinstance(shard_info, dict) and "merged" in shard_info:
+                print(f"⚠️ {source}: parquet_t2i 无分片 (BOS 合并形态不支持 t2i), 已跳过该源", flush=True)
+                continue
             source_stats = stats.setdefault(source, {
                 "shards": 0, "total": 0, "valid": 0,
                 "filtered_split": 0, "filtered_no_id": 0, "limit_stopped": False,
@@ -1597,7 +1654,11 @@ class LmdbParquetDataset(ImageDatabaseDataset):
                             break
                         source_stats["total"] += 1
                         sid = int(row.get(sid_col))
-                        rows.append(_item_from_row(row, sid, stem, source, is_edit, dataset_dir))
+                        item = _item_from_row(row, sid, stem, source, is_edit, dataset_dir)
+                        if item is None:
+                            source_stats["filtered_no_caption"] += 1
+                            continue
+                        rows.append(item)
                         source_counts[source] = source_counts.get(source, 0) + 1
                         source_stats["valid"] += 1
                 continue
@@ -1627,18 +1688,26 @@ class LmdbParquetDataset(ImageDatabaseDataset):
                 sid = int(sid)
                 # URI 必须指向实际包含 mdb/ 的 source 目录；lmdb_root 用于
                 # database_path 是 parquet 路径、但载荷位于另一根目录的情况。
-                rows.append(_item_from_row(row, sid, stem, source, is_edit, dataset_dir))
+                item = _item_from_row(row, sid, stem, source, is_edit, dataset_dir)
+                if item is None:
+                    source_stats["filtered_no_caption"] += 1
+                    continue
+                rows.append(item)
                 source_counts[source] = source_counts.get(source, 0) + 1
                 source_stats["valid"] += 1
         if not rows:
             raise RuntimeError(f"Parquet 数据没有可用样本: {path}")
-        self.read_stats[mode] = stats
+        if t2i:
+            # t2i 行并入 image 模式统计 (普通 image 读取已写过该 key, 不能覆盖)
+            self.read_stats.setdefault("image", {}).update(stats)
+        else:
+            self.read_stats[mode] = stats
         if excluded_sources:
             self.read_stats[f"{mode}_excluded"] = excluded_sources
         grand = {key: sum(int(info.get(key, 0)) for info in stats.values())
                  for key in ("shards", "total", "valid")}
         print(
-            f"✅ parquet 读取完成[{mode}]: sources={len(stats)} 分片={grand['shards']:,} "
+            f"✅ parquet 读取完成[{'t2i' if t2i else mode}]: sources={len(stats)} 分片={grand['shards']:,} "
             f"总数={grand['total']:,} 有效={grand['valid']:,} "
             f"过滤={grand['total'] - grand['valid']:,} ({time.time() - t0:.1f}s)"
             + (f" 未加载目录={excluded_sources}" if excluded_sources else ""),

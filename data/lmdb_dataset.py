@@ -24,6 +24,8 @@ class GigaLMDBDataset(LmdbParquetDataset):
             lmdb_root=cfg.get("lmdb_root"),
             image_root=cfg.get("image_root"),
             sources=cfg.get("image_sources"),
+            t2i_edit_database_path=cfg.get("t2i_edit_database_path"),
+            t2i_edit_sources_t2i_mode=cfg.get("t2i_edit_sources_t2i_mode"),
             image_training_enabled=True,
             edit_training_enabled=False,
             edit_ratio=0.0,

@@ -106,6 +106,39 @@ dataset:
     # 估算总量 ~190 万; pixelprose 需关注与已有 pixelprose_* 子集的重复, imagenet_1k
     # 2026-11-06 新增: moss_synth_sa1b_10h 合并入库 (56GB, 152 分片, SA-1B 合成图 1024px)
     - moss_synth_sa1b_10h
+    # 2026-11-11 新增: 分片校验通过 (mdb==parquet: FLUX 1180/1180, JourneyDB 200/200),
+    # mdb 记录含 img_bytes (single 通路), 抽样解码正常。
+    # FLUX-Reason-6M: 5,890,279 行 1024px, 长描述 caption (caption/caption_cn/caption_full)
+    # JourneyDB: ~419 万行 Midjourney 图 1024px (caption 描述 + caption_full 标签串)
+    - FLUX-Reason-6M
+    - JourneyDB
+    # 2026-11-11 新增: moss/h3image 合成源入库, 分片校验通过 (mdb==parquet), caption 无空值。
+    # moss_synth: 4/4 片 512 行; moss_synth_eval100k: 100/100 片 100,000 行 (均 1024px)。
+    # h3image_synth_webcap_10h: 由 pfs_data/h3image_synth_webcap_10h 校验后 mv 入库,
+    # 180/180 片 33,928 行, 1024x{576,768,1024} 短边>=576 全过 512 桶;
+    # mdb 记录 pickle dict (id/source/caption/w/h/img_bytes/source_dataset), 抽样 PNG 解码正常。
+    # 注: moss_synth_eval100k_v2 未加入 -- BOS 端即缺 9 个 mdb 分片 (parquet 52/mdb 43),
+    # 需从 dg5090 补传后校验再启用。
+    - moss_synth
+    - moss_synth_eval100k
+    - h3image_synth_webcap_10h
+    # 2026-11-11 新增: moss_synth_300k_48h 从 BOS 同步入库 (148GB), 校验通过:
+    # 1012 文件与 BOS 逐字节大小一致 (缺失0/不一致0), mdb==parquet 506/506 分片 ID 全匹配;
+    # 506,000 行全部 1024x1024, caption 无空值, mdb 记录 pickle dict 抽样 JPEG 解码正常。
+    - moss_synth_300k_48h
+  # 2026-11-11 新增: edit 库 7 个单图对源的 Qwen3-VL 描述 caption (t2i_caption, 非编辑指令)
+  # 以 before 原图 + 描述 caption 作为普通 image 样本参与 t2i 训练 (~741 万行, caption 无空值);
+  # 读 <root>/<source>/parquet_t2i/, 多参考图源 (unipic_*/Macro-Dataset) 不支持自动跳过。
+  # 注意: 新增数据源会改变索引指纹, 首次启动会重建一次索引缓存 (rank0 扫描, 其余 rank 等待)。
+  t2i_edit_database_path: /home/jovyan/pfs/users/zhanqian.wu/pfs_data/unified_edit_images_lmdb
+  t2i_edit_sources_t2i_mode:
+    - HQ-Edit
+    - GPT-UltraEdit
+    - GPT-HQEdit
+    - pico-banana-400k
+    - GPT-OmniEdit
+    - CrispEdit
+    - SEED-Data-Edit
   contract: "[B,C,T,H,W]"
   num_frames: 1
   preprocess_style: cover   # 短边贴桶+中心裁剪, 无黑边 (实测 resize_long_edge 加权后 37% 样本补黑 >1%)
