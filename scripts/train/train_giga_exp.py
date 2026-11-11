@@ -36,7 +36,8 @@ from transformers import AutoModel, AutoTokenizer
 from data.lmdb_dataset import GigaLMDBDataset, collate_image_batch
 from data.samplers.bucket_sampler import BucketBatchSampler
 from models.giga_transformer import (GigaExpTransformer, apply_adaln_basis_migration,
-                                     apply_mod_adaln_migration)
+                                     apply_mod_adaln_migration, load_compatible_state_dict)
+from models.moe import apply_dense_to_moe_migration
 import models.giga_transformer as _giga_transformer
 
 
@@ -422,6 +423,21 @@ def _report_text_trans_reinit(model, state, logger=None):
     print(f"\033[1;33m{message}\033[0m", flush=True)
 
 
+def _report_moe_dense_upcycle(migration, logger=None):
+    """dense→MoE 热启动迁移播报 (rank0): dense FFN 拷贝到全部 experts (强制均衡初始化)。"""
+    if _dist_rank() != 0:
+        return
+    logger = logger or logging.getLogger("giga_exp")
+    if not migration.get("model_moe") or migration.get("already_moe"):
+        return
+    if migration["upcycled"]:
+        message = (f"⚠️ moe-upcycle: dense ckpt 的每层 FFN 已拷贝到全部 experts "
+                   f"(强制均衡初始化, {len(migration['upcycled'])} 层); router gate 保持随机初始化, "
+                   f"RoutingSchedule phase A 强制均衡路由启动, 各 expert 均匀分化")
+        logger.warning(message)
+        print(f"\033[1;33m{message}\033[0m", flush=True)
+
+
 def _report_adaln_basis_migration(migration, logger=None):
     """basis (r=64 共享基) 迁移结果播报 (rank0): 低秩转换 / 已是 basis / 非 basis 模型回退。"""
     if _dist_rank() != 0:
@@ -493,6 +509,7 @@ def load_compatible_state_dict(model, state, metadata=None):
     else:
         _report_adaln_basis_migration(basis)
     _report_text_trans_reinit(model, state)
+    _report_moe_dense_upcycle(apply_dense_to_moe_migration(current, state))
     matched = {key: value for key, value in state.items()
                if key in current and current[key].shape == value.shape}
     patch_volume = math.prod(model.patch_size)
@@ -633,7 +650,19 @@ def run_next_batch_validation(engine, vae, tokenizer, text_encoder, device, dtyp
     def shift_sigma(u):
         return shift * u / (1.0 + (shift - 1.0) * u)
 
+    # MoE 统计收集 (full 档: 模态/去噪步用量/routing stability/expert RMS 全量指标, validation 出图用)
+    module = engine.module
+    collector = None
+    moe_metrics_cfg = cfg.get("moe_metrics", {}) or {}
+    if getattr(module, "moe_cfg", None) and moe_metrics_cfg.get("enabled", True):
+        from models.moe_stats import MoEStatsCollector
+        collector = MoEStatsCollector(mode=str(moe_metrics_cfg.get("validation_mode", "full")),
+                                      top_k=int(module.moe_cfg.get("top_k", 2)),
+                                      dead_expert_threshold=float(moe_metrics_cfg.get("dead_expert_threshold", 0.0)))
+        module.set_moe_metrics_collector(collector)
+
     engine.eval()
+    ode_error = None
     try:
         # 验证 batch 形状与训练不同, 会触发 Inductor 重编译; 其异步编译子进程一旦死亡,
         # 主进程会永久等待 (无任何报错, NCCL watchdog 也不管) —— 21:59 卡死即此因。
@@ -642,6 +671,9 @@ def run_next_batch_validation(engine, vae, tokenizer, text_encoder, device, dtyp
         # 把 engine 包成禁编译版本, ODE 循环全程 eager。
         eager_engine = torch.compiler.disable(engine)
         for i in range(num_steps):  # σ: 1(噪声) → 0(数据), v = noise - data
+            if collector is not None:
+                # ODE 步序号 (0..N-1): collector 用它统计去噪步用量 + 相邻步 routing stability
+                module.set_moe_denoising_step(i)
             sigma = shift_sigma(1.0 - i / num_steps)
             next_sigma = shift_sigma(1.0 - (i + 1) / num_steps)
             model_input = x.to(dtype)
@@ -656,8 +688,39 @@ def run_next_batch_validation(engine, vae, tokenizer, text_encoder, device, dtyp
             guidance_scale = float(val_cfg.get("guidance_scale", 3.0))
             v = v_uncond + guidance_scale * (v_cond - v_uncond)
             x = x - v * (sigma - next_sigma)
+    except Exception as exc:
+        # 捕获而非直接抛出: reduce_collector 是集合通信, 所有 rank 必须到达, 否则死锁;
+        # 统计汇总完再原样抛出 (调用方按既有逻辑跳过本步验证)
+        ode_error = exc
+        logger.warning("⚠️ step=%d rank=%d ODE 推理异常 (MoE 统计汇总后再抛出): %s", step, rank, repr(exc))
     finally:
         engine.train()
+        module.set_moe_metrics_collector(None)
+        module.set_moe_denoising_step(None)
+
+    if collector is not None:
+        try:
+            from models.moe_stats import reduce_collector
+            # ZeRO-1 数据并行: 各 rank 看到不同 token, WORLD 组求和后再算比率
+            reduce_collector(collector)
+            if rank == 0:
+                summary = collector.summary()
+                summary["step"] = step
+                moe_dir = output_dir / "validation" / f"step-{step:08d}" / "moe_metrics"
+                moe_dir.mkdir(parents=True, exist_ok=True)
+                (moe_dir / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2))
+                from models.moe_visualization import plot_all, plot_checkpoint_trends
+                plot_all(summary, moe_dir)
+                plot_checkpoint_trends(output_dir / "validation", moe_dir / "checkpoint_trends")
+                logger.info("📊 step=%d MoE validation 图表 → %s", step, moe_dir)
+                if swanlab_run:
+                    payload = {f"val_moe/{png.stem}": swanlab.Image(str(png)) for png in sorted(moe_dir.glob("*.png"))}
+                    if payload:
+                        swanlab.log(payload, step=step)
+        except Exception as exc:
+            logger.warning("⚠️ step=%d MoE 统计/绘图失败 (训练继续): %s", step, repr(exc))
+    if ode_error is not None:
+        raise ode_error
     gen = vae.decode(x / std_inv + mean).sample
 
     def to_uint8(t):  # [C,T,H,W] → HWC uint8
@@ -737,6 +800,11 @@ def print_banner(cfg, rank):
     else:
         tt_desc = "off (文本 token 直进主 DiT)"
     print(f"✍️  Text Refiner(text_trans): {tt_desc}", flush=True)
+    moe_desc = model.get("moe")
+    if moe_desc:
+        print(f"🧩 MoE FFN: experts={moe_desc.get('num_experts', 4)} top-k={moe_desc.get('top_k', 2)} (每 expert ffn_dim={model['ffn_dim']}) | "
+              f"router fp32 | phase A 强制均衡 0~{moe_desc.get('phase_a_steps', 500)} → B 渐进 →{moe_desc.get('phase_b_end_step', 2000)} | "
+              f"load_balance={moe_desc.get('load_balancing_weight', 0.01)} z_loss={moe_desc.get('router_z_loss_weight', 0.001)}", flush=True)
     print(f"⚡ 加速: torch.compile={'ON (dynamic)' if cfg['training'].get('torch_compile') else 'off'} | FA3={'READY (varlen 支持右 padding)' if _giga_transformer._FA3 else 'MISSING (SDPA 回退)'}", flush=True)
     print(f"🌀 RoPE: axes(t/h/w)={model['rope_axes_dims']} theta={model['rope_theta']} — time axis retained for video", flush=True)
     print(f"📝 Text encoder: {cfg['components']['text_encoder']['pretrained_path']}", flush=True)
@@ -781,6 +849,11 @@ def main():
     text_encoder = build_text_encoder(tc, dtype, device)
     vae = AutoencoderKLWan.from_pretrained(dc["pretrained_path"], subfolder=dc.get("subfolder", "vae"), torch_dtype=torch.float32, local_files_only=True).eval().to(device)
     model = GigaExpTransformer(**cfg["model"]).to(device, dtype=dtype)
+    if getattr(model, "has_moe", False):
+        # router 要求全 fp32: .to(bf16) 会把 gate 一并降精度, 这里回浮 (权重常驻 fp32)
+        model.cast_router_fp32()
+        if rank == 0:
+            logger.info("MoE router gate 已回浮 fp32 (模型其余参数 bf16)")
     if cfg["training"].get("torch_compile"):
         # nn.Module.compile 就地编译: 参数名/state_dict 结构不变, 与 DeepSpeed/优化器分组/断点恢复兼容。
         # 注意: 此处不能写 "import torch._dynamo" —— 函数内 import torch.* 会把 torch 绑定为 main 的局部变量,
@@ -973,10 +1046,14 @@ def main():
         step += 1
         micro_losses = []
         micro_sigmas = []
+        micro_moe_aux = []
         micro_bucket_sums = torch.zeros(SIGMA_BUCKETS, device=device)
         micro_bucket_counts = torch.zeros(SIGMA_BUCKETS, device=device)
         last_captions = None
         lr_now = set_lr(client_optimizer, ds_optimizer, step, cfg["training"])
+        if getattr(engine.module, "has_moe", False):
+            # 同步 RoutingSchedule (A 强制均衡 → B 渐进混入 → C 学习路由)
+            engine.module.set_moe_routing_step(step)
         for micro_idx in range(grad_accum):
             bad_local = 0
             try:
@@ -1036,6 +1113,13 @@ def main():
             diff_sq = (pred.float() - (noise - latents).float()).square()
             # DeepSpeed 会在 gradient_accumulation_steps > 1 时自动缩放 backward loss；这里不要再次除以 grad_accum。
             loss = diff_sq.mean()
+            # MoE router aux loss (load_balance/z_loss 等, 各层权重已在 MoEFFN 内乘好):
+            # 加入总 loss 一起 backward, aux 权重相对主 loss 很小 (~1e-2 量级), 不影响主任务收敛
+            moe_aux_list = getattr(engine.module, "moe_aux_losses", None)
+            if moe_aux_list:
+                moe_aux_total = torch.stack(moe_aux_list).mean()
+                loss = loss + moe_aux_total
+                micro_moe_aux.append(moe_aux_total.detach())
             per_sample_loss = diff_sq.flatten(1).mean(1)
             engine.backward(loss)
             micro_losses.append(diff_sq.mean().detach())
@@ -1059,6 +1143,15 @@ def main():
             logger.info("rank=%d step=%d loss=%.6f data=%s lr=%.3e time=%s sigma_mean=%.5f", rank, step, loss_value, data_hash, lr_now, time.strftime("%H:%M:%S"), sigma_mean)
             if rank == 0 and (wandb_run or swanlab_run):
                 payload = {"train/loss": loss_value, "train/lr": lr_now, "train/sigma_mean": sigma_mean, "train/samples": step * grad_accum * cfg['training']['batch_size_per_device'] * dist.get_world_size()}
+                # MoE router aux (只记本 rank 均值; 跨 rank 一致性靠 validation collector 全量统计)
+                if micro_moe_aux:
+                    payload["train/moe/aux_loss"] = torch.stack(micro_moe_aux).mean().item()
+                    comps = {}
+                    for block in engine.module.blocks:
+                        for key, value in (getattr(block.ff, "last_auxiliary_components", None) or {}).items():
+                            comps[key] = comps.get(key, 0.0) + float(value)
+                    for key, value in comps.items():
+                        payload[f"train/moe/aux_{key}"] = value / len(engine.module.blocks)
                 for i in range(SIGMA_BUCKETS):
                     if stats[1, i] <= 0:
                         continue

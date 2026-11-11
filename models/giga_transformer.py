@@ -5,6 +5,8 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
+from .moe import MoEFFN
+
 try:  # FA3 (FlashAttention 3), copied under model_exp/thirdparty
     from flash_attn_interface import flash_attn_func as _fa3_func
     from flash_attn_interface import flash_attn_varlen_func as _fa3_varlen
@@ -235,7 +237,7 @@ class TextRefiner(nn.Module):
 
 
 class GigaBlock(nn.Module):
-    def __init__(self, dim, heads, ffn_dim, mod_adaln=False, adaln_rank=None):
+    def __init__(self, dim, heads, ffn_dim, mod_adaln=False, adaln_rank=None, moe=None):
         super().__init__()
         self.heads = heads
         self.mod_adaln = bool(mod_adaln)
@@ -247,7 +249,11 @@ class GigaBlock(nn.Module):
         self.q_norm = RMSNorm(head_dim)
         self.k_norm = RMSNorm(head_dim)
         self.out = nn.Linear(dim, dim, bias=False)
-        self.ff = nn.Sequential(nn.Linear(dim, ffn_dim, bias=False), nn.SiLU(), nn.Linear(ffn_dim, dim, bias=False))
+        # moe 非 None 时用 top-2 MoE FFN 替换 dense FFN (结构见 models/moe.py);
+        # aux loss 暂存 self.last_moe_aux, 由 GigaExpTransformer.forward 收集进 moe_aux_losses
+        self.ff = (MoEFFN(dim, ffn_dim, **moe) if moe is not None
+                   else nn.Sequential(nn.Linear(dim, ffn_dim, bias=False), nn.SiLU(), nn.Linear(ffn_dim, dim, bias=False)))
+        self.last_moe_aux = None
         if self.mod_adaln:
             # dual-branch AdaLN (MiniMax H3 风格): image token 用 mod_img, text token 用 mod_txt。
             # 旧 ckpt 恢复时由 apply_mod_adaln_migration 把旧 mod.* 拷贝初始化到两分支
@@ -304,20 +310,40 @@ class GigaBlock(nn.Module):
             a = F.scaled_dot_product_attention(q, k, v, attn_mask=attention_mask).transpose(1, 2).reshape(b, n, -1)
         return a
 
-    def forward(self, x, cond, cos, sin, attention_mask=None, pack=None, n_img=None):
+    def forward(self, x, cond, cos, sin, attention_mask=None, pack=None, n_img=None, denoising_step=None):
         if self.mod_adaln:
             if n_img is None or not 0 < n_img < x.shape[1]:
                 raise ValueError(f"mod_adaln 需要 0 < n_img < seq_len, got n_img={n_img}, seq_len={x.shape[1]}")
-            return self._forward_dual(x, cond, cos, sin, attention_mask, pack, n_img)
+            return self._forward_dual(x, cond, cos, sin, attention_mask, pack, n_img, denoising_step)
         # shared AdaLN 路径 (与原实现逐行等价)
         shift_a, scale_a, gate_a, shift_f, scale_f, gate_f = self.mod(cond).chunk(6, -1)
         y = self.norm1(x) * (1 + scale_a[:, None]) + shift_a[:, None]
         x = x + self.out(self._attend(y, cos, sin, attention_mask, pack)) * gate_a[:, None]
         y = self.norm2(x) * (1 + scale_f[:, None]) + shift_f[:, None]
-        return x + self.ff(y) * gate_f[:, None]
+        return x + self._ff(y, attention_mask, n_img, denoising_step, gate_f[:, None]) * gate_f[:, None]
 
-    def _forward_dual(self, x, cond, cos, sin, attention_mask, pack, n_img):
+    def _ff(self, y, attention_mask, n_img=None, denoising_step=None, gate=None):
+        """FFN 分派: dense 直通; MoE 需 valid mask/模态/去噪步做统计, aux 暂存 last_moe_aux。"""
+        if not isinstance(self.ff, MoEFFN):
+            self.last_moe_aux = None
+            return self.ff(y)
+        # valid mask: [B,1,1,S] bool → flatten; 模态 0=image / 1=text (与 moe_stats 对齐)
+        f, aux = self.ff(y, valid_mask=attention_mask, modality=self._modality_tags(y.shape[1], n_img, gate),
+                         denoising_step=denoising_step, residual_gate=gate)
+        self.last_moe_aux = aux
+        return f
+
+    def _modality_tags(self, n_total, n_img, gate):
+        if n_img is None:
+            return None
+        # [B,S] 展平序: 每个样本都是 image 前缀 + text 后缀, 按 batch 平铺
+        tags = torch.cat((torch.zeros(n_img, dtype=torch.long, device=gate.device),
+                          torch.ones(n_total - n_img, dtype=torch.long, device=gate.device)))
+        return tags.repeat(gate.shape[0])
+
+    def _forward_dual(self, x, cond, cos, sin, attention_mask, pack, n_img, denoising_step=None):
         """dual-branch AdaLN: image 前缀用 mod_img, text 后缀用 mod_txt, 两分支梯度独立。"""
+        b = x.shape[0]
         sa_i, sca_i, ga_i, sf_i, scf_i, gf_i = self.mod_img(cond).chunk(6, -1)
         sa_t, sca_t, ga_t, sf_t, scf_t, gf_t = self.mod_txt(cond).chunk(6, -1)
         img, txt = x[:, :n_img], x[:, n_img:]
@@ -329,7 +355,11 @@ class GigaBlock(nn.Module):
         img, txt = x[:, :n_img], x[:, n_img:]
         y = torch.cat((self.norm2(img) * (1 + scf_i[:, None]) + sf_i[:, None],
                        self.norm2(txt) * (1 + scf_t[:, None]) + sf_t[:, None]), 1)
-        f = self.ff(y)
+        # per-token AdaLN gate 向量 (image 段 gf_i, text 段 gf_t), 供 MoE 统计/gating
+        gate = torch.cat((gf_i[:, None, :].expand(b, n_img, -1),
+                          gf_t[:, None, :].expand(b, x.shape[1] - n_img, -1)), 1) \
+            if isinstance(self.ff, MoEFFN) else None
+        f = self._ff(y, attention_mask, n_img, denoising_step, gate)
         return torch.cat((img + f[:, :n_img] * gf_i[:, None],
                           txt + f[:, n_img:] * gf_t[:, None]), 1)
 
@@ -339,7 +369,7 @@ class GigaExpTransformer(nn.Module):
     def __init__(self, in_channels=48, out_channels=48, text_dim=4096, dim=1792,
                  ffn_dim=4864, heads=14, layers=24, rope_theta=10000.0,
                  rope_axes_dims=(32, 32, 32, 32), patch_size=(1, 1, 1), mod_adaln=False,
-                 text_trans=False, adaln_type=None, adaln_rank=64):
+                 text_trans=False, adaln_type=None, adaln_rank=64, moe=None):
         super().__init__()
         self.patch_size = tuple(patch_size)
         if len(self.patch_size) != 3 or self.patch_size[0] != 1 or any(p < 1 for p in self.patch_size):
@@ -380,11 +410,49 @@ class GigaExpTransformer(nn.Module):
         self.text_in = nn.Linear(text_dim, dim)
         self.time_in = nn.Sequential(nn.Linear(256, dim), nn.SiLU(), nn.Linear(dim, dim))
         self.rope = SpacetimeRoPE(dim // heads, rope_theta, rope_axes_dims)
+        # MoE FFN (models/moe.py): None=dense; dict 直接传给 MoEFFN (num_experts/top_k/调度/aux 权重)
+        self.moe_cfg = dict(moe) if moe else None
+        self.moe_routing_step = 0
+        self._moe_denoising_step = None
+        self._moe_stats_collector = None
+        self.moe_aux_losses = []
         self.blocks = nn.ModuleList([GigaBlock(dim, heads, ffn_dim, mod_adaln=self.mod_adaln,
-                                               adaln_rank=self.adaln_rank)
+                                               adaln_rank=self.adaln_rank, moe=self.moe_cfg)
                                      for _ in range(layers)])
+        # MoE 统计收集器按层命名 (纯数字, moe_visualization 按数值排序画 per-layer 曲线)
+        for idx, block in enumerate(self.blocks):
+            if isinstance(block.ff, MoEFFN):
+                block.ff._stats_layer = str(idx)
         self.norm = RMSNorm(dim)
         self.out = nn.Linear(dim, out_channels * patch_volume)
+
+    def set_moe_routing_step(self, step: int):
+        """同步 RoutingSchedule 步数 (A 强制均衡 → B 渐进 → C 学习), 训练循环每 step 调用。"""
+        self.moe_routing_step = int(step)
+        for block in self.blocks:
+            if isinstance(block.ff, MoEFFN):
+                block.ff.set_routing_step(step)
+
+    def set_moe_denoising_step(self, value):
+        """validation ODE 步序号 (0..N-1), 供 collector 做 denoising-step 用量与相邻步 stability 统计。"""
+        self._moe_denoising_step = value
+
+    def set_moe_metrics_collector(self, collector):
+        """挂载/卸载 MoEStatsCollector (validation 前挂载 full 档, 结束后传 None 卸载)。"""
+        self._moe_stats_collector = collector
+        for block in self.blocks:
+            if isinstance(block.ff, MoEFFN):
+                block.ff.set_stats_collector(collector)
+
+    def cast_router_fp32(self):
+        """模型 .to(bf16) 会把 gate 一并降精度; router 要求全 fp32, 加载/搬设备后调用回浮。"""
+        for block in self.blocks:
+            if isinstance(block.ff, MoEFFN):
+                block.ff.router.float()
+
+    @property
+    def has_moe(self) -> bool:
+        return any(isinstance(block.ff, MoEFFN) for block in self.blocks)
 
     def semantic_metadata(self):
         return {
@@ -401,6 +469,7 @@ class GigaExpTransformer(nn.Module):
             "adaln_type": self.adaln_type,
             "adaln_rank": self.adaln_rank,
             "text_trans": self.text_trans,
+            "moe": self.moe_cfg,
             "implementation": {
                 "version": "giga_semantics_v1",
                 "rope": "fp32_cos_sin_and_rotation",
@@ -469,9 +538,16 @@ class GigaExpTransformer(nn.Module):
             # basis 模式: 全模型一次投影 z = P·cond, blocks 的双分支系数头只吃 r 维 z
             cond = self.adaln_basis(cond.to(self.adaln_basis.weight.dtype))
         cos, sin = self.rope(t, h, w, text.shape[1], x.device, x.dtype)
+        # MoE: 每 forward 重置 aux 收集 (训练循环在 backward 前读取 moe_aux_losses)
+        self.moe_aux_losses = []
+        if self.has_moe:
+            for block in self.blocks:
+                block.last_moe_aux = None
         features = [] if feature_layers is not None else None
         for block_idx, block in enumerate(self.blocks):
-            x = block(x, cond, cos, sin, attention_mask, pack, n_img)
+            x = block(x, cond, cos, sin, attention_mask, pack, n_img, denoising_step=self._moe_denoising_step)
+            if block.last_moe_aux is not None:
+                self.moe_aux_losses.append(block.last_moe_aux)
             if features is not None and block_idx in feature_layers:
                 features.append(x)  # [B, n_img+n_text, D] 全序列, KD 侧再切 image 前缀
         image = self.out(self.norm(x[:, :t * h * w]))

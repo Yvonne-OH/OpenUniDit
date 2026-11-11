@@ -1,0 +1,237 @@
+# Giga-Exp Image stage_1 XL MoE: 基于 configs/stage_1_xl.yaml, dense FFN → top-2 MoE FFN。
+# 结构 (每 expert 与原 dense FFN 同构, ffn_dim=8192 不变):
+#   dense 每层:  attn 4d²=16.8M + ff 2·d·8192=33.6M + adaLN basis 头 1.57M ≈ 51.9M
+#   MoE  每层:  attn 16.8M + 4×33.6M=134.2M + router gate 8K + adaLN 1.57M ≈ 152.6M
+#   总参数 ≈ 1.981B + 3×33.6M×36 ≈ 5.6B (bf16 ~11.2GB); 激活参数 (top-2) ≈ 1.981B + 33.6M×36 ≈ 3.19B
+#   每 token FFN FLOPs ×2, step 耗时预计上浮 ~40-60% (ffn 占计算 ~2/3)
+# 热启动 (dense→MoE 强制均衡):
+#   training.init_from 指向 dense stage_1_xl 最新权重 (step-212500); 加载时每层 dense FFN 自动
+#   拷贝到全部 4 个 experts (models/moe.py: apply_dense_to_moe_migration), router gate 随机初始化,
+#   RoutingSchedule: phase A (0~1000 步) balanced-random top-2 完全强制均衡 → phase B (→4000 步)
+#   学习路由线性混入 → phase C 纯学习路由; 训练侧 aux loss (load_balance 1e-2 + z_loss 1e-3) 加入总 loss。
+# Router 全 fp32: gate 权重常驻 fp32 (cast_router_fp32), logits/softmax/topk/aux 全 fp32 域计算。
+# MoE validation 图表: moe_metrics.enabled=true → 每次 validation 输出 per-layer 专家用量热图/
+#   load CV/router 熵/dead expert/routing stability/gate/expert RMS/模态(image-text)用量/去噪步用量/
+#   3x3 dashboard + 跨 checkpoint 趋势图 (validation/step-*/moe_metrics/, swanlab val_moe/*)。
+stage: stage_1
+output_dir: /home/jovyan/pfs/users/zhanqian.wu/exp/giga_exp_image/stage_1_xl_moe
+seed: 42
+
+# DeepSpeed launcher: deepspeed --num_gpus=8 train_giga_exp.py --config configs/stage_1_xl_moe.yaml
+distributed:
+  backend: deepspeed
+  config: configs/zero1.json
+  world_size: 8
+  timeout_seconds: 7200
+
+model:
+  adaln_type: basis
+  adaln_rank: 64
+  text_trans:
+    enabled: true
+    layers: 2
+    heads: 16
+  in_channels: 48
+  out_channels: 48
+  text_dim: 2560
+  dim: 2048
+  ffn_dim: 8192        # 每个 expert 的 FFN 宽度 (与 dense 版一致)
+  heads: 16
+  layers: 36
+  rope_theta: 10000.0
+  rope_axes_dims: [16, 48, 48, 16]
+  patch_size: [1, 1, 1]
+  # FFN MoE (models/moe.py): 4 专家 top-2, router fp32, 强制均衡调度
+  moe:
+    num_experts: 4
+    top_k: 2
+    phase_a_steps: 1000        # phase A: balanced-random top-2 完全强制均衡
+    phase_b_end_step: 4000     # phase B: 学习路由按 0→1 线性混入, jitter 0.5→0.1
+    phase_a_jitter: 0.5
+    phase_b_jitter_start: 0.5
+    phase_b_jitter_end: 0.1
+    phase_c_jitter: 0.03
+    load_balancing_weight: 1.0e-2   # Switch 负载均衡 aux (权重已含, 直接加进总 loss)
+    router_z_loss_weight: 1.0e-3
+    router_entropy_weight: 0.0
+    warmup_ce_weight: 0.0
+
+components:
+  text_encoder:
+    type: qwen3_vl
+    pretrained_path: /mnt/nfs/models/huggingface/Qwen/Qwen3-VL-4B-Instruct
+    tokenizer_path: /mnt/nfs/models/huggingface/Qwen/Qwen3-VL-4B-Instruct
+    local_files_only: true
+    layer: -2
+    max_length: 512
+  wan_vae:
+    type: AutoencoderKLWan
+    pretrained_path: /mnt/nfs/models/huggingface/models--Wan-AI--Wan2.2-TI2V-5B-Diffusers
+    subfolder: vae
+    local_files_only: true
+
+scheduler:
+  type: flow_matching
+  num_train_timesteps: 1000
+  shift: 3.0
+  timestep_sampling: uniform
+  validation_shift: 3.0
+
+dataset:
+  dataset_type: lmdb_parquet
+  image_training_enabled: true
+  edit_training_enabled: false
+  database_path: /home/jovyan/pfs/users/zhanqian.wu/pfs_data/unified_images_lmdb
+  image_database_path: /home/jovyan/pfs/users/zhanqian.wu/pfs_data/unified_images_lmdb
+  lmdb_root: /home/jovyan/pfs/users/zhanqian.wu/pfs_data/unified_images_lmdb
+  image_root: /home/jovyan/pfs/users/zhanqian.wu/pfs_data/unified_images_lmdb
+  image_sources:
+    - 4KLSDB
+    - Aesthetic-4K
+    - HumanCaption-10M
+    - LAION_Aesthetics_1024
+    - Poster100K
+    - anime_captions
+    - bg_photo_concepts
+    - blip3o-long-caption-wds
+    - blip3o-long-caption
+    - caption3o-xl-v4
+    - ffhq_captioned_1024
+    - fine_t2i
+    - pexels-advertisement-photography
+    - pexels_aesth_2_1024
+    - qwen-synth-characters-fused
+    - sa1b_en
+    - anyword_3m
+    - pixelprose_cc12m
+    - pixelprose_commonpool
+    - pixelprose_redcaps
+    - monet_cc12m
+    - monet_commoncatalog_cc_by
+    - monet_coyo
+    - GenPoster100K
+    - Text-Render-2M
+    - moss_synth_sa1b_10h
+    # 2026-11-11 新增: 分片校验通过 (mdb==parquet: FLUX 1180/1180, JourneyDB 200/200),
+    # mdb 记录含 img_bytes (single 通路), 抽样解码正常。
+    # FLUX-Reason-6M: 5,890,279 行 1024px, 长描述 caption (caption/caption_cn/caption_full)
+    # JourneyDB: ~419 万行 Midjourney 图 1024px (caption 描述 + caption_full 标签串)
+    - FLUX-Reason-6M
+    - JourneyDB
+    # 2026-11-11 新增: moss/h3image 合成源入库, 分片校验通过 (mdb==parquet), caption 无空值。
+    # moss_synth: 4/4 片 512 行; moss_synth_eval100k: 100/100 片 100,000 行 (均 1024px)。
+    # h3image_synth_webcap_10h: 由 pfs_data/h3image_synth_webcap_10h 校验后 mv 入库,
+    # 180/180 片 33,928 行, 1024x{576,768,1024} 短边>=576 全过 512 桶;
+    # mdb 记录 pickle dict (id/source/caption/w/h/img_bytes/source_dataset), 抽样 PNG 解码正常。
+    # 注: moss_synth_eval100k_v2 未加入 -- BOS 端即缺 9 个 mdb 分片 (parquet 52/mdb 43),
+    # 需从 dg5090 补传后校验再启用。
+    - moss_synth
+    - moss_synth_eval100k
+    - h3image_synth_webcap_10h
+    # 2026-11-11 新增: moss_synth_300k_48h 从 BOS 同步入库 (148GB), 校验通过:
+    # 1012 文件与 BOS 逐字节大小一致 (缺失0/不一致0), mdb==parquet 506/506 分片 ID 全匹配;
+    # 506,000 行全部 1024x1024, caption 无空值, mdb 记录 pickle dict 抽样 JPEG 解码正常。
+    - moss_synth_300k_48h
+  # 2026-11-11 新增: edit 库 7 个单图对源的 Qwen3-VL 描述 caption (t2i_caption, 非编辑指令)
+  # 以 before 原图 + 描述 caption 作为普通 image 样本参与 t2i 训练 (~741 万行, caption 无空值);
+  # 读 <root>/<source>/parquet_t2i/, 多参考图源 (unipic_*/Macro-Dataset) 不支持自动跳过。
+  # 注意: 新增数据源会改变索引指纹, 首次启动会重建一次索引缓存 (rank0 扫描, 其余 rank 等待)。
+  t2i_edit_database_path: /home/jovyan/pfs/users/zhanqian.wu/pfs_data/unified_edit_images_lmdb
+  t2i_edit_sources_t2i_mode:
+    - HQ-Edit
+    - GPT-UltraEdit
+    - GPT-HQEdit
+    - pico-banana-400k
+    - GPT-OmniEdit
+    - CrispEdit
+    - SEED-Data-Edit
+  contract: "[B,C,T,H,W]"
+  num_frames: 1
+  preprocess_style: cover
+  resolution: 512
+  long_edge: 512
+  max_upscale_ratio: 1.2
+  max_retries: 16
+  refresh_index_cache: false
+  index_cache_dir: /home/jovyan/pfs/users/zhanqian.wu/exp/giga_exp_image/stage_1_xl_moe/dataset_index_cache
+  buckets:
+    - 256_square
+    - 256x192
+    - 192x256
+    - 512_square
+    - 512x384
+    - 384x512
+  bucket_sampling_weights:
+    256_square: 0.14
+    256x192: 0.08
+    192x256: 0.08
+    512_square: 0.315
+    512x384: 0.1925
+    384x512: 0.1925
+  bucket_batch_sizes:
+    256_square: 16
+    256x192: 16
+    192x256: 16
+
+validation:
+  enabled: true
+  every_n_steps: 1000
+  per_rank: true
+  use_next_batch: true
+  num_inference_steps: 20
+  seed: 42
+  guidance_scale: 3.0
+
+# MoE validation 统计/图表 (moe-h3 同款): full 档收集, rank0 汇总后落盘+出图+swanlab 上报
+moe_metrics:
+  enabled: true
+  validation_mode: full        # validation collector 档位 (full=全量指标, lightweight=仅负载统计)
+  dead_expert_threshold: 0.0   # 分配数 <= 阈值判 dead (0 = 完全没分到 token)
+
+training:
+  enabled: true
+  t2v_only: true
+  cfg_dropout: 0.1
+  batch_size_per_device: 4
+  num_workers: 4
+  max_epochs: 6
+  mixed_precision: bf16
+  optimizer: adamw
+  torch_compile: false         # MoE dispatch 含动态形状, 编译收益不明; 保持关闭 (TORCH_LOGS=recompiles 已开)
+  muon:
+    enabled: false
+    momentum: 0.95
+    learning_rate: 3x
+    adjust_lr_fn: match_rms_adamw
+    weight_decay: 0.0
+  adam:
+    enabled: true
+    betas: [0.9, 0.95]
+    epsilon: 1.0e-8
+  learning_rate: 8.0e-5
+  weight_decay: 0.005
+  lr_scheduler: cosine
+  lr_warmup_steps: 1000
+  gradient_accumulation_steps: 1
+  checkpointing_steps: 2500
+  state_checkpoints_keep: 2
+  # dense→MoE 热启动: 新 output_dir 无可恢复 ckpt 时, 从 dense stage_1_xl 最新纯权重初始化
+  # (load_compatible_state_dict 自动把每层 dense FFN 拷贝到全部 experts, 强制均衡初始化)
+  init_from: /home/jovyan/pfs/users/zhanqian.wu/exp/giga_exp_image/stage_1_xl/checkpoints/weights
+  resume_mode: auto            # MoE 训练中断后自动从本目录最新 state/weights 恢复
+  resume_optimizer: false
+  resume_lr_scheduler: true
+
+logging:
+  report_to: [console, swanlab]
+  log_every_n_steps: 1
+  save_samples: true
+  swanlab:
+    enabled: true
+    project: giga-exp-image
+    name: giga_exp_image_stage_1_xl_moe
+    api_key: Dit2ngq8iuiGfUkI88e5b
+  wandb:
+    enabled: false
+    project: giga-exp-image
+    name: giga_exp_image_stage_1_xl_moe
