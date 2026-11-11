@@ -36,7 +36,7 @@ from transformers import AutoModel, AutoTokenizer
 from data.lmdb_dataset import GigaLMDBDataset, collate_image_batch
 from data.samplers.bucket_sampler import BucketBatchSampler
 from models.giga_transformer import (GigaExpTransformer, apply_adaln_basis_migration,
-                                     apply_mod_adaln_migration, load_compatible_state_dict)
+                                     apply_mod_adaln_migration)
 from models.moe import apply_dense_to_moe_migration
 import models.giga_transformer as _giga_transformer
 
@@ -1002,45 +1002,51 @@ def main():
     # 只存在唯一的符号化尺寸类, 每桶一次 forward+backward 即可编完整图 (含 FA3 段)。
     # 纯 forward+backward, 不做 optimizer.step 且事后清零梯度, 不碰数据迭代器/优化器状态/
     # 学习率; 各 rank 预热次数一致, 集合通信不会错位。
-    warm_b = 2
-    warm_dtype = next(engine.module.parameters()).dtype
-    warm_text_dim = engine.module.text_in.in_features
-    # stage_1.yaml 的三个分辨率桶对应的 latent 空间尺寸 (VAE /8): 512 / 512x384 / 384x512
-    warm_buckets = ((64, 64), (64, 48), (48, 64))
-    # inductor 对小尺寸还有内部分界 (guard: b*L+b*C <= 1536, 约 L<=368 一类), 因此每个桶
-    # 用 短/长 两个文本长度把两个尺寸类都编完, 否则真实数据里的长 prompt batch 仍会触发
-    # 每 rank 一次的现场重编译
-    warm_lens = (8, 512)
-    # 编译心跳: Inductor 单次编译内部无进度回调, 可能静默数分钟; 后台线程每 10s 打印
-    # 已耗时和当前进度, 明确"在编译而不是卡死"
-    warm_stop = threading.Event()
-    warm_total = len(warm_buckets) * len(warm_lens)
-    warm_state = {"idx": 0, "t0": time.time()}
+    # 预热只为 torch.compile 预编译变体服务; compile 关闭时直接跳过 —— 大模型下 warmup
+    # batch (b=2) 自身就可能 OOM, 被上方 except 吞掉后受损的 CUDA 上下文会让后续 NCCL
+    # 集合通信连环失败 (2026-11-11 MoE XL 实测), 不允许这个无收益路径运行。
+    if not cfg["training"].get("torch_compile"):
+        logger.info("⏭️ torch_compile=false, 跳过 compile warmup")
+    else:
+        warm_b = 2
+        warm_dtype = next(engine.module.parameters()).dtype
+        warm_text_dim = engine.module.text_in.in_features
+        # stage_1.yaml 的三个分辨率桶对应的 latent 空间尺寸 (VAE /8): 512 / 512x384 / 384x512
+        warm_buckets = ((64, 64), (64, 48), (48, 64))
+        # inductor 对小尺寸还有内部分界 (guard: b*L+b*C <= 1536, 约 L<=368 一类), 因此每个桶
+        # 用 短/长 两个文本长度把两个尺寸类都编完, 否则真实数据里的长 prompt batch 仍会触发
+        # 每 rank 一次的现场重编译
+        warm_lens = (8, 512)
+        # 编译心跳: Inductor 单次编译内部无进度回调, 可能静默数分钟; 后台线程每 10s 打印
+        # 已耗时和当前进度, 明确"在编译而不是卡死"
+        warm_stop = threading.Event()
+        warm_total = len(warm_buckets) * len(warm_lens)
+        warm_state = {"idx": 0, "t0": time.time()}
 
-    def _warmup_heartbeat() -> None:
-        while not warm_stop.wait(10.0):
-            elapsed = time.time() - warm_state["t0"]
-            logger.info("⏳ 编译预热中... 已 %.0fs (%d/%d)", elapsed, min(warm_state["idx"] + 1, warm_total), warm_total)
+        def _warmup_heartbeat() -> None:
+            while not warm_stop.wait(10.0):
+                elapsed = time.time() - warm_state["t0"]
+                logger.info("⏳ 编译预热中... 已 %.0fs (%d/%d)", elapsed, min(warm_state["idx"] + 1, warm_total), warm_total)
 
-    threading.Thread(target=_warmup_heartbeat, daemon=True).start()
-    try:
-        for warm_h, warm_w in tqdm(warm_buckets, desc="🔥 compile warmup", disable=rank != 0, dynamic_ncols=True):
-            for warm_len in warm_lens:
-                warm_state["idx"] += 1
-                warm_img = torch.zeros(warm_b, engine.module.in_channels, 1, warm_h, warm_w, device=device, dtype=warm_dtype)
-                warm_t = torch.rand(warm_b, device=device) * 1000.0
-                warm_text = torch.randn(warm_b, warm_len, warm_text_dim, device=device, dtype=warm_dtype)
-                warm_mask = torch.ones(warm_b, warm_len, dtype=torch.bool, device=device)
-                warm_loss = engine(warm_img, warm_t, warm_text, warm_mask).float().mean()
-                engine.backward(warm_loss)
-                engine.zero_grad()
-    except Exception:
-        # 预热只是优化项, 失败绝不致命: 清零梯度后照常进入训练 (首步仍会正常编译)
-        engine.zero_grad()
-        logger.exception("⚠️ compile warmup 失败, 跳过预热继续训练")
-    finally:
-        warm_stop.set()
-    logger.info("✅ compile warmup 结束 (耗时 %.0fs)", time.time() - warm_state["t0"])
+        threading.Thread(target=_warmup_heartbeat, daemon=True).start()
+        try:
+            for warm_h, warm_w in tqdm(warm_buckets, desc="🔥 compile warmup", disable=rank != 0, dynamic_ncols=True):
+                for warm_len in warm_lens:
+                    warm_state["idx"] += 1
+                    warm_img = torch.zeros(warm_b, engine.module.in_channels, 1, warm_h, warm_w, device=device, dtype=warm_dtype)
+                    warm_t = torch.rand(warm_b, device=device) * 1000.0
+                    warm_text = torch.randn(warm_b, warm_len, warm_text_dim, device=device, dtype=warm_dtype)
+                    warm_mask = torch.ones(warm_b, warm_len, dtype=torch.bool, device=device)
+                    warm_loss = engine(warm_img, warm_t, warm_text, warm_mask).float().mean()
+                    engine.backward(warm_loss)
+                    engine.zero_grad()
+        except Exception:
+            # 预热只是优化项, 失败绝不致命: 清零梯度后照常进入训练 (首步仍会正常编译)
+            engine.zero_grad()
+            logger.exception("⚠️ compile warmup 失败, 跳过预热继续训练")
+        finally:
+            warm_stop.set()
+        logger.info("✅ compile warmup 结束 (耗时 %.0fs)", time.time() - warm_state["t0"])
     progress = tqdm(total=max_steps, initial=step, disable=rank != 0, dynamic_ncols=True, desc="🚂 stage_1")
     while step < max_steps:
         step += 1

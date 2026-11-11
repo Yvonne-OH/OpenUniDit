@@ -29,8 +29,10 @@ export YISU_IMAGE_PERSISTENT_DECODER=0
 export NCCL_DEBUG=WARN
 # 打印每次 dynamo 重编译的具体 guard 失败原因, 用于定位反复重编译的元凶
 export TORCH_LOGS=recompiles
+# 扩展段分配器: 降低碎片化 (MoE XL 实测 3.2GB reserved-but-unallocated), 大模型显存余量更真实
+export PYTORCH_ALLOC_CONF=expandable_segments:True
 
-# stage_1 XL MoE (5.6B 总参 / ~3.2B 激活, 4 专家 top-2, router fp32, 强制均衡热启动):
+# stage_1 XL MoE (4/28/4 分层 MoE: 4.8B 总参 / ~2.9B 激活, 4 专家 top-2, 强制均衡热启动):
 # 默认 configs/stage_1_xl_moe.yaml; dense→MoE 初始化见该 yaml 的 training.init_from 注释
 CONFIG="${CONFIG:-${1:-configs/stage_1_xl_moe.yaml}}"
 GPUS="${NPROC_PER_NODE:-${GPUS:-8}}"

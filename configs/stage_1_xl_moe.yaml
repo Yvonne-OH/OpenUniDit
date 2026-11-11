@@ -2,7 +2,8 @@
 # 结构 (每 expert 与原 dense FFN 同构, ffn_dim=8192 不变):
 #   dense 每层:  attn 4d²=16.8M + ff 2·d·8192=33.6M + adaLN basis 头 1.57M ≈ 51.9M
 #   MoE  每层:  attn 16.8M + 4×33.6M=134.2M + router gate 8K + adaLN 1.57M ≈ 152.6M
-#   总参数 ≈ 1.981B + 3×33.6M×36 ≈ 5.6B (bf16 ~11.2GB); 激活参数 (top-2) ≈ 1.981B + 33.6M×36 ≈ 3.19B
+#   分层 MoE (layers={first:4,last:4}): 28 层 MoE + 8 层 dense, 总参 ≈ 4.80B (bf16 ~9.6GB);
+#   激活参数 (top-2) ≈ 1.981B + 33.6M×28 ≈ 2.92B
 #   每 token FFN FLOPs ×2, step 耗时预计上浮 ~40-60% (ffn 占计算 ~2/3)
 # 热启动 (dense→MoE 强制均衡):
 #   training.init_from 指向 dense stage_1_xl 最新权重 (step-212500); 加载时每层 dense FFN 自动
@@ -41,8 +42,11 @@ model:
   rope_theta: 10000.0
   rope_axes_dims: [16, 48, 48, 16]
   patch_size: [1, 1, 1]
-  # FFN MoE (models/moe.py): 4 专家 top-2, router fp32, 强制均衡调度
+  # FFN MoE (models/moe.py): 4 专家 top-2, router fp32 计算域, 强制均衡调度。
+  # 分层分布 Dense→MoE→Dense: 前 4 层 / 后 4 层 dense FFN, 中间 28 层 MoE (layers={first,last})。
+  # Attention 全部层恒为 dense。总参 ≈ 4.80B, 激活参数 (top-2) ≈ 2.92B
   moe:
+    layers: {first: 4, last: 4}
     num_experts: 4
     top_k: 2
     phase_a_steps: 1000        # phase A: balanced-random top-2 完全强制均衡
@@ -169,13 +173,13 @@ dataset:
     512x384: 0.1925
     384x512: 0.1925
   bucket_batch_sizes:
-    256_square: 16
-    256x192: 16
-    192x256: 16
+    256_square: 4
+    256x192: 4
+    192x256: 4
 
 validation:
   enabled: true
-  every_n_steps: 1000
+  every_n_steps: 100
   per_rank: true
   use_next_batch: true
   num_inference_steps: 20
@@ -192,7 +196,9 @@ training:
   enabled: true
   t2v_only: true
   cfg_dropout: 0.1
-  batch_size_per_device: 4
+  # 显存预算: MoE XL (5.6B) 单卡 80GB 下 b=2 一个前向峰值已 ~74GB (warmup 实测 OOM),
+  # b=4 必炸 → 降为 b=1 + grad_accum=4, 等效 batch 32 与 dense 版一致; 256 桶同比例 16→4
+  batch_size_per_device: 1
   num_workers: 4
   max_epochs: 6
   mixed_precision: bf16
@@ -212,7 +218,7 @@ training:
   weight_decay: 0.005
   lr_scheduler: cosine
   lr_warmup_steps: 1000
-  gradient_accumulation_steps: 1
+  gradient_accumulation_steps: 4
   checkpointing_steps: 2500
   state_checkpoints_keep: 2
   # dense→MoE 热启动: 新 output_dir 无可恢复 ckpt 时, 从 dense stage_1_xl 最新纯权重初始化

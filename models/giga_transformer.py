@@ -410,15 +410,43 @@ class GigaExpTransformer(nn.Module):
         self.text_in = nn.Linear(text_dim, dim)
         self.time_in = nn.Sequential(nn.Linear(256, dim), nn.SiLU(), nn.Linear(dim, dim))
         self.rope = SpacetimeRoPE(dim // heads, rope_theta, rope_axes_dims)
-        # MoE FFN (models/moe.py): None=dense; dict 直接传给 MoEFFN (num_experts/top_k/调度/aux 权重)
+        # MoE FFN (models/moe.py): None=dense; dict 直接传给 MoEFFN (num_experts/top_k/调度/aux 权重)。
+        # 分层 MoE: moe.layers 指定哪些层用 MoE, 其余层保持 dense FFN (Attention 恒为 dense)。
+        #   - 缺省/None      : 全部层 MoE
+        #   - dict{first,last}: 跳过前 first 层与后 last 层, 中间全部 MoE (Dense→MoE→Dense 分布)
+        #   - list[int]      : 显式层号 (如 [3, 5, 7])
+        # 该键会随 semantic_metadata 落入 checkpoint, resume 时指纹不一致会告警。
         self.moe_cfg = dict(moe) if moe else None
+        if self.moe_cfg is not None:
+            layers_spec = self.moe_cfg.get("layers")
+            if layers_spec is None:
+                moe_layer_ids = set(range(layers))
+            elif isinstance(layers_spec, dict):
+                first = int(layers_spec.get("first", 0))
+                last = int(layers_spec.get("last", 0))
+                if first < 0 or last < 0 or first + last > layers:
+                    raise ValueError(f"moe.layers first/last 非法: {layers_spec!r} (共 {layers} 层)")
+                moe_layer_ids = set(range(first, layers - last))
+            else:
+                moe_layer_ids = {int(i) for i in layers_spec}
+                bad = moe_layer_ids - set(range(layers))
+                if bad:
+                    raise ValueError(f"moe.layers 层号越界: {sorted(bad)} (共 {layers} 层)")
+            self.moe_layer_ids = sorted(moe_layer_ids)
+            if not self.moe_layer_ids:
+                raise ValueError("moe.layers 为空: 没有任何层使用 MoE")
+        else:
+            self.moe_layer_ids = None
         self.moe_routing_step = 0
         self._moe_denoising_step = None
         self._moe_stats_collector = None
         self.moe_aux_losses = []
+        block_moe_cfg = ({k: v for k, v in self.moe_cfg.items() if k != "layers"}
+                         if self.moe_cfg is not None else None)
         self.blocks = nn.ModuleList([GigaBlock(dim, heads, ffn_dim, mod_adaln=self.mod_adaln,
-                                               adaln_rank=self.adaln_rank, moe=self.moe_cfg)
-                                     for _ in range(layers)])
+                                               adaln_rank=self.adaln_rank,
+                                               moe=block_moe_cfg if self.moe_layer_ids is not None and i in set(self.moe_layer_ids) else None)
+                                     for i in range(layers)])
         # MoE 统计收集器按层命名 (纯数字, moe_visualization 按数值排序画 per-layer 曲线)
         for idx, block in enumerate(self.blocks):
             if isinstance(block.ff, MoEFFN):

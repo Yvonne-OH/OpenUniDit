@@ -1,8 +1,8 @@
 """Giga-Exp FFN MoE: top-2 路由 MoE FFN, 对齐 moe-h3 SparseMoE/Router 行为。
 
 关键设计 (源自 moe-h3, 按 giga DiT 特性适配):
-- router 全程 fp32: gate 权重常驻 fp32 (cast_router_fp32 在模型 .to(bf16) 后回浮),
-  输入 cast float32 计算 logits, softmax/topk/aux loss 全 fp32。
+- router 全程 fp32 计算域: 输入与 gate 权重上浮 float32 计算 logits, softmax/topk/aux loss 全 fp32
+  (权重存储精度: 纯 torch 路径常驻 fp32; DeepSpeed ZeRO bf16 路径由引擎管理, 每 step 覆写)。
 - 强制均衡调度 RoutingSchedule 三阶段:
     A 期 (< phase_a_steps)   : 路由完全强制均衡 —— balanced random top-2 (每 expert 均匀命中),
                                与 gate logits 无关。dense→MoE 热启动时所有 expert 是同一份 FFN
@@ -128,7 +128,8 @@ class MoEFFN(nn.Module):
         self.schedule = RoutingSchedule(int(phase_a_steps), int(phase_b_end_step),
                                         float(phase_a_jitter), float(phase_b_jitter_start),
                                         float(phase_b_jitter_end), float(phase_c_jitter))
-        # router 常驻 fp32 (cast_router_fp32 保证 .to(bf16) 后仍是 fp32)
+        # router logits/topk/aux 全在 fp32 计算域 (权重存储精度见 forward 内注释);
+        # cast_router_fp32 仅对纯 torch 路径 (推理/无 DeepSpeed) 有效, ZeRO 引擎会重新 cast
         self.router = nn.Linear(dim, num_experts, bias=False, dtype=torch.float32)
         self.experts = nn.ModuleList([
             nn.Sequential(nn.Linear(dim, ffn_dim, bias=False), nn.SiLU(),
@@ -164,8 +165,9 @@ class MoEFFN(nn.Module):
         num_tokens = flat.shape[0]
         valid = valid_mask.reshape(-1).bool() if valid_mask is not None else torch.ones(num_tokens, dtype=torch.bool, device=x.device)
 
-        # ---- router: 全 fp32 (输入 cast, gate 权重 fp32, logits/topk 均在 fp32 域) ----
-        logits = self.router(flat.to(torch.float32))  # [T, E]
+        # ---- router: 全 fp32 计算域 (输入+权重上浮 fp32; ZeRO bf16 引擎会把 fp32 参数强制
+        # cast 回 bf16 且每 step 覆写 param.data, 权重存储精度由 DeepSpeed 管理, 计算域不变) ----
+        logits = F.linear(flat.to(torch.float32), self.router.weight.to(torch.float32))  # [T, E]
         phase, learned_probability, jitter = self.schedule.at(self.routing_step)
         self.last_phase = phase
         route_logits = logits
