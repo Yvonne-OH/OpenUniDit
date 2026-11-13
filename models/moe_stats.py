@@ -65,6 +65,7 @@ class MoEStatsCollector:
                 "top2_mass_sum": zero(),
                 "gap_sum": zero(),
                 "gate_sum": zero(),
+                "gate_sq_sum": zero(),
                 "gate_count": zero(),
                 "expert_output_rms_sum": torch.zeros(experts, dtype=torch.float64, device=device),
                 "expert_output_rms_count": torch.zeros(experts, dtype=torch.float64, device=device),
@@ -72,6 +73,8 @@ class MoEStatsCollector:
                 "denoising_step_assignment_count": {},
                 "moe_rms_sum": zero(),
                 "ffn_rms_sum": zero(),
+                "residual_rms_sum": zero(),
+                "residual_rms_count": zero(),
                 "rms_count": torch.zeros(4, dtype=torch.float64, device=device),
                 "routing_stability_sum": zero(),
                 "routing_stability_count": zero(),
@@ -98,6 +101,7 @@ class MoEStatsCollector:
         denoising_step: Any = None,
         moe_output: torch.Tensor | None = None,
         ffn_output: torch.Tensor | None = None,
+        residual: torch.Tensor | None = None,
         token_ids: torch.Tensor | None = None,
     ) -> None:
         if not self.enabled:
@@ -143,6 +147,7 @@ class MoEStatsCollector:
             elif flat_gate.numel() == flat_logits.shape[0]:
                 flat_gate = flat_gate.reshape(-1)[mask]
             state["gate_sum"].add_(flat_gate.sum())
+            state["gate_sq_sum"].add_(flat_gate.square().sum())
             state["gate_count"].add_(flat_gate.numel())
 
         if self.mode != "full":
@@ -166,11 +171,11 @@ class MoEStatsCollector:
             state["expert_output_rms_count"].add_(expert_output_rms_count.detach().to(torch.float64))
         else:
             self._update_expert_rms(state, expert_outputs, routes, mask, experts)
-        if moe_output is not None and ffn_output is not None:
+        # moe/gated/ffn/residual RMS 各自独立累加 (任一输入缺省则对应指标缺省):
+        # rms_count[0]=moe 样本数, [1]=gated RMS 和, [2]=ffn RMS 和, [3]=gated 样本数
+        if moe_output is not None:
             moe_values = moe_output.detach().reshape(-1, moe_output.shape[-1])[mask].float()
-            ffn_values = ffn_output.detach().reshape(-1, ffn_output.shape[-1])[mask].float()
             state["moe_rms_sum"].add_(_rms(moe_values))
-            state["ffn_rms_sum"].add_(_rms(ffn_values))
             state["rms_count"][0].add_(1)
             if gate is not None:
                 gain = gate.detach().float()
@@ -178,8 +183,15 @@ class MoEStatsCollector:
                     gain = gain.unsqueeze(-1)
                 gated = (moe_output.detach().float() * gain).reshape(-1, moe_output.shape[-1])[mask]
                 state["rms_count"][1].add_(_rms(gated))
-                state["rms_count"][2].add_(_rms(ffn_values))
                 state["rms_count"][3].add_(1)
+        if ffn_output is not None:
+            ffn_values = ffn_output.detach().reshape(-1, ffn_output.shape[-1])[mask].float()
+            state["ffn_rms_sum"].add_(_rms(ffn_values))
+            state["rms_count"][2].add_(_rms(ffn_values))
+        if residual is not None:
+            residual_values = residual.detach().reshape(-1, residual.shape[-1])[mask].float()
+            state["residual_rms_sum"].add_(_rms(residual_values))
+            state["residual_rms_count"].add_(1)
         self._update_stability(str(layer), state, routes, mask, denoising_step, token_ids)
 
     collect = update
@@ -258,6 +270,7 @@ class MoEStatsCollector:
                 "dead_expert": dead,
                 "dead_expert_count": dead.sum(),
                 "gate": state["gate_sum"] / state["gate_count"].clamp_min(1),
+                "gate_rms": (state["gate_sq_sum"] / state["gate_count"].clamp_min(1)).sqrt(),
             }
             if self.mode == "full":
                 counts = state["expert_output_rms_count"]
@@ -274,7 +287,13 @@ class MoEStatsCollector:
                     "moe_ffn_rms_ratio": (state["moe_rms_sum"] / state["ffn_rms_sum"]
                                           if bool(state["ffn_rms_sum"] > 0) else None),
                     "gated_moe_ffn_rms_ratio": (state["rms_count"][1] / state["rms_count"][2]
-                                                if bool(state["rms_count"][2] > 0) else None),
+                                                if bool(state["rms_count"][2] > 0) and bool(state["rms_count"][1] > 0)
+                                                else None),
+                    "residual_rms": (state["residual_rms_sum"] / state["residual_rms_count"].clamp_min(1)
+                                     if bool(state["residual_rms_count"] > 0) else None),
+                    "gated_residual_rms_ratio": (state["rms_count"][1] / state["residual_rms_sum"]
+                                                 if bool(state["residual_rms_sum"] > 0) and bool(state["rms_count"][1] > 0)
+                                                 else None),
                     "routing_stability": (
                         state["routing_stability_sum"] / state["routing_stability_count"]
                         if bool(state["routing_stability_count"]) else None
@@ -283,7 +302,7 @@ class MoEStatsCollector:
                 })
             layers[name] = _json_value(item)
         return {"mode": self.mode, "top_k": self.top_k, "layers": layers,
-                "rms_comparison": "sum(update RMS(beta * moe_output)) / sum(update RMS(ffn_output)); raw omits beta; pre-AdaLN residual gate, not exact final residual contribution",
+                "rms_comparison": "sum(update RMS(beta * moe_output)) / sum(update RMS(ffn_output)); raw omits beta; pre-AdaLN residual gate, not exact final residual contribution; gated_residual_rms_ratio compares against the residual stream (pre-FFN x)",
                 "routing_stability_identity": "position_ids",
                 "routing_stability_definition": "per-layer token-weighted mean adjacent observed-step Top-k overlap"}
 

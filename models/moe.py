@@ -106,6 +106,8 @@ class MoEFFN(nn.Module):
 
     forward 返回 (output [B,S,dim], auxiliary_loss 标量); AdaLN 残差 gate 由 GigaBlock 侧乘,
     与 moe-h3 的 beta gate 位置一致 (collector 统计为 pre-AdaLN RMS 比)。
+    residual: GigaBlock 传入的 FFN 残差基线 x (仅统计用, 供 gated_residual_rms_ratio),
+    不参与前向计算。
     """
 
     def __init__(self, dim, ffn_dim, num_experts=4, top_k=2,
@@ -159,7 +161,7 @@ class MoEFFN(nn.Module):
         indices = torch.stack((first, second), dim=-1)
         return torch.randperm(self.num_experts, device=device)[indices]
 
-    def forward(self, x, valid_mask=None, modality=None, denoising_step=None, residual_gate=None):
+    def forward(self, x, valid_mask=None, modality=None, denoising_step=None, residual_gate=None, residual=None):
         b, n, d = x.shape
         flat = x.reshape(-1, d)
         num_tokens = flat.shape[0]
@@ -241,7 +243,8 @@ class MoEFFN(nn.Module):
                 self._stats_layer, logits, valid_mask=valid, topk_indices=indices,
                 gate=residual_gate, expert_output_rms_sum=rms_sum,
                 expert_output_rms_count=torch.bincount(dispatch_experts, minlength=self.num_experts).to(torch.float32),
-                moe_output=output, modality=modality, denoising_step=denoising_step,
+                moe_output=output, ffn_output=flat, residual=residual, modality=modality,
+                denoising_step=denoising_step,
                 token_ids=identity,
             )
         return output, auxiliary_loss

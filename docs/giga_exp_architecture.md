@@ -4,7 +4,9 @@
 
 ## 1. 总体结构
 
-Giga-Exp 是一个 **0.71B 稠密 DiT** 的文本到图像 Flow Matching 模型（stage_1_28layers：28 层 / dim 1536 / 12 头 / FFN 4096，basis AdaLN 结构；bf16 权重约 1.43GB），采用**单流（single-stream）**设计：图像 token 与文本 token 拼接后进同一组 Transformer Block 联合注意力。文本 token 在投影后先经过一个 **Text Refiner**（MOSS-Image 风格，2 层残差自注意力+FFN，恒等初始化）再进主 DiT。时间轴（T）在结构上完整保留，图像只是 T=1 的特例，因此可直接扩展到视频训练。latent 在进入 Transformer 前做 **(1,2,2) patchify**（时间维不合并、空间 2x2 合并），以 1/4 的图像 token 数换取训练吞吐。推理使用 **Classifier-Free Guidance（CFG）**：条件分支与空文本 unconditional 分支共享同一个 DiT，批量前向后按 guidance scale 合并。
+Giga-Exp 是一个 **0.71B 稠密 DiT** 的文本到图像 Flow Matching 模型（stage_1_28layers：28 层 / dim 1536 / 12 头 / FFN 4096，basis AdaLN 结构；bf16 权重约 1.43GB），采用**单流（single-stream）**设计：图像 token 与文本 token 拼接后进同一组 Transformer Block 联合注意力。文本 token 在投影后先经过一个 **Text Refiner**（MOSS-Image 风格，2 层残差自注意力+FFN，恒等初始化）再进主 DiT。时间轴（T）在结构上完整保留，图像只是 T=1 的特例，因此可直接扩展到视频训练。latent 进入 Transformer 前 patchify：**当前全部配置为 (1,1,1)**（每 latent 像素 1 token，不合并；历史结构为 (1,2,2) 空间 2x2 合并，已统一迁移，见 §3.1）。推理使用 **Classifier-Free Guidance（CFG）**：条件分支与空文本 unconditional 分支共享同一个 DiT，批量前向后按 guidance scale 合并。
+
+> 变体：XL 配置（`configs/stage_1_xl.yaml`，36 层 / dim 2048 / FFN 8192 / 16 头，≈2B）与 XL MoE 配置（`configs/stage_1_xl_moe.yaml`，FFN 换 top-2 路由 MoE，总参 ≈4.80B / 激活 ≈2.92B），见 §9。
 
 > 历史：早期配置为 16 层 / 1792 宽 / 0.80B（shared AdaLN），后扩到 28 层并引入 dual-branch（MiniMax H3 风格）与 basis 共享基结构，见 §4。
 
@@ -17,7 +19,7 @@ flowchart TB
     P["文本 Prompt"] --> TE["Qwen3-VL-4B 文本编码器<br/>text_dim = 2560, 取 hidden_states[-2]"]
     TE --> TXT["文本隐藏状态 + mask<br/>形状 [B, S, 2560]"]
     SIGMA["sigma 采样: U(0,1) 后接 shift=3 变换<br/>sigma = 3u / (1 + 2u)"] --> DIT
-    XT --> PATCH["(1,2,2) patchify<br/>空间 2x2 合并 latent patch<br/>token 特征 = 48 x 4 = 192"]
+    XT --> PATCH["(1,1,1) patchify<br/>每 latent 像素 1 token<br/>token 特征 = 48"]
     PATCH --> DIT["GigaExpTransformer<br/>28 层单流 DiT, 0.71B"]
     TXT --> DIT
     DIT --> UNPATCH["unpatchify 还原<br/>[B, 48, T, H, W]"]
@@ -47,7 +49,7 @@ sigma 采样: u ~ U(0,1), sigma = shift * u / (1 + (shift-1) * u), shift = 3.0
 | Text Encoder | Qwen3-VL-4B-Instruct（`Qwen3VLForConditionalGeneration`，纯文本输入） | 输出 2560 维隐藏状态（hidden_states[-2]），bf16，max_length=512，pad token 被 mask 掉 |
 | Tokenizer | Qwen2Tokenizer | 空 prompt 回退为 eos_token |
 | VAE | AutoencoderKLWan（Wan2.2 TI2V-5B） | 48 通道 latent，16x 空间压缩，`z_norm = (z - mean) / std` 对齐官方约定 |
-| DiT | GigaExpTransformer | 1536 宽度、28 层、12 头、单流联合注意力，(1,2,2) patchify，basis r=64 AdaLN + 2 层 Text Refiner |
+| DiT | GigaExpTransformer | 1536 宽度、28 层、12 头、单流联合注意力，(1,1,1) patchify（每 latent 像素 1 token），basis r=64 AdaLN + 2 层 Text Refiner |
 | Attention 后端 | FlashAttention 3（`thirdparty/flash_attn_interface.py`）优先，回退 SDPA | FA3 仅在无 padding mask 且 bf16/fp16 CUDA 时启用 |
 | 调度器 | 代码内实现（无 diffusers 依赖） | Flow Matching，训练 shift=3.0，验证 shift=3.0 |
 | 优化器 | AdamW（默认）；Muon+AdamW 实现保留但 `muon.enabled: false` | DeepSpeed ZeRO-2（configs/zero1.json，8 卡），bf16 混合精度，lr=1e-4 cosine + 200 warmup |
@@ -56,8 +58,8 @@ sigma 采样: u ~ U(0,1), sigma = shift * u / (1 + (shift-1) * u), shift = 3.0
 
 ```mermaid
 flowchart TB
-    X["图像 latent<br/>形状 [B, 48, T, H, W]"] --> PATCH["(1,2,2) patchify<br/>空间 2x2 合并, 时间不合并<br/>token 网格 [B, T*(H/2)*(W/2), 192]"]
-    PATCH --> PI["patch_in<br/>Linear 192 -> 1536"]
+    X["图像 latent<br/>形状 [B, 48, T, H, W]"] --> PATCH["(1,1,1) patchify<br/>不合并, token 网格 [B, T*H*W, 48]"]
+    PATCH --> PI["patch_in<br/>Linear 48 -> 1536"]
     TXT["文本隐藏状态<br/>形状 [B, S, 2560]"] --> TI["text_in<br/>Linear 2560 -> 1536"]
     TI --> TR["text_refiner<br/>2 层残差自注意力+FFN<br/>恒等初始化, 只处理文本 token"]
     PI --> CAT["拼接<br/>seq = image tokens + text tokens"]
@@ -66,7 +68,7 @@ flowchart TB
     FR --> TIN["time_in<br/>MLP 256 -> 1536 -> 1536"]
     TIN --> BAS["adaln_basis<br/>共享 Linear 1536 -> 64<br/>z = P·cond, 全模型只算一次"]
     BAS --> MOD["z<br/>每层双分支系数头的调制源"]
-    POS["T, H/2, W/2, L 坐标 (patchify 后网格)"] --> ROPE["SpacetimeRoPE<br/>4 轴: 16 + 48 + 48 + 16 = 128"]
+    POS["T, H, W, L 坐标 (latent 网格全分辨率)"] --> ROPE["SpacetimeRoPE<br/>4 轴: 16 + 48 + 48 + 16 = 128"]
     ROPE --> B0["GigaBlock 0"]
     CAT --> B0
     MOD --> B0
@@ -74,15 +76,15 @@ flowchart TB
     B1 --> BD["......"]
     BD --> B27["GigaBlock 27"]
     B27 --> NORM["final RMSNorm<br/>只取 image tokens"]
-    NORM --> OUT["out<br/>Linear 1536 -> 192"]
-    OUT --> UNPATCH["unpatchify<br/>reshape 回 [B, 48, T, H, W]"]
+    NORM --> OUT["out<br/>Linear 1536 -> 48"]
+    OUT --> UNPATCH["unpatchify<br/>还原 [B, 48, T, H, W]"]
 ```
 
 ### 3.1 Token 序列、patchify 与位置编码
 
-- **(1,2,2) patchify**：`patch_size = (pt, ph, pw) = (1, 2, 2)`，时间维不合并、空间 2x2 合并。latent `[B, C, T, H, W]` 先 reshape 为 `[B, C, T, H/2, 2, W/2, 2]`，再排布为 `[B, T*(H/2)*(W/2), pt*ph*pw*C]`，即每个 token 特征维 `4 x 48 = 192`。patch 内通道序为 `(pt, ph, pw, c)`；unpatchify 是完全互逆的 reshape + permute。
-- 序列构成为 `image tokens` 在前、`text tokens` 在后，image token 数 = `T × (H/32) × (W/32)`（VAE 16x 压缩 x patchify 2x2）。
-- 4D SpacetimeRoPE 按 head_dim=128 切分为 `16(时间) + 48(高) + 48(宽) + 16(文本位置)`；RoPE 坐标使用 **patchify 后的 token 网格** `(t, h, w)`（即 latent 网格的一半分辨率）。图像时 T 恒为 1，但时间轴保留，升级视频时无需改结构。
+- **(1,1,1) patchify（当前）**：`patch_size = (pt, ph, pw) = (1, 1, 1)`，不做任何合并，每 latent 像素 1 token，token 特征维 = 48（与 MOSS-Image 相同的"无 patchify"方案）。动机：空间信息无损进入 Transformer，分辨率扩展时 token 数更可控。历史结构为 (1,2,2)（空间 2x2 合并、token 特征 192），所有配置已统一切换，旧 (1,2,2) ckpt 加载时 `patch_in` 输入权重自动 2x2 扩展、`out` 权重复制到各 patch 位置（红字提示，见 §7.1 路径 2）。
+- 序列构成为 `image tokens` 在前、`text tokens` 在后，image token 数 = `T × (H/16) × (W/16)`（仅 VAE 16x 压缩）。
+- 4D SpacetimeRoPE 按 head_dim=128 切分为 `16(时间) + 48(高) + 48(宽) + 16(文本位置)`；RoPE 坐标使用 **latent 全分辨率 token 网格** `(t, h, w)`（(1,1,1) patchify 下即 VAE 网格本身；历史上 (1,2,2) 时为网格一半分辨率）。图像时 T 恒为 1，但时间轴保留，升级视频时无需改结构。
 - 图像 token 的四元坐标为 `(t, h, w, l=0)`；文本 token 的坐标为 `(t=0, h=0, w=0, l=1..S)`，文本拥有独立递增的位置编码，**不复用图像位置**。
 - 文本位置轴 `l` 在不同视频帧数下保持独立于 `(t,h,w)`，因此图像与视频使用同一套 4D 坐标规则。
 
@@ -90,10 +92,10 @@ flowchart TB
 
 | bucket | latent (H/16 x W/16) | patchify 后网格 | image tokens |
 |---|---|---|---|
-| 512_square | 32 x 32 | 16 x 16 | 256 |
-| 512x384 / 384x512 | 32 x 24 / 24 x 32 | 16 x 12 / 12 x 16 | 192 |
+| 512_square | 32 x 32 | 32 x 32 | 1024 |
+| 512x384 / 384x512 | 32 x 24 / 24 x 32 | 32 x 24 / 24 x 32 | 768 |
 
-加上最长 512 个文本 token，最长序列约 768。
+加上最长 512 个文本 token，最长序列约 1536。
 
 ### 3.2 注意力 mask 的双路径
 
@@ -138,7 +140,7 @@ flowchart TB
     IN --> ARES
     ARES --> N2["RMSNorm"]
     M -->|"scale_f shift_f"| N2
-    N2 --> FF["FFN<br/>1536 -> 4096 -> 1536<br/>SiLU 激活, no bias"]
+    N2 --> FF["FFN<br/>1536 -> 4096 -> 1536 (dense)<br/>或 MoEFFN (4 专家 top-2, 见 §9)<br/>SiLU 激活, no bias"]
     M -->|gate_f| FRES["残差: x + ff(y) * gate_f"]
     ARES --> FRES
     FRES --> NEXT["x: 输出序列"]
@@ -148,10 +150,12 @@ flowchart TB
 
 1. **调制**：`shift/scale` 作用于 Norm 之后（`norm(x) * (1 + scale) + shift`），`gate` 以零初始化风险的残差门控方式相加——本实现 gate 未做零初始化，直接由 `nn.Linear` 常规初始化输出。
 2. **QKV/FFN 均无 bias**，`adaln_basis` 也无 bias；`mod_img`/`mod_txt` 系数头与 `patch_in`、`text_in`、`time_in`、`out` 保留 bias。
-3. **FFN** 为 `Linear(1536→4096) → SiLU → Linear(4096→1536)`（门控仅在外层残差，FFN 内部无 GLU）。
+3. **FFN** 为 `Linear(1536→4096) → SiLU → Linear(4096→1536)`（门控仅在外层残差，FFN 内部无 GLU）。配置 `model.moe` 时 FFN 替换为 `MoEFFN`（`models/giga_transformer.py` GigaBlock：`moe is not None` 分支），见 §9。
 4. **Text Refiner**（`text_trans`）：text_in 投影后、进主 DiT 前的 2 层残差自注意力+FFN（12 头，仅文本序列、无 AdaLN），残差支路输出层零初始化 → step0 恒等，旧 ckpt 无 `text_refiner.*` 时自动恒等初始化。
 
-## 5. 参数量明细（实测，stage_1.yaml：28 层 / dim 1536 / basis r=64 / (1,2,2) patchify）
+## 5. 参数量明细（实测，stage_1.yaml：28 层 / dim 1536 / basis r=64）
+
+> 注：本节实测基于历史 (1,2,2) patchify 权重；当前配置 patch_size=(1,1,1) 后 `patch_in` 变为 48→1536、`out` 变为 1536→48，两项合计由 593,088 降为 150,576（推算），总量 ≈ 713.8M，其余不变。
 
 总量 **714,245,824 ≈ 0.71B**，bf16 权重约 1.43 GB。（对照：同结构改 `adaln_type: dual` 为 1,473,840,832 ≈ 1.47B / 2.95 GB——adaLN 差异全部来自调制参数。）
 
@@ -162,7 +166,7 @@ flowchart TB
 | text_refiner (2 层) | 56,663,040 (28,331,520/层) | 7.9% |
 | text_in (2560→1536, 含 bias) | 3,933,696 | 0.55% |
 | time_in (256→1536→1536) | 2,755,584 | 0.39% |
-| patch_in (192→1536) / out (1536→192) / final norm | 593,088 | 0.08% |
+| patch_in (48→1536) / out (1536→48) / final norm（(1,1,1)，推算） | 150,576 | 0.02% |
 | adaln_basis (1536→64, 全模型共享) | 98,304 | 0.01% |
 
 单层 GigaBlock 内部（共 23.22M）：
@@ -188,11 +192,11 @@ text refiner layers     2   (text_trans: dim 1536, ffn 4096, heads 12)
 adaln_type              basis   # shared | dual | basis (旧 ckpt 加载时自动转换)
 adaln_rank              64      # 共享基维度, adaLN 793M -> 33.6M
 latent channels         48  (Wan2.2 VAE)
-patch size (t/h/w)      (1, 2, 2)  时间不合并, 空间 2x2
-patch_in / out          Linear 192->1536 / Linear 1536->192
+patch size (t/h/w)      (1, 1, 1)  不合并, 每 latent 像素 1 token (旧 ckpt 自动迁移)
+patch_in / out          Linear 48->1536 / Linear 1536->48
 text hidden dimension   2560  (Qwen3-VL-4B-Instruct, hidden_states[-2])
 timestep embedding      256 (128 频率 sin/cos) -> 1536
-RoPE axes (t/h/w/l)     16 / 48 / 48 / 16, theta = 10000 (patchify 后网格)
+RoPE axes (t/h/w/l)     16 / 48 / 48 / 16, theta = 10000 (latent 全分辨率网格)
 RoPE for image tokens   (t, h, w, l=0)
 RoPE for text tokens    (t=0, h=0, w=0, l=1..S)
 CFG guidance scale      3.0 (validation/inference)
@@ -253,7 +257,25 @@ DeepSpeed ZeRO-2 会把 Muon 组的全部 2D 参数按顺序 flatten 成一个 *
 | 规模 | 42 层 / 3072 宽（≈4.9B） | 28 层 / 1536 宽（0.71B） |
 | VAE | FLUX.2 VAE，128ch | Wan2.2 TI2V VAE，48ch |
 | 结构 | 双流（文本有独立 TextBlock） | **单流**联合注意力 + 2 层 Text Refiner |
-| latent patchify | 无（每 latent 像素 1 token） | **(1,2,2) patchify**，空间 token x1/4 |
+| latent patchify | 无（每 latent 像素 1 token） | **(1,1,1)**，与 MOSS 相同（历史为 (1,2,2)） |
+
+## 9. XL 与 MoE 变体
+
+### 9.1 stage_1_xl（稠密 ≈2B）
+
+`configs/stage_1_xl.yaml`：36 层 / dim 2048 / FFN 8192 / 16 头 / basis r=64 / patch (1,1,1)，参数量 ≈2B。训练吞吐由分层 Dense→MoE→Dense 预算解决，见下节。
+
+### 9.2 stage_1_xl_moe（top-2 MoE FFN，总参 ≈4.80B / 激活 ≈2.92B）
+
+`configs/stage_1_xl_moe.yaml` + `models/moe.py`，对齐 moe-h3 的 SparseMoE/Router 行为，按 DiT 特性适配：
+
+- **分层 Dense→MoE→Dense**：36 层中**首 4 层与末 4 层保持 dense FFN**，中间 28 层换 `MoEFFN`（4 专家、top-2 路由，每 expert 与原 dense FFN 同构），用首尾层的显存换总参容量；
+- **Router 全程 fp32**：输入与 gate 权重上浮 float32 计算 logits，softmax/topk/aux loss 全 fp32（权重存储精度由 DeepSpeed ZeRO 引擎管理，每 step 覆写）；
+- **RoutingSchedule 三阶段强制均衡**：A 期（`phase_a_steps=500`）balanced random top-2 强制均衡（与 gate logits 无关）；B 期（至 `phase_b_end_step=2000`）learned_probability 线性递增混入学习路由，jitter 0.5→0.1 线性衰减；C 期纯学习路由 + jitter 0.03，推理恒用学习路由；
+- **aux loss 四件套**（权重在 MoEFFN 内乘好，训练侧直接累加）：load_balance（Switch 风格，1e-2）+ router_z_loss（1e-3）+ entropy（默认 0）+ warmup_ce（默认 0）；
+- **dispatch**：按专家 argsort 分组计算，布尔掩码选 token，空 expert 走空张量前向（无 host 同步，梯度自动为零）；
+- **热启动迁移**：从 dense ckpt upcycle——每个 expert 拷贝原 dense FFN 权重、router gate 置零，训练从 `init_from` 指定的 warmup ckpt 启动；
+- **观测**：`moe_stats.py` 收集各层 aux loss、expert 流量占比、pre-AdaLN RMS 比（gated_residual_rms_ratio）等 `moe_metrics` 输出到训练日志。
 | 文本位置编码 | 4D RoPE 含文本位置 | 4D RoPE 含文本位置 |
 | CFG | guidance 3.0，空文本 unconditional 分支 | guidance 3.0，空文本 unconditional 分支 |
 | 时间维 | 图像专用 | **T 保留**，RoPE 含时间轴，可平移到视频 |

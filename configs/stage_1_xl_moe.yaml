@@ -179,7 +179,7 @@ dataset:
 
 validation:
   enabled: true
-  every_n_steps: 100
+  every_n_steps: 1000
   per_rank: true
   use_next_batch: true
   num_inference_steps: 20

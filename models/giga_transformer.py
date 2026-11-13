@@ -320,16 +320,17 @@ class GigaBlock(nn.Module):
         y = self.norm1(x) * (1 + scale_a[:, None]) + shift_a[:, None]
         x = x + self.out(self._attend(y, cos, sin, attention_mask, pack)) * gate_a[:, None]
         y = self.norm2(x) * (1 + scale_f[:, None]) + shift_f[:, None]
-        return x + self._ff(y, attention_mask, n_img, denoising_step, gate_f[:, None]) * gate_f[:, None]
+        return x + self._ff(y, attention_mask, n_img, denoising_step, gate_f[:, None], residual=x) * gate_f[:, None]
 
-    def _ff(self, y, attention_mask, n_img=None, denoising_step=None, gate=None):
-        """FFN 分派: dense 直通; MoE 需 valid mask/模态/去噪步做统计, aux 暂存 last_moe_aux。"""
+    def _ff(self, y, attention_mask, n_img=None, denoising_step=None, gate=None, residual=None):
+        """FFN 分派: dense 直通; MoE 需 valid mask/模态/去噪步做统计, aux 暂存 last_moe_aux。
+        residual 是 FFN 分支的残差基线 x (仅 MoE 统计用)。"""
         if not isinstance(self.ff, MoEFFN):
             self.last_moe_aux = None
             return self.ff(y)
         # valid mask: [B,1,1,S] bool → flatten; 模态 0=image / 1=text (与 moe_stats 对齐)
         f, aux = self.ff(y, valid_mask=attention_mask, modality=self._modality_tags(y.shape[1], n_img, gate),
-                         denoising_step=denoising_step, residual_gate=gate)
+                         denoising_step=denoising_step, residual_gate=gate, residual=residual)
         self.last_moe_aux = aux
         return f
 
@@ -359,7 +360,7 @@ class GigaBlock(nn.Module):
         gate = torch.cat((gf_i[:, None, :].expand(b, n_img, -1),
                           gf_t[:, None, :].expand(b, x.shape[1] - n_img, -1)), 1) \
             if isinstance(self.ff, MoEFFN) else None
-        f = self._ff(y, attention_mask, n_img, denoising_step, gate)
+        f = self._ff(y, attention_mask, n_img, denoising_step, gate, residual=x)
         return torch.cat((img + f[:, :n_img] * gf_i[:, None],
                           txt + f[:, n_img:] * gf_t[:, None]), 1)
 
