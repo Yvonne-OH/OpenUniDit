@@ -49,7 +49,7 @@ components:
     tokenizer_path: /mnt/nfs/models/huggingface/Qwen/Qwen3-VL-4B-Instruct
     local_files_only: true
     layer: -2                     # 取倒数第二层 hidden states (对齐 gigaworld stage1 约定)
-    max_length: 512
+    max_length: 2048
   wan_vae:
     type: AutoencoderKLWan
     pretrained_path: /mnt/nfs/models/huggingface/models--Wan-AI--Wan2.2-TI2V-5B-Diffusers
@@ -209,7 +209,7 @@ training:
     betas: [0.9, 0.95]
     epsilon: 1.0e-8
   # XL 从零训练: lr 相对 stage_1 (1e-4) 下调, warmup 拉长适配更大模型
-  learning_rate: 8.0e-5
+  learning_rate: 5.0e-5
   weight_decay: 0.005
   lr_scheduler: cosine
   lr_warmup_steps: 1000

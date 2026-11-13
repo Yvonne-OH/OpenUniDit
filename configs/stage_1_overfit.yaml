@@ -45,7 +45,7 @@ components:
     tokenizer_path: /mnt/nfs/models/huggingface/Qwen/Qwen3-VL-4B-Instruct
     local_files_only: true
     layer: -2
-    max_length: 512
+    max_length: 2048
   wan_vae:
     type: AutoencoderKLWan
     pretrained_path: /mnt/nfs/models/huggingface/models--Wan-AI--Wan2.2-TI2V-5B-Diffusers
