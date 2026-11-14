@@ -126,9 +126,34 @@ class TarParquetDataset(LmdbParquetDataset):
                     f"Parquet/tar 分片数量不一致: {source_dir} parquet={len(pq_files)} tar={tar_count}"
                 )
             file_list.extend((file, source_dir) for file in pq_files)
-        iterator = tqdm(file_list, total=len(file_list), desc="Loading tar parquet metadata",
-                        unit="shard", dynamic_ncols=True) if tqdm is not None else file_list
-        for file, source_dir in iterator:
+        # 并行读分片: pyarrow 的 footer/列读取释放 GIL, NFS 上单线程逐分片开文件
+        # 被 RTT 排队卡死 (~2 shard/s); 线程池并行后纯 IO 受限, 提速一个数量级以上。
+        # pool.map 保序产出 → 行处理仍按 sorted 分片顺序串行执行, 索引内容与单线程逐字节一致。
+        max_workers = max(1, int(os.environ.get("GWP_TAR_INDEX_THREADS", "32")))
+
+        def load_shard(task):
+            file, source_dir = task
+            pf = parquet.ParquetFile(str(file))   # footer 读一次, schema 与列读共用, 不再二次开文件
+            columns = [name for name in ("caption", "text", "w", "h", "width", "height", "images")
+                       if name in set(pf.schema_arrow.names)]
+            return file, source_dir, pf.read(columns=columns)
+
+        def iter_tables():
+            # 分块提交限制在途表格数: IO 快于行处理时避免 2.6 万分片的 table 全部积压内存
+            chunk = max_workers * 4
+            if max_workers > 1:
+                from concurrent.futures import ThreadPoolExecutor
+                with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                    for i in range(0, len(file_list), chunk):
+                        yield from pool.map(load_shard, file_list[i:i + chunk])
+            else:
+                yield from (load_shard(task) for task in file_list)
+
+        iterator = iter_tables()
+        if tqdm is not None:
+            iterator = tqdm(iterator, total=len(file_list), desc="Loading tar parquet metadata",
+                            unit="shard", dynamic_ncols=True)
+        for file, source_dir, table in iterator:
             source = source_dir.name
             source_stats = stats.setdefault(source, {
                 "shards": 0, "total": 0, "valid": 0, "filtered_no_image": 0,
@@ -137,13 +162,9 @@ class TarParquetDataset(LmdbParquetDataset):
             if limit is not None and source_counts.get(source, 0) >= int(limit):
                 source_stats["limit_stopped"] = True
                 continue
-            available = set(parquet.ParquetFile(str(file)).schema_arrow.names)
-            columns = [name for name in ("caption", "text", "w", "h", "width", "height", "images")
-                       if name in available]
             stem = file.stem   # shard-NNNNN, 与 tar/idx 同 stem 一一对应
             shard_dir = str(source_dir)
             source_stats["shards"] += 1
-            table = parquet.read_table(str(file), columns=columns)
             for pos, row in enumerate(table.to_pylist()):
                 if limit is not None and source_counts.get(source, 0) >= int(limit):
                     source_stats["limit_stopped"] = True
