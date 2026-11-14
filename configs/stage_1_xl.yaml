@@ -167,11 +167,12 @@ dataset:
     512_square: 0.315
     512x384: 0.1925
     384x512: 0.1925
-  # 每桶 per-device batch: 256 桶 batch x4 (16) 与 512 桶 x4 对齐 token 负载 (16*256 = 4*1024)
+  # 每桶 per-device batch: text max_length 512→2048 后文本激活随 batch 线性涨,
+  # 256 桶 16 张图 x ~2048 text token 直接 OOM (copy10 step-320459 实测), 16→4 对齐 MoE 配置
   bucket_batch_sizes:
-    256_square: 16
-    256x192: 16
-    192x256: 16
+    256_square: 4
+    256x192: 4
+    192x256: 4
 
 validation:
   enabled: true
@@ -186,10 +187,9 @@ training:
   enabled: true
   t2v_only: true
   cfg_dropout: 0.1
-  # patch (1,1,1) 后 image token x4 (512px: 256 -> 1024/token/图), 最长序列 1024+512;
-  # batch 减半相对 stage_1 (8 -> 4) 对齐显存。b=4 时显存 ~79GB 打满, 超长文本样本
-  # (txt 激活随长度线性涨) 一步即 OOM (2026-11-14 step-320027 实测), 降为 b=2 + grad_accum=2
-  # 等效 batch 32 与原先一致
+  # patch (1,1,1) 后 image token x4 (512px: 256 -> 1024/token/图), 最长序列 1024+2048;
+  # text max_length 512→2048 后文本激活占大头, b=4 在超长 caption 样本上 OOM
+  # (2026-11-14 step-320027 实测 copy9 96MiB @ norm2(txt)), 降为 b=2 + grad_accum=1
   batch_size_per_device: 2
   num_workers: 4
   max_epochs: 6
