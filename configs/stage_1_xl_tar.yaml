@@ -7,7 +7,7 @@
 #   不解析 tar 结构、不读 .idx; NFS tar seek 实测 ~816 samples/s @ C=256,
 #   训练需求 (8 卡 b=2 ≈ 20 samples/s) 余量 >40x, 分桶+乱序采样语义与 LMDB 版一致。
 stage: stage_1
-output_dir: /home/jovyan/pfs/users/zhanqian.wu/exp/giga_exp_image/stage_1_xl_tar
+output_dir: /home/jovyan/pfs/users/zhanqian.wu/exp/giga_exp_image/stage_1_xl
 seed: 42
 
 # DeepSpeed launcher: deepspeed --num_gpus=8 train_giga_exp.py --config configs/stage_1_xl_tar.yaml
@@ -116,7 +116,7 @@ dataset:
   max_retries: 16
   refresh_index_cache: false   # 指纹 = tar 根目录 + sources + 每源 (parquet 分片数, tar 分片数);
                                # NFS 上新入库分片会使指纹失效并自动重建 (rank0 扫描, 其余 rank 等待)
-  index_cache_dir: /home/jovyan/pfs/users/zhanqian.wu/exp/giga_exp_image/stage_1_xl_tar/dataset_index_cache
+  index_cache_dir: /home/jovyan/pfs/users/zhanqian.wu/exp/giga_exp_image/stage_1_xl/dataset_index_cache
   # 256/512 混合分辨率训练: patch(1,1,1) 下 token 数 256px=256, 512px=1024。
   # 桶归属在加载后按 width/height 重算, 256 桶要求源图短边 >= 213px (max_upscale_ratio 1.2);
   # 同比例高分桶 (512→256) 自动借图降采样, 桶耗尽不回绕重复。
@@ -190,7 +190,10 @@ training:
   checkpointing_steps: 2500
   state_checkpoints_keep: 2      # DeepSpeed 完整 state 只保留最近 2 个, 纯 weights 快照全部保留
   # auto: 自动恢复 output_dir 下最新 state/weights；none: 不恢复；也可填 .safetensors/.pt 文件或 weights 目录路径，强制从指定纯权重恢复。
-  resume_mode: auto   # tar 数据版全新 output_dir, 从零训练
+  # auto (默认): 从纯权重快照恢复 (checkpoints/weights 最高 step, 秒级, 与保存时 world size 无关,
+  #   optimizer 重置 step 保留); state: 完整 DeepSpeed state 含 optimizer (须同 world size);
+  #   也可填 .safetensors/.pt 文件或 weights 目录路径强制指定。none: 从 0 开始。
+  resume_mode: auto   # output_dir 与 LMDB 版共享, auto 会从 step-00337500.safetensors 续训
   resume_optimizer: false
   resume_lr_scheduler: true
 
@@ -201,9 +204,9 @@ logging:
   swanlab:
     enabled: true
     project: giga-exp-image
-    name: giga_exp_image_stage_1_xl_tar
+    name: giga_exp_image_stage_1_xl
     api_key: Dit2ngq8iuiGfUkI88e5b
   wandb:
     enabled: false
     project: giga-exp-image
-    name: giga_exp_image_stage_1_xl_tar
+    name: giga_exp_image_stage_1_xl

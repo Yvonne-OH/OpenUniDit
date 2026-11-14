@@ -892,19 +892,18 @@ def main():
             model=model, model_parameters=model.parameters(), optimizer=client_optimizer,
             config=ds_config,
         )
-    # 断点恢复三级策略: 完整 DeepSpeed state (含 optimizer) → 纯权重快照 (step 保留) → 从 0 开始。
-    # resume_mode 为文件/目录路径时，跳过自动发现，强制从指定纯权重恢复。
-    resume_mode = cfg["training"].get("resume_mode", "auto")
-    resume_tag = latest_state_tag(checkpoint_dir) if resume_mode == "auto" else None
+    # 断点恢复策略 (2026-11-15 起默认反转):
+    #   auto (默认) → 纯权重快照 (checkpoints/weights 最高 step): 秒级加载, 与保存时的
+    #     world size 无关 (64 卡存的可被 48/32 卡续训), optimizer 重置 (step 保留)。
+    #     完整 ZeRO state 跨卡数恢复既慢 (10~20 分钟) 又绑死 world size, 不再默认触发。
+    #   state → 显式要求完整 DeepSpeed state (含 optimizer), 仅在与保存时相同 world size 下使用。
+    #   文件/目录路径 → 指定纯权重恢复。
+    resume_mode = str(cfg["training"].get("resume_mode", "auto"))
     step = 0
-    if isinstance(resume_mode, str) and resume_mode not in {"auto", "none", "false", "off"}:
-        with _loud_phase(rank, logger, f"🔄 从指定路径恢复纯权重 {resume_mode}"):
-            step = load_pure_weights(engine, output_dir, resume_mode)
-        if rank == 0:
-            _blue_print(f"🔁 已从指定纯权重 {resume_mode} 恢复: 从 step={step} 继续训练 (optimizer 状态已重置)")
-            logger.info("🔁 已从指定纯权重恢复: %s, 从 step=%d 继续训练 (optimizer 状态已重置)", resume_mode, step)
-        dist.barrier()
-    elif resume_tag:
+    if resume_mode == "state":
+        resume_tag = latest_state_tag(checkpoint_dir)
+        if resume_tag is None:
+            raise FileNotFoundError(f"resume_mode=state 但没有可用的 state checkpoint: {checkpoint_dir}")
         size_gib = _ckpt_dir_size_gib(checkpoint_dir / resume_tag)
         hint = (f"(checkpoint 目录 ≈{size_gib:.0f} GiB, {dist.get_world_size()} rank 并行读取分片, "
                 "并发恢复时可达 10~20 分钟, 静默期间每分钟播报一次进度)")
@@ -932,6 +931,17 @@ def main():
             else:
                 _blue_print("🆕 未发现 checkpoint, 从 step=0 开始训练")
                 logger.info("🆕 未发现 checkpoint, 从 step=0 开始训练")
+    elif resume_mode not in {"none", "false", "off"}:
+        with _loud_phase(rank, logger, f"🔄 从指定路径恢复纯权重 {resume_mode}"):
+            step = load_pure_weights(engine, output_dir, resume_mode)
+        if rank == 0:
+            _blue_print(f"🔁 已从指定纯权重 {resume_mode} 恢复: 从 step={step} 继续训练 (optimizer 状态已重置)")
+            logger.info("🔁 已从指定纯权重恢复: %s, 从 step=%d 继续训练 (optimizer 状态已重置)", resume_mode, step)
+        dist.barrier()
+    else:
+        if rank == 0:
+            _blue_print("🆕 resume_mode=none: 从 step=0 开始训练")
+            logger.info("🆕 resume_mode=none, 从 step=0 开始训练")
 
     with _loud_phase(rank, logger, "📦 数据集索引加载",
                      hint="(mmap 列式索引: rank0 构建/加载, 其余 rank 只读映射共享; 首次构建约数分钟, 命中缓存秒级)"):

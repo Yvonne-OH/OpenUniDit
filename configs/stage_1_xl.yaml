@@ -219,7 +219,9 @@ training:
   gradient_accumulation_steps: 1
   checkpointing_steps: 2500
   state_checkpoints_keep: 2      # DeepSpeed 完整 state 只保留最近 2 个, 纯 weights 快照全部保留
-  # auto: 自动恢复 output_dir 下最新 state/weights；none: 不恢复；也可填 .safetensors/.pt 文件或 weights 目录路径，强制从指定纯权重恢复。
+  # auto (默认): 从纯权重快照恢复 (checkpoints/weights 最高 step, 秒级, 与保存时 world size 无关,
+  #   optimizer 重置 step 保留); state: 完整 DeepSpeed state 含 optimizer (须同 world size, 10~20 分钟);
+  #   也可填 .safetensors/.pt 文件或 weights 目录路径，强制从指定纯权重恢复。none: 从 0 开始。
   resume_mode: auto   # XL 全新结构, 从零训练 (不继承 stage_1_28layers 权重)
   resume_optimizer: false
   resume_lr_scheduler: true
