@@ -346,7 +346,7 @@ def _bili_task(pic: str, bvid: str, it: dict, source: str) -> Task:
 
 
 def enum_bilibili(args, limiter: RateLimiter):
-    """B站封面：优先 popular 分页；风控/失败自动降级 ranking（一次全量）。"""
+    """B站封面：popular 分页 / series 每周必看 / precious 入站必刷 / ranking 排行榜，可组合。"""
     s = _new_session()
 
     def bili_api(url: str) -> dict:
@@ -358,31 +358,101 @@ def enum_bilibili(args, limiter: RateLimiter):
             raise RuntimeError(f"code={d.get('code')} {d.get('message', '')}")
         return d.get("data") or {}
 
-    items, source = [], args.bili_source
-    if source == "popular":
+    src = args.bili_source
+    want = ["popular", "series", "precious", "ranking"] if src == "all" \
+        else [x.strip() for x in src.split(",") if x.strip()]
+
+    bucket = []   # (source_label, item)
+
+    if "popular" in want:
+        got = 0
         for pn in range(1, args.pages + 1):
             try:
                 d = bili_api(f"https://api.bilibili.com/x/web-interface/popular?ps=20&pn={pn}")
             except RuntimeError as e:
-                say(f"[bilibili] popular page {pn} 失败: {e}，降级 ranking")
-                source = "ranking"
+                say(f"[bilibili] popular page {pn} 失败: {e}")
                 break
             batch = d.get("list") or []
             if not batch:
                 break
-            items.extend(batch)
-    if source == "ranking" or not items:
+            got += len(batch)
+            bucket.extend(("popular", it) for it in batch)
+        say(f"[bilibili] popular 候选 {got} 条")
+
+    if "series" in want:
+        # 每周必看：先取期数列表，再抓最近 pages 期（每期 ~50 条）
+        try:
+            d = bili_api("https://api.bilibili.com/x/web-interface/popular/series/list")
+            numbers = [x.get("number") for x in (d.get("list") or []) if x.get("number")]
+            numbers.sort(reverse=True)
+            got = 0
+            for num in numbers[:args.pages]:
+                try:
+                    dd = bili_api(f"https://api.bilibili.com/x/web-interface/popular/series/one?number={num}")
+                    batch = dd.get("list") or []
+                    got += len(batch)
+                    bucket.extend(("series", it) for it in batch)
+                except RuntimeError as e:
+                    say(f"[bilibili] series 第{num}期失败: {e}")
+            say(f"[bilibili] series 每周必看 {min(len(numbers), args.pages)} 期，候选 {got} 条")
+        except Exception as e:
+            say(f"[bilibili] series 列表失败: {e}")
+
+    if "precious" in want:
+        # 入站必刷（百大级别高赞聚合，分页）
+        got = 0
+        for pn in range(1, args.pages + 1):
+            try:
+                d = bili_api(f"https://api.bilibili.com/x/web-interface/popular/precious?page={pn}")
+            except RuntimeError as e:
+                say(f"[bilibili] precious page {pn} 失败: {e}")
+                break
+            batch = d.get("list") or []
+            if not batch:
+                break
+            got += len(batch)
+            bucket.extend(("precious", it) for it in batch)
+        say(f"[bilibili] precious 入站必刷候选 {got} 条")
+
+    if "ranking" in want:
         try:
             d = bili_api("https://api.bilibili.com/x/web-interface/ranking/v2?rid=0&type=all")
-            items.extend(d.get("list") or [])
+            batch = d.get("list") or []
+            bucket.extend(("ranking", it) for it in batch)
+            say(f"[bilibili] ranking 排行榜候选 {len(batch)} 条")
         except Exception as e:
             say(f"[bilibili] ranking 失败: {e}")
 
-    say(f"[bilibili] source={source}，候选 {len(items)} 条")
+    # 兜底：全空再试一次 ranking
+    if not bucket:
+        try:
+            d = bili_api("https://api.bilibili.com/x/web-interface/ranking/v2?rid=0&type=all")
+            bucket.extend(("ranking", it) for it in (d.get("list") or []))
+        except Exception as e:
+            say(f"[bilibili] 兜底 ranking 也失败: {e}")
+
+    say(f"[bilibili] sources={'+'.join(want)}，候选合计 {len(bucket)} 条")
+
+    # 跨轮去重：metadata 里已出现过的 bvid 直接跳过，避免重复下载
+    known = set()
+    meta_path = os.path.join(args.out, "bilibili", "metadata.jsonl")
+    if os.path.exists(meta_path):
+        with open(meta_path, encoding="utf-8") as f:
+            for line in f:
+                if '"bvid"' not in line:
+                    continue
+                try:
+                    bv = json.loads(line).get("bvid")
+                except Exception:
+                    continue
+                if bv:
+                    known.add(bv)
+        say(f"[bilibili] 历史已采集 {len(known)} 个 bvid，自动跳过")
+
     seen = set()
-    for it in items:
+    for source, it in bucket:
         bvid, pic = it.get("bvid"), it.get("pic")
-        if not pic or not bvid or bvid in seen:
+        if not pic or not bvid or bvid in seen or bvid in known:
             continue
         seen.add(bvid)
         yield _bili_task(pic, bvid, it, source)
@@ -613,7 +683,8 @@ def parse_args():
     ap.add_argument("--per-query", type=int, default=10,
                     help="每个 query（B站为一个 feed）目标保存张数（通过过滤后）")
     ap.add_argument("--pages", type=int, default=6, help="每平台/query 最多枚举页数")
-    ap.add_argument("--bili-source", choices=["popular", "ranking"], default="popular")
+    ap.add_argument("--bili-source", default="all",
+                    help="popular / series / precious / ranking，可逗号组合，all=全部")
     ap.add_argument("--out", default="/mnt/nfs/data/zhanqian.wu/unified_images")
     ap.add_argument("--workers", type=int, default=8, help="下载+过滤并发数")
     ap.add_argument("--per-dir", type=int, default=1000,
