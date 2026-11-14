@@ -398,7 +398,9 @@ class ImageDatabaseDataset(Dataset):
 
     def _open_image(self, path, field_kind="single", deadline=None, context=""):
         from data.datasets.video_decode import decode_isolated
-        if str(path).startswith("lmdb://"):
+        if str(path).startswith("tar://"):
+            source = str(path)   # tar:// URI 自带 off/size 定位, 直接透传
+        elif str(path).startswith("lmdb://"):
             source = str(path)
             if ":" not in source.rsplit("/", 1)[-1]:
                 source = f"{source}:{field_kind}"
@@ -428,6 +430,8 @@ class ImageDatabaseDataset(Dataset):
 
         def source_path(path, kind):
             path = str(path)
+            if path.startswith('tar://'):
+                return path   # tar:// URI 自带 off/size 定位, 直接透传
             if path.startswith('lmdb://'):
                 return path if ':' in path.rsplit('/', 1)[-1] else f'{path}:{kind}'
             return str(self.image_root / path) if self.image_root and not Path(path).is_absolute() else path
@@ -539,7 +543,9 @@ class ImageDatabaseDataset(Dataset):
 # 不再存储 (见 _read_parquet 白名单注释)。
 # v3: 新增 kind.npy 行级 uri 后缀列 (0=single, 1=before) — edit 库 t2i_caption
 # 样本以 before 原图作为 image 行入索引, row_dict 重组 image_path 时按 kind 还原后缀。
-_INDEX_FORMAT_VERSION = 3
+# v4: 支持 tar:// scheme (unified tar 分片数据集): 新增 off.npy/size.npy int64 列
+# (lmdb 行恒为 0), row_dict 按 uri_schemes 还原 tar://{shard_dir}/{stem}/{off}:{size}。
+_INDEX_FORMAT_VERSION = 4
 
 
 def _madvise_random(arr: np.ndarray) -> np.ndarray:
@@ -567,26 +573,29 @@ def _madvise_random(arr: np.ndarray) -> np.ndarray:
 class _ColumnarIndex:
     """mmap 只读列式索引。加载后所有数组保持文件映射, 不得整份读取或 .copy()。"""
 
-    def __init__(self, n_image, n_edit, arrays, sources, stems, source_dirs):
+    def __init__(self, n_image, n_edit, arrays, sources, stems, source_dirs, uri_schemes=None):
         self.n_image = int(n_image)
         self.n_edit = int(n_edit)
         (self.sid, self.w, self.h, self.src, self.stem, self.is_edit, self.kind,
-         self.cap_off, self.captions, self.meta_off, self.metadata, self.meta_kind) = arrays
+         self.blob_off, self.blob_size, self.cap_off, self.captions,
+         self.meta_off, self.metadata, self.meta_kind) = arrays
         self.sources = list(sources)
         self.stems = list(stems)
         self.source_dirs = list(source_dirs)
+        self.uri_schemes = list(uri_schemes) if uri_schemes else ["lmdb"] * len(self.sources)
 
     def __len__(self):
         return self.n_image + self.n_edit
 
     @staticmethod
-    def _split_image_uri(image_path) -> tuple[str, str]:
-        """lmdb://{dataset_dir}/{stem}/{sid}:{kind} → (dataset_dir, stem)。
-        载入侧按列重组 image_path, 必须与构建时的 URI 逐字节一致。"""
-        if not isinstance(image_path, str) or not image_path.startswith("lmdb://"):
-            raise RuntimeError(f"列式索引要求 lmdb:// 形式的 image_path, 收到: {image_path!r}")
-        dataset_dir, stem, _ = image_path[len("lmdb://"):].rsplit("/", 2)
-        return dataset_dir, stem
+    def _split_image_uri(image_path) -> tuple[str, str, str]:
+        """lmdb://{dataset_dir}/{stem}/{sid}:{kind} / tar://{shard_dir}/{stem}/{off}:{size}
+        → (dataset_dir, stem, scheme)。载入侧按列重组 image_path, 必须与构建时的 URI 逐字节一致。"""
+        if not isinstance(image_path, str) or not (image_path.startswith("lmdb://") or image_path.startswith("tar://")):
+            raise RuntimeError(f"列式索引要求 lmdb:// 或 tar:// 形式的 image_path, 收到: {image_path!r}")
+        scheme = "tar" if image_path.startswith("tar://") else "lmdb"
+        dataset_dir, stem, _ = image_path[len(scheme) + 3:].rsplit("/", 2)
+        return dataset_dir, stem, scheme
 
     @classmethod
     def build_from_rows(cls, records: list, edits: list) -> "_ColumnarIndex":
@@ -599,6 +608,8 @@ class _ColumnarIndex:
         stem_col = np.empty(n, np.uint32)
         is_edit = np.empty(n, bool)
         kind = np.empty(n, np.uint8)
+        blob_off = np.zeros(n, np.int64)
+        blob_size = np.zeros(n, np.int64)
         cap_off = np.empty(n + 1, np.int64)
         meta_off = np.empty(n + 1, np.int64)
         meta_kind = np.empty(n, np.uint8)
@@ -607,6 +618,7 @@ class _ColumnarIndex:
         source_ids: dict[str, int] = {}
         sources: list[str] = []
         source_dirs: list[str] = []
+        uri_schemes: list[str] = []
         stem_ids: dict[str, int] = {}
         stems: list[str] = []
         cap_off[0] = meta_off[0] = 0
@@ -619,11 +631,15 @@ class _ColumnarIndex:
                 h[pos] = int(height) if height else 0
                 is_edit[pos] = edit_row
                 kind[pos] = int(item.get("uri_kind", 0))
+                blob_off[pos] = int(item.get("blob_off") or 0)
+                blob_size[pos] = int(item.get("blob_size") or 0)
                 source = str(item["source"])
                 if source not in source_ids:
                     source_ids[source] = len(sources)
                     sources.append(source)
-                    source_dirs.append(cls._split_image_uri(item["image_path"])[0])
+                    source_dir, stem, scheme = cls._split_image_uri(item["image_path"])
+                    source_dirs.append(source_dir)
+                    uri_schemes.append(scheme)
                 src[pos] = source_ids[source]
                 stem = cls._split_image_uri(item["image_path"])[1]
                 if stem not in stem_ids:
@@ -652,20 +668,20 @@ class _ColumnarIndex:
                 pos += 1
         empty = np.empty(0, np.uint8)
         arrays = (
-            sid, w, h, src, stem_col, is_edit, kind, cap_off,
+            sid, w, h, src, stem_col, is_edit, kind, blob_off, blob_size, cap_off,
             np.frombuffer(cap_buf, dtype=np.uint8) if len(cap_buf) else empty,
             meta_off,
             np.frombuffer(meta_buf, dtype=np.uint8) if len(meta_buf) else empty,
             meta_kind,
         )
-        return cls(len(records), len(edits), arrays, sources, stems, source_dirs)
+        return cls(len(records), len(edits), arrays, sources, stems, source_dirs, uri_schemes)
 
     def save(self, index_dir: Path, fingerprint: str, created: float, stats) -> None:
         """逐文件原子写 (tmp + rename); meta.json 最后写, 作为目录构建完成的标记。"""
         columns = (
             ("sid.npy", self.sid), ("w.npy", self.w), ("h.npy", self.h),
             ("src.npy", self.src), ("stem.npy", self.stem), ("is_edit.npy", self.is_edit),
-            ("kind.npy", self.kind),
+            ("kind.npy", self.kind), ("blob_off.npy", self.blob_off), ("blob_size.npy", self.blob_size),
             ("cap_off.npy", self.cap_off), ("meta_off.npy", self.meta_off),
             ("meta_kind.npy", self.meta_kind),
         )
@@ -685,6 +701,7 @@ class _ColumnarIndex:
             "sources": self.sources,
             "stems": self.stems,
             "source_dirs": self.source_dirs,
+            "uri_schemes": self.uri_schemes,
             "stats": stats,
         }
         self._atomic_write_bytes(index_dir / "meta.json",
@@ -729,6 +746,8 @@ class _ColumnarIndex:
         stem_col = mmap_npy("stem.npy", np.uint32)
         is_edit = mmap_npy("is_edit.npy", np.bool_)
         kind = mmap_npy("kind.npy", np.uint8)
+        blob_off = mmap_npy("blob_off.npy", np.int64)
+        blob_size = mmap_npy("blob_size.npy", np.int64)
         cap_off = mmap_npy("cap_off.npy", np.int64)
         meta_off = mmap_npy("meta_off.npy", np.int64)
         meta_kind = mmap_npy("meta_kind.npy", np.uint8)
@@ -736,15 +755,16 @@ class _ColumnarIndex:
         metadata = np.memmap(index_dir / "metadata.bin", dtype=np.uint8, mode="r")
         if (sid.shape[0] != n or w.shape[0] != n or h.shape[0] != n or src.shape[0] != n
                 or stem_col.shape[0] != n or is_edit.shape[0] != n or kind.shape[0] != n
-                or meta_kind.shape[0] != n
+                or blob_off.shape[0] != n or blob_size.shape[0] != n or meta_kind.shape[0] != n
                 or cap_off.shape[0] != n + 1 or meta_off.shape[0] != n + 1
                 or int(cap_off[-1]) > captions.shape[0] or int(meta_off[-1]) > metadata.shape[0]):
             raise ValueError("列式索引各列行数/长度不一致")
         return cls(meta["n_image"], meta["n_edit"],
                    tuple(_madvise_random(a) for a in
-                         (sid, w, h, src, stem_col, is_edit, kind, cap_off, captions,
-                          meta_off, metadata, meta_kind)),
-                   meta["sources"], meta["stems"], meta["source_dirs"])
+                         (sid, w, h, src, stem_col, is_edit, kind, blob_off, blob_size,
+                          cap_off, captions, meta_off, metadata, meta_kind)),
+                   meta["sources"], meta["stems"], meta["source_dirs"],
+                   meta.get("uri_schemes"))
 
     def row_dict(self, i: int, bucket: str | None = None) -> dict[str, Any]:
         """按行现拼 item dict (瞬态分配, 用完即弃, 不落任何常驻 Python 对象)。"""
@@ -762,21 +782,31 @@ class _ColumnarIndex:
         else:
             meta_bytes = bytes(self.metadata[int(self.meta_off[i]):int(self.meta_off[i + 1])])
             metadata = meta_bytes.decode("utf-8") if kind == 1 else json.loads(meta_bytes)
-        # uri 后缀: edit 行 image=after/input=before; image 行默认 single,
-        # kind=1 (t2i_caption 样本) 指向 before 原图
-        uri_kind = "after" if edit else ("before" if kind_code == 1 else "single")
+        # uri 重组必须与构建期逐字节一致: lmdb 行 = lmdb://{dir}/{stem}/{sid}:{uri_kind};
+        # tar 行 = tar://{shard_dir}/{stem}/{off}:{size} (off/size 由 parquet images 列直供)
+        if source_id < len(self.uri_schemes) and self.uri_schemes[source_id] == "tar":
+            image_path = f"tar://{dataset_dir}/{stem}/{int(self.blob_off[i])}:{int(self.blob_size[i])}"
+        else:
+            # uri 后缀: edit 行 image=after/input=before; image 行默认 single,
+            # kind=1 (t2i_caption 样本) 指向 before 原图
+            uri_kind = "after" if edit else ("before" if kind_code == 1 else "single")
+            image_path = f"lmdb://{dataset_dir}/{stem}/{sample_id}:{uri_kind}"
         item = {
             "sample_id": sample_id,
             "source": self.sources[source_id],
             "is_edit": edit,
-            "image_path": f"lmdb://{dataset_dir}/{stem}/{sample_id}:{uri_kind}",
+            "image_path": image_path,
             "caption": bytes(self.captions[cap_start:cap_end]).decode("utf-8"),
             "width": width or None,
             "height": height or None,
             "metadata": metadata,
         }
         if edit:
-            item["input_image_path"] = f"lmdb://{dataset_dir}/{stem}/{sample_id}:before"
+            if "tar" == (self.uri_schemes[source_id] if source_id < len(self.uri_schemes) else "lmdb"):
+                # tar edit 行: 输入图取同 shard 内另一成员暂不支持, 交由 TarParquetDataset 限制 image-only
+                item["input_image_path"] = image_path
+            else:
+                item["input_image_path"] = f"lmdb://{dataset_dir}/{stem}/{sample_id}:before"
         if bucket is not None:
             item["bucket"] = bucket
         return item

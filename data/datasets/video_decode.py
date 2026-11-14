@@ -559,6 +559,23 @@ def read_image(path, records=None, target_width=None, target_height=None):
     import io
     from PIL import Image
     Image.MAX_IMAGE_PIXELS = 150_000_000
+    if path.startswith('tar://'):
+        # unified tar 分片数据集: tar://{shard_dir}/{stem}/{off}:{size}
+        # off/size 由 parquet images 列直供 (与 .idx 一致), seek+read 切出 blob,
+        # 无需解析 tar 结构/读 idx; 顺序读友好 (NFS 实测见 docs/dataset_storage_design.md)
+        rest = path[len('tar://'):]
+        off_part, size_part = rest.rsplit(':', 1)
+        shard_dir, off_s = off_part.rsplit('/', 1)
+        off, size = int(off_s), int(size_part)
+        with open(shard_dir + '.tar', 'rb') as handle:
+            handle.seek(off)
+            blob = handle.read(size)
+        with _stage_call('pil_open', Image.open, io.BytesIO(blob)) as image:
+            if image.width * image.height > 150_000_000:
+                raise ValueError('image exceeds pixel limit')
+            _stage_call('image_bound', _bound_image, image, target_width, target_height)
+            rgb = _stage_call('pil_decode_rgb', image.convert, 'RGB')
+            return _stage_call('image_array', np.asarray, rgb)
     if path.startswith('lmdb://'):
         rest = path[len('lmdb://'):]
         rest, kind = rest.rsplit(':', 1)

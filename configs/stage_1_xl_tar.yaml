@@ -1,0 +1,209 @@
+# Giga-Exp Image stage_1 XL (~2B) — NFS unified tar 数据版。
+# 参考 configs/stage_1_xl.yaml, 模型/调度/训练超参完全一致; 唯一区别是数据后端:
+#   PFS LMDB (lmdb_parquet) → NFS 分片 tar (tar_parquet)。
+# 数据布局: <database_path>/<source>/shard-NNNNN.tar + parquet/shard-NNNNN.parquet
+#   (见 .trae/skills/unified-tar-dataset/SKILL.md 与 docs/dataset_storage_design.md)
+# 读取路径: parquet images 列直供 {shard, off, size} → seek+read 一次切出 blob,
+#   不解析 tar 结构、不读 .idx; NFS tar seek 实测 ~816 samples/s @ C=256,
+#   训练需求 (8 卡 b=2 ≈ 20 samples/s) 余量 >40x, 分桶+乱序采样语义与 LMDB 版一致。
+stage: stage_1
+output_dir: /home/jovyan/pfs/users/zhanqian.wu/exp/giga_exp_image/stage_1_xl_tar
+seed: 42
+
+# DeepSpeed launcher: deepspeed --num_gpus=8 train_giga_exp.py --config configs/stage_1_xl_tar.yaml
+distributed:
+  backend: deepspeed
+  config: configs/zero1.json
+  world_size: 8
+  timeout_seconds: 7200
+
+model:
+  # AdaLN 结构 (adaln_type: shared | dual | basis), 旧 shared/dual 全秩 ckpt 加载时自动转换:
+  #   basis (默认): 全模型共享 Linear(dim→r) 投影 P + 每层 mod_img/mod_txt 各一个 Linear(r, 6·dim)
+  #     系数头。调制只依赖 timestep, 56 条调制曲线在 t 流形上秩 ~32-64, r=64 事后低秩转换
+  #     误差 ~3.2% RMS, adaLN 参数 793M→34M (模型 2.95GB→1.43GB bf16)。
+  #   dual  : 每层 mod_img/mod_txt 全秩 Linear (MiniMax H3 风格)
+  #   shared: 每层一个全序列共用 mod
+  adaln_type: basis
+  adaln_rank: 64
+  # Text Refiner (MOSS-Image 风格): text_in 投影后的文本 token 先过 2 层残差自注意力+FFN 再进主 DiT;
+  # 残差支路输出层零初始化 → 初始为恒等映射, step0 与原版逐位一致; 旧 ckpt 无 text_refiner.* 时
+  # 自动恒等初始化并给出警告, 平滑增量学习。设为 false 或删除即回到原版直通。
+  text_trans:
+    enabled: true
+    layers: 2        # MOSS 配置 2 层; 消融可先改 1
+    heads: 16        # 默认同主 DiT heads
+  in_channels: 48
+  out_channels: 48
+  text_dim: 2560
+  dim: 2048
+  ffn_dim: 8192
+  heads: 16
+  layers: 36
+  rope_theta: 10000.0
+  # 4D RoPE: (time, height, width, text_position), head_dim = 128, 与 dim 解耦不变
+  rope_axes_dims: [16, 48, 48, 16]
+  patch_size: [1, 1, 1]
+
+components:
+  text_encoder:
+    type: qwen3_vl
+    pretrained_path: /mnt/nfs/models/huggingface/Qwen/Qwen3-VL-4B-Instruct
+    tokenizer_path: /mnt/nfs/models/huggingface/Qwen/Qwen3-VL-4B-Instruct
+    local_files_only: true
+    layer: -2                     # 取倒数第二层 hidden states (对齐 gigaworld stage1 约定)
+    max_length: 2048
+  wan_vae:
+    type: AutoencoderKLWan
+    pretrained_path: /mnt/nfs/models/huggingface/models--Wan-AI--Wan2.2-TI2V-5B-Diffusers
+    subfolder: vae
+    local_files_only: true
+
+scheduler:
+  type: flow_matching
+  num_train_timesteps: 1000
+  shift: 3.0
+  timestep_sampling: uniform
+  validation_shift: 3.0
+
+dataset:
+  # ── 数据后端: NFS unified tar 分片 (与 stage_1_xl.yaml 的 PFS LMDB 互不影响) ──
+  # tar 后端暂不支持 edit/t2i_edit 训练 (配置 edit 相关 key 会直接报错)。
+  dataset_type: tar_parquet
+  image_training_enabled: true
+  edit_training_enabled: false
+  # tar 根目录: 每个源一个子目录, 四件套 shard-NNNNN.{tar,idx,meta.jsonl} + parquet/
+  database_path: /mnt/nfs/data/zhanqian.wu/unified_images_tar
+  image_sources:
+    - 4KLSDB
+    - Aesthetic-4K
+    - HumanCaption-10M
+    - LAION_Aesthetics_1024
+    - Poster100K
+    - anime_captions
+    - bg_photo_concepts
+    - blip3o-long-caption-wds
+    - blip3o-long-caption
+    - caption3o-xl-v4
+    - ffhq_captioned_1024
+    - fine_t2i
+    - pexels-advertisement-photography
+    - pexels_aesth_2_1024
+    - qwen-synth-characters-fused
+    - sa1b_en
+    - anyword_3m
+    - pixelprose_cc12m
+    - pixelprose_commonpool
+    - pixelprose_redcaps
+    - monet_cc12m
+    - monet_commoncatalog_cc_by
+    - monet_coyo
+    - GenPoster100K
+    - Text-Render-2M
+    - moss_synth_sa1b_10h
+    - FLUX-Reason-6M
+    - JourneyDB
+    - moss_synth
+    - moss_synth_eval100k
+    - h3image_synth_webcap_10h
+    - moss_synth_300k_48h
+  contract: "[B,C,T,H,W]"
+  num_frames: 1
+  preprocess_style: cover   # 短边贴桶+中心裁剪, 与 LMDB 版一致
+  resolution: 512
+  long_edge: 512
+  max_upscale_ratio: 1.2    # 512 桶要求源图短边 >= 427px
+  max_retries: 16
+  refresh_index_cache: false   # 指纹 = tar 根目录 + sources + 每源 (parquet 分片数, tar 分片数);
+                               # NFS 上新入库分片会使指纹失效并自动重建 (rank0 扫描, 其余 rank 等待)
+  index_cache_dir: /home/jovyan/pfs/users/zhanqian.wu/exp/giga_exp_image/stage_1_xl_tar/dataset_index_cache
+  # 256/512 混合分辨率训练: patch(1,1,1) 下 token 数 256px=256, 512px=1024。
+  # 桶归属在加载后按 width/height 重算, 256 桶要求源图短边 >= 213px (max_upscale_ratio 1.2);
+  # 同比例高分桶 (512→256) 自动借图降采样, 桶耗尽不回绕重复。
+  buckets:
+    - 256_square
+    - 256x192
+    - 192x256
+    - 512_square
+    - 512x384
+    - 384x512
+  # 采样权重: 256 组合计 ~30%, 512 组 ~70% (按 512 层内比例分配, 可调)
+  bucket_sampling_weights:
+    256_square: 0.14
+    256x192: 0.08
+    192x256: 0.08
+    512_square: 0.315
+    512x384: 0.1925
+    384x512: 0.1925
+  # 每桶 per-device batch: text max_length 512→2048 后文本激活随 batch 线性涨,
+  # 256 桶 16 张图 x ~2048 text token 直接 OOM (copy10 step-320459 实测), 16→4 对齐 MoE 配置
+  bucket_batch_sizes:
+    256_square: 4
+    256x192: 4
+    192x256: 4
+
+validation:
+  enabled: true
+  every_n_steps: 1000
+  per_rank: true
+  use_next_batch: true
+  num_inference_steps: 20
+  seed: 42
+  guidance_scale: 3.0
+
+training:
+  enabled: true
+  t2v_only: true
+  cfg_dropout: 0.1
+  # patch (1,1,1) 后 image token x4 (512px: 256 -> 1024/token/图), 最长序列 1024+2048;
+  # text max_length 512→2048 后文本激活占大头, b=4 在超长 caption 样本上 OOM
+  # (2026-11-14 step-320027 实测 copy9 96MiB @ norm2(txt)), 降为 b=2 + grad_accum=1
+  batch_size_per_device: 2
+  # NFS tar 版 dataloader: 4→8 workers。tar seek 单读 ~10ms (p50), 解码是主要开销,
+  # 更多 worker 提高解码并发 (8 rank x 8 worker = 64 路并发, 实测 ~430 samples/s @ C=64)
+  num_workers: 8
+  max_epochs: 6
+  mixed_precision: bf16
+  optimizer: adamw
+  # 已从 muon+adam 切换回纯 AdamW: hidden 2D 矩阵与 out 头/1D 参数统一走 AdamW (base lr, Muon 3x 系数不再生效)。
+  # 注意: 优化器结构变化, 续训时旧 checkpoint 的 optimizer state 不匹配, 会自动降级为纯权重恢复
+  # (step 保留, optimizer 状态重置), 日志有 ⚠️ 提示, 属预期行为。
+  # 就地编译 DiT (nn.Module.compile, 数学等价): 融合每层 norm/adaLN/RoPE 小 kernel, 缓解 36 层 launch overhead;
+  # 前几步为编译 warmup, step 耗时先长后短属正常
+  torch_compile: false #true
+  muon:
+    enabled: false               # 如需切回 muon+adam: enabled 改 true, optimizer 改 muon+adam
+    momentum: 0.95
+    learning_rate: 3x
+    adjust_lr_fn: match_rms_adamw
+    weight_decay: 0.0
+  adam:
+    enabled: true
+    betas: [0.9, 0.95]
+    epsilon: 1.0e-8
+  # XL 从零训练: lr 相对 stage_1 (1e-4) 下调, warmup 拉长适配更大模型
+  learning_rate: 5.0e-5
+  weight_decay: 0.005
+  lr_scheduler: cosine
+  lr_warmup_steps: 1000
+  gradient_accumulation_steps: 1
+  checkpointing_steps: 2500
+  state_checkpoints_keep: 2      # DeepSpeed 完整 state 只保留最近 2 个, 纯 weights 快照全部保留
+  # auto: 自动恢复 output_dir 下最新 state/weights；none: 不恢复；也可填 .safetensors/.pt 文件或 weights 目录路径，强制从指定纯权重恢复。
+  resume_mode: auto   # tar 数据版全新 output_dir, 从零训练
+  resume_optimizer: false
+  resume_lr_scheduler: true
+
+logging:
+  report_to: [console, swanlab]
+  log_every_n_steps: 1
+  save_samples: true
+  swanlab:
+    enabled: true
+    project: giga-exp-image
+    name: giga_exp_image_stage_1_xl_tar
+    api_key: Dit2ngq8iuiGfUkI88e5b
+  wandb:
+    enabled: false
+    project: giga-exp-image
+    name: giga_exp_image_stage_1_xl_tar
