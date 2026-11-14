@@ -27,6 +27,10 @@ export YISU_IMAGE_PERSISTENT_DECODER=0
 
 # NCCL 只在 WARN 及以上时输出: 平时静默, 通信异常(超时/降级/连接失败)时能看到原因
 export NCCL_DEBUG=WARN
+# expandable_segments: 显存按需扩展虚拟段, 缓解碎片; b=2 打满 ~78GB 时超长样本
+# 偶发 "差几十 MiB" OOM 的官方建议 (2026-11-14 step-320027 实测)
+export PYTORCH_ALLOC_CONF=expandable_segments:True
+
 # 打印每次 dynamo 重编译的具体 guard 失败原因, 用于定位反复重编译的元凶
 export TORCH_LOGS=recompiles
 

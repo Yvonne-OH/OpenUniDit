@@ -130,6 +130,7 @@ dataset:
   # 以 before 原图 + 描述 caption 作为普通 image 样本参与 t2i 训练 (~741 万行, caption 无空值);
   # 读 <root>/<source>/parquet_t2i/, 多参考图源 (unipic_*/Macro-Dataset) 不支持自动跳过。
   # 注意: 新增数据源会改变索引指纹, 首次启动会重建一次索引缓存 (rank0 扫描, 其余 rank 等待)。
+  # 2026-11-14 暂时停用 edit 库 7 源 (t2i_caption 图): 减少索引体积与 LMDB 读压力, 需要时恢复
   t2i_edit_database_path: /home/jovyan/pfs/users/zhanqian.wu/pfs_data/unified_edit_images_lmdb
   t2i_edit_sources_t2i_mode:
     - HQ-Edit
@@ -186,8 +187,10 @@ training:
   t2v_only: true
   cfg_dropout: 0.1
   # patch (1,1,1) 后 image token x4 (512px: 256 -> 1024/token/图), 最长序列 1024+512;
-  # batch 减半相对 stage_1 (8 -> 4) 对齐显存, 后续可按显存余量调回
-  batch_size_per_device: 4
+  # batch 减半相对 stage_1 (8 -> 4) 对齐显存。b=4 时显存 ~79GB 打满, 超长文本样本
+  # (txt 激活随长度线性涨) 一步即 OOM (2026-11-14 step-320027 实测), 降为 b=2 + grad_accum=2
+  # 等效 batch 32 与原先一致
+  batch_size_per_device: 2
   num_workers: 4
   max_epochs: 6
   mixed_precision: bf16
