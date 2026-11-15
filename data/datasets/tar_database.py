@@ -24,7 +24,8 @@ from data.datasets.image_database import LmdbParquetDataset, collate_image_batch
 
 
 class TarParquetDataset(LmdbParquetDataset):
-    """unified_images_tar 分片 tar 数据集: 只支持 image 训练 (edit/t2i 走 LMDB 库)。"""
+    """unified_images_tar 分片 tar 数据集: image 训练 + edit 库 t2i_caption 模式
+    (before 原图 + 描述 caption 作普通 image 样本); edit 对训练仍走 lmdb_parquet 后端。"""
 
     def __init__(self, database_path: str, buckets: list[str], lmdb_root: str | None = None,
                  image_root: str | None = None, transform=None, max_upscale_ratio: float = 1.2,
@@ -39,9 +40,7 @@ class TarParquetDataset(LmdbParquetDataset):
                  t2i_edit_database_path: str | None = None, t2i_edit_sources_t2i_mode: list[str] | None = None,
                  **kwargs):
         if edit_training_enabled or edit_database_path:
-            raise NotImplementedError("TarParquetDataset 暂不支持 edit 训练 (edit 库仍走 lmdb_parquet 后端)")
-        if t2i_edit_database_path or t2i_edit_sources_t2i_mode:
-            raise NotImplementedError("TarParquetDataset 暂不支持 t2i_edit 库 (需在 yaml 中去掉 t2i_edit_* 配置)")
+            raise NotImplementedError("TarParquetDataset 暂不支持 edit 对训练 (edit 库仍走 lmdb_parquet 后端)")
         self.tar_root = Path(database_path)
         if not self.tar_root.is_dir():
             raise FileNotFoundError(f"tar 数据集根目录不存在: {self.tar_root}")
@@ -54,6 +53,8 @@ class TarParquetDataset(LmdbParquetDataset):
             index_cache_dir=index_cache_dir, refresh_index_cache=refresh_index_cache,
             bucket_sampling_weights=bucket_sampling_weights,
             max_decode_candidates=max_decode_candidates, preprocess_style=preprocess_style,
+            t2i_edit_database_path=t2i_edit_database_path,
+            t2i_edit_sources_t2i_mode=t2i_edit_sources_t2i_mode,
             **kwargs,
         )
 
@@ -62,35 +63,46 @@ class TarParquetDataset(LmdbParquetDataset):
     def _shard_signature(self, edit_database_path: str | None = None,
                          t2i_database_path: str | None = None) -> dict[str, list[int]]:
         signature: dict[str, list[int]] = {}
-        root = self.tar_root
         ttl = float(os.environ.get("GWP_SHARD_SIGNATURE_TTL", 300))
         self.index_cache_dir.mkdir(parents=True, exist_ok=True)
-        snapshot = self._load_signature_snapshot("tar", root, ttl)
-        for source_dir in self._discover_source_dirs(root, self.sources):
-            name = f"tar:{source_dir.name}"
-            if snapshot and name in snapshot:
-                signature[name] = snapshot[name]
-                continue
-            try:
-                pq_count = sum(1 for entry in os.listdir(source_dir / "parquet")
-                               if entry.startswith("shard-") and entry.endswith(".parquet"))
-                tar_count = sum(1 for entry in os.listdir(source_dir)
-                                if entry.startswith("shard-") and entry.endswith(".tar"))
-            except OSError:
-                continue
-            signature[name] = [pq_count, tar_count]
-        self._write_signature_snapshot("tar", root, signature)
+        roots: list[tuple[str, Path, list[str] | None]] = [("tar", self.tar_root, self.sources)]
+        if t2i_database_path:
+            roots.append(("t2i", Path(t2i_database_path), self.t2i_edit_sources_t2i_mode))
+        for label, root, sources in roots:
+            snapshot = self._load_signature_snapshot(label, root, ttl)
+            for source_dir in self._discover_source_dirs(root, sources):
+                name = f"{label}:{source_dir.name}"
+                if snapshot and name in snapshot:
+                    signature[name] = snapshot[name]
+                    continue
+                try:
+                    pq_subdir = "parquet_t2i" if label == "t2i" else "parquet"
+                    pq_count = sum(1 for entry in os.listdir(source_dir / pq_subdir)
+                                   if entry.endswith(".parquet"))
+                    tar_count = sum(1 for entry in os.listdir(source_dir)
+                                    if entry.endswith(".tar"))
+                except OSError:
+                    continue
+                signature[name] = [pq_count, tar_count]
+            self._write_signature_snapshot(label, root, signature)
         return signature
 
     # ─── 元数据扫描: 只读检索列 (列裁剪), blob 定位信息来自 images 列 ───
 
     def _read_parquet(self, path, sources, is_edit, lmdb_root, limit=None, t2i: bool = False):
-        if is_edit or t2i:
-            raise NotImplementedError("TarParquetDataset 只支持 image 模式读取")
+        if is_edit:
+            raise NotImplementedError("TarParquetDataset 只支持 image 模式读取 (edit 对训练走 LMDB 库)")
         import pyarrow.parquet as parquet
 
+        # t2i 模式: 读 edit tar 库各 source 的 parquet_t2i/ (原 tar parquet + t2i_caption 列,
+        # 由 tools/build_tar_parquet_t2i.py 生成), 以 before 原图 + 描述 caption 生成普通 image 行。
+        pq_subdir = "parquet_t2i" if t2i else "parquet"
+        # tar edit 库分片命名不统一 (shard-* / {env_stem}-NNNNN), 统一按 *.parquet / *.tar 计数;
+        # image 库保持 shard-* glob 以防 parquet/ 下出现其他 parquet 文件
+        pq_glob = "*.parquet" if t2i else "shard-*.parquet"
+
         root = Path(path)
-        if (root / "parquet").is_dir():
+        if (root / pq_subdir).is_dir():
             source_dirs = [root]
         else:
             source_dirs = [root / source for source in sorted(sources)] if sources else sorted(
@@ -115,15 +127,15 @@ class TarParquetDataset(LmdbParquetDataset):
             source = source_dir.name
             if sources and source not in sources:
                 continue
-            pq_files = sorted((source_dir / "parquet").glob("shard-*.parquet"))
+            pq_files = sorted((source_dir / pq_subdir).glob(pq_glob))
             tar_count = sum(1 for entry in os.listdir(source_dir)
-                            if entry.startswith("shard-") and entry.endswith(".tar"))
+                            if entry.endswith(".tar"))
             if not pq_files:
-                print(f"⚠️ {source}: parquet/ 下无 shard-*.parquet, 已跳过该源", flush=True)
+                print(f"⚠️ {source}: {pq_subdir}/ 下无 *.parquet, 已跳过该源", flush=True)
                 continue
             if len(pq_files) != tar_count:
                 raise RuntimeError(
-                    f"Parquet/tar 分片数量不一致: {source_dir} parquet={len(pq_files)} tar={tar_count}"
+                    f"Parquet/tar 分片数量不一致: {source_dir} {pq_subdir}={len(pq_files)} tar={tar_count}"
                 )
             file_list.extend((file, source_dir) for file in pq_files)
         # 并行读分片: pyarrow 的 footer/列读取释放 GIL, NFS 上单线程逐分片开文件
@@ -134,8 +146,11 @@ class TarParquetDataset(LmdbParquetDataset):
         def load_shard(task):
             file, source_dir = task
             pf = parquet.ParquetFile(str(file))   # footer 读一次, schema 与列读共用, 不再二次开文件
-            columns = [name for name in ("caption", "text", "w", "h", "width", "height", "images")
-                       if name in set(pf.schema_arrow.names)]
+            if t2i:
+                want = ("t2i_caption", "w_before", "h_before", "images")
+            else:
+                want = ("caption", "text", "w", "h", "width", "height", "images")
+            columns = [name for name in want if name in set(pf.schema_arrow.names)]
             return file, source_dir, pf.read(columns=columns)
 
         def iter_tables():
@@ -157,7 +172,7 @@ class TarParquetDataset(LmdbParquetDataset):
             source = source_dir.name
             source_stats = stats.setdefault(source, {
                 "shards": 0, "total": 0, "valid": 0, "filtered_no_image": 0,
-                "limit_stopped": False,
+                "filtered_no_caption": 0, "limit_stopped": False,
             })
             if limit is not None and source_counts.get(source, 0) >= int(limit):
                 source_stats["limit_stopped"] = True
@@ -174,32 +189,54 @@ class TarParquetDataset(LmdbParquetDataset):
                 if not images:
                     source_stats["filtered_no_image"] += 1
                     continue
-                # image-only 模式: blob 取 images[0]; edit 对 (before/after) 尚未接入 tar 后端
-                blob = images[0]
+                if t2i:
+                    # t2i 行: before 原图 + Qwen3-VL 描述 caption (宽高取 w_before/h_before)。
+                    # 多参考图源 t2i_caption 是 list → 非 str 视为无效; 空 caption 同样跳过。
+                    cap = row.get("t2i_caption")
+                    if not isinstance(cap, str) or not cap.strip():
+                        source_stats["filtered_no_caption"] += 1
+                        continue
+                # image-only 模式: blob 取 images[0]; t2i 模式取 id 含 before 的成员
+                # (edit 对 images[0]=img_before, images[1]=img_after; PATHS 去重条目同样带 shard/off/size)
+                if t2i:
+                    blob = next((b for b in images if "before" in str(b.get("id", ""))), images[0])
+                else:
+                    blob = images[0]
                 # images[].shard 形如 "shard-00000.tar", 去掉扩展名得到 stem; 缺失时退回 parquet stem
                 blob_stem = str(blob.get("shard") or "").removesuffix(".tar") or stem
-                rows.append({
+                entry = {
                     "sample_id": pos,          # 分片内行号 (tar 后端 id 为字符串, 不入 int64 列式索引)
                     "source": source,
                     "is_edit": False,
-                    "caption": row.get("caption") or row.get("text") or "",
-                    "width": row.get("w") if row.get("w") is not None else row.get("width"),
-                    "height": row.get("h") if row.get("h") is not None else row.get("height"),
                     "image_path": f"tar://{shard_dir}/{blob_stem}/{int(blob['off'])}:{int(blob['size'])}",
                     "blob_off": int(blob["off"]),
                     "blob_size": int(blob["size"]),
-                })
+                }
+                if t2i:
+                    entry.update(caption=cap,
+                                 width=row.get("w_before"), height=row.get("h_before"))
+                else:
+                    entry.update(
+                        caption=row.get("caption") or row.get("text") or "",
+                        width=row.get("w") if row.get("w") is not None else row.get("width"),
+                        height=row.get("h") if row.get("h") is not None else row.get("height"),
+                    )
+                rows.append(entry)
                 source_counts[source] = source_counts.get(source, 0) + 1
                 source_stats["valid"] += 1
         if not rows:
             raise RuntimeError(f"tar parquet 数据没有可用样本: {path}")
-        self.read_stats["image"] = stats
+        if t2i:
+            # t2i 行并入 image 模式统计 (普通 image 读取已写过该 key, 不能覆盖)
+            self.read_stats.setdefault("image", {}).update(stats)
+        else:
+            self.read_stats["image"] = stats
         if excluded_sources:
             self.read_stats["image_excluded"] = excluded_sources
         grand = {key: sum(int(info.get(key, 0)) for info in stats.values())
                  for key in ("shards", "total", "valid")}
         print(
-            f"✅ tar parquet 读取完成[image]: sources={len(stats)} 分片={grand['shards']:,} "
+            f"✅ tar parquet 读取完成[{'t2i' if t2i else 'image'}]: sources={len(stats)} 分片={grand['shards']:,} "
             f"总数={grand['total']:,} 有效={grand['valid']:,} "
             f"过滤={grand['total'] - grand['valid']:,} ({time.time() - t0:.1f}s)"
             + (f" 未加载目录={excluded_sources}" if excluded_sources else ""),

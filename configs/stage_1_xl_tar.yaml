@@ -68,7 +68,8 @@ scheduler:
 
 dataset:
   # ── 数据后端: NFS unified tar 分片 (与 stage_1_xl.yaml 的 PFS LMDB 互不影响) ──
-  # tar 后端暂不支持 edit/t2i_edit 训练 (配置 edit 相关 key 会直接报错)。
+  # tar 后端支持 image 训练 + edit 库 t2i_caption 模式 (t2i_edit_*); edit 对训练仍走 LMDB
+  # (配置 edit_training_enabled/edit_database_path 会直接报错)。
   dataset_type: tar_parquet
   image_training_enabled: true
   edit_training_enabled: false
@@ -107,6 +108,20 @@ dataset:
     - moss_synth_eval100k
     - h3image_synth_webcap_10h
     - moss_synth_300k_48h
+  # 2026-11-15 新增: edit 库 7 个单图对源的 t2i_caption 模式 (tar 版), 与 LMDB 版
+  # stage_1_xl.yaml 对齐: before 原图 + Qwen3-VL 描述 caption 作普通 image 样本 (~741 万行)。
+  # 读 <edit_tar_root>/<source>/parquet_t2i/ (由 tools/build_tar_parquet_t2i.py 从 LMDB
+  # parquet_t2i 按 id 合并生成); 多参考图源 (unipic_*/Macro-Dataset) 不支持自动跳过。
+  # 注意: 新增 t2i 配置会改变索引指纹, 首次启动会重建一次索引缓存 (rank0 扫描, 其余 rank 等待)。
+  t2i_edit_database_path: /mnt/nfs/data/zhanqian.wu/unified_edit_images_tar
+  t2i_edit_sources_t2i_mode:
+    - HQ-Edit
+    - GPT-UltraEdit
+    - GPT-HQEdit
+    - pico-banana-400k
+    - GPT-OmniEdit
+    - CrispEdit
+    - SEED-Data-Edit
   contract: "[B,C,T,H,W]"
   num_frames: 1
   preprocess_style: cover   # 短边贴桶+中心裁剪, 与 LMDB 版一致
@@ -162,7 +177,7 @@ training:
   # NFS tar 版 dataloader: 4→8 workers。tar seek 单读 ~10ms (p50), 解码是主要开销,
   # 更多 worker 提高解码并发 (8 rank x 8 worker = 64 路并发, 实测 ~430 samples/s @ C=64)
   num_workers: 8
-  max_epochs: 6
+  max_epochs: 2
   mixed_precision: bf16
   optimizer: adamw
   # 已从 muon+adam 切换回纯 AdamW: hidden 2D 矩阵与 out 头/1D 参数统一走 AdamW (base lr, Muon 3x 系数不再生效)。
