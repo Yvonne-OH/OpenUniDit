@@ -37,6 +37,7 @@ from data.lmdb_dataset import GigaLMDBDataset, collate_image_batch
 from data.samplers.bucket_sampler import BucketBatchSampler
 from models.giga_transformer import (GigaExpTransformer, apply_adaln_basis_migration,
                                      apply_mod_adaln_migration)
+from models.wan5b_single_stream import Wan5BSingleStream
 from models.moe import apply_dense_to_moe_migration
 import models.giga_transformer as _giga_transformer
 
@@ -848,7 +849,10 @@ def main():
         raise ValueError(f"tokenizer 词表异常: {tc['tokenizer_path']}")
     text_encoder = build_text_encoder(tc, dtype, device)
     vae = AutoencoderKLWan.from_pretrained(dc["pretrained_path"], subfolder=dc.get("subfolder", "vae"), torch_dtype=torch.float32, local_files_only=True).eval().to(device)
-    model = GigaExpTransformer(**cfg["model"]).to(device, dtype=dtype)
+    # model.type 分发 (缺省 giga = GigaExpTransformer): wan5b_ss 为 Wan2.2 5B 单流化结构
+    model_cfg = dict(cfg["model"])
+    model_cls = {"giga": GigaExpTransformer, "wan5b_ss": Wan5BSingleStream}[model_cfg.pop("type", "giga")]
+    model = model_cls(**model_cfg).to(device, dtype=dtype)
     if getattr(model, "has_moe", False):
         # router 要求全 fp32: .to(bf16) 会把 gate 一并降精度, 这里回浮 (权重常驻 fp32)
         model.cast_router_fp32()
