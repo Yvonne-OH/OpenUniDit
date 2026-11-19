@@ -44,6 +44,10 @@ model:
   # 4D RoPE: (time, height, width, text_position), head_dim = 128, 与 dim 解耦不变
   rope_axes_dims: [16, 48, 48, 16]
   patch_size: [1, 1, 1]
+  # 激活检查点 (forward 块级重算, +~30% 计算换 GB 级激活显存): 默认 false。
+  # Wan2.2 VAE 空间压缩 16 → 720p=3600 token/图, 1024=4096, b=1 时与 512 桶 b=2 同级显存,
+  # 当前桶组合无需开启; 若 1024_square 长文本样本偶发 OOM, 改 true 兜底
+  activation_checkpointing: false
 
 components:
   text_encoder:
@@ -132,9 +136,11 @@ dataset:
   refresh_index_cache: false   # 指纹 = tar 根目录 + sources + 每源 (parquet 分片数, tar 分片数);
                                # NFS 上新入库分片会使指纹失效并自动重建 (rank0 扫描, 其余 rank 等待)
   index_cache_dir: /home/jovyan/pfs/users/zhanqian.wu/exp/giga_exp_image/stage_1_xl/dataset_index_cache
-  # 256/512 混合分辨率训练: patch(1,1,1) 下 token 数 256px=256, 512px=1024。
-  # 桶归属在加载后按 width/height 重算, 256 桶要求源图短边 >= 213px (max_upscale_ratio 1.2);
-  # 同比例高分桶 (512→256) 自动借图降采样, 桶耗尽不回绕重复。
+  # 多分辨率混合训练: Wan2.2 VAE 空间压缩 16, patch(1,1,1) 下 token 数 256px=256, 512px=1024,
+  # 720p=3600, 1024px=4096。桶归属在加载后按 width/height 重算:
+  #   720p 桶要求源图短边 >= 600px (主流 1024+ 源都够);
+  #   1024_square 要求源图短边 >= 854px (max_upscale_ratio 1.2);
+  #   同比例高分桶 (512→256) 自动借图降采样, 桶耗尽不回绕。
   buckets:
     - 256_square
     - 256x192
@@ -142,20 +148,31 @@ dataset:
     - 512_square
     - 512x384
     - 384x512
-  # 采样权重: 256 组合计 ~30%, 512 组 ~70% (按 512 层内比例分配, 可调)
+    - 1280x720
+    - 720x1280
+    - 1024_square
+  # 采样权重 (合计 1.0): 256 组 25% / 512 组 42% / 720p 组 21% / 1024 方图 12%
   bucket_sampling_weights:
-    256_square: 0.14
-    256x192: 0.08
-    192x256: 0.08
-    512_square: 0.315
-    512x384: 0.1925
-    384x512: 0.1925
+    256_square: 0.12
+    256x192: 0.065
+    192x256: 0.065
+    512_square: 0.19
+    512x384: 0.115
+    384x512: 0.115
+    1280x720: 0.12
+    720x1280: 0.09
+    1024_square: 0.12
   # 每桶 per-device batch: text max_length 512→2048 后文本激活随 batch 线性涨,
   # 256 桶 16 张图 x ~2048 text token 直接 OOM (copy10 step-320459 实测), 16→4 对齐 MoE 配置
   bucket_batch_sizes:
     256_square: 4
     256x192: 4
     192x256: 4
+    # 720p/1024 b=1 时总 token (img+text) 与 512 桶 b=2 同级 (~5.6k/6.1k), 显存同级;
+    # b=2 会翻倍到 11k+ 超临界, 先 b=1 探路, 稳定后可试 2 (OOM 则开 activation_checkpointing)
+    1280x720: 1
+    720x1280: 1
+    1024_square: 1
 
 validation:
   enabled: true
@@ -174,9 +191,9 @@ training:
   # text max_length 512→2048 后文本激活占大头, b=4 在超长 caption 样本上 OOM
   # (2026-11-14 step-320027 实测 copy9 96MiB @ norm2(txt)), 降为 b=2 + grad_accum=1
   batch_size_per_device: 2
-  # NFS tar 版 dataloader: 4→8 workers。tar seek 单读 ~10ms (p50), 解码是主要开销,
-  # 更多 worker 提高解码并发 (8 rank x 8 worker = 64 路并发, 实测 ~430 samples/s @ C=64)
-  num_workers: 8
+  # NFS tar 版 dataloader: 8→16 workers (2026-11-19 本机压测 5.4x, persistent_decoder 同步恢复=1)。
+  # collate 走 numpy 管道不占 /dev/shm; 注意每节点 8 rank × 16 worker = 128 解码进程, 需 CPU 核数够
+  num_workers: 16
   max_epochs: 2
   mixed_precision: bf16
   optimizer: adamw
@@ -185,7 +202,7 @@ training:
   # (step 保留, optimizer 状态重置), 日志有 ⚠️ 提示, 属预期行为。
   # 就地编译 DiT (nn.Module.compile, 数学等价): 融合每层 norm/adaLN/RoPE 小 kernel, 缓解 36 层 launch overhead;
   # 前几步为编译 warmup, step 耗时先长后短属正常
-  torch_compile: false #true
+  torch_compile: false
   muon:
     enabled: false               # 如需切回 muon+adam: enabled 改 true, optimizer 改 muon+adam
     momentum: 0.95

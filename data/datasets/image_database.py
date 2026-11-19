@@ -109,8 +109,10 @@ def _lmdb_image_bytes(uri: str) -> bytes:
 _IMAGE_COLUMNS = ("sample_id", "image_path", "path", "file_path", "uri", "caption", "source", "width", "height", "bucket")
 _EDIT_COLUMNS = ("sample_id", "source", "source_id", "split", "instruction", "input_image_path", "output_image_path", "input_width", "input_height", "output_width", "output_height", "metadata_json")
 
-# Wan VAE 空间压缩 16，经压缩后还须被 GWP patch 2 整除 ⇒ 像素宽高必须被 32 整除
-BUCKET_PIXEL_MULTIPLE = 32
+# Wan2.2 TI2V VAE (AutoencoderKLWan, 48ch) 空间压缩 16; patch (1,1,1) 下无额外约束
+# ⇒ 像素宽高须被 16 整除 (720p=45x16, 1280=80x16, 1024=64x16 均 OK; 1080 非 16 倍数不可用)。
+# (旧值 32 = "压缩 16 × patch 2" 的历史假设, 当前模型 patch(1,1,1) 只需 16)
+BUCKET_PIXEL_MULTIPLE = 16
 
 
 def parse_bucket(bucket: str) -> tuple[int, int]:

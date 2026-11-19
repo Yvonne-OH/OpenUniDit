@@ -370,8 +370,11 @@ class GigaExpTransformer(nn.Module):
     def __init__(self, in_channels=48, out_channels=48, text_dim=4096, dim=1792,
                  ffn_dim=4864, heads=14, layers=24, rope_theta=10000.0,
                  rope_axes_dims=(32, 32, 32, 32), patch_size=(1, 1, 1), mod_adaln=False,
-                 text_trans=False, adaln_type=None, adaln_rank=64, moe=None):
+                 text_trans=False, adaln_type=None, adaln_rank=64, moe=None,
+                 activation_checkpointing=False):
         super().__init__()
+        # 激活检查点: 高分辨率桶 (720p/1024/1080p) 训练必需, 见 forward 内 use_ckpt 注释
+        self.activation_checkpointing = bool(activation_checkpointing)
         self.patch_size = tuple(patch_size)
         if len(self.patch_size) != 3 or self.patch_size[0] != 1 or any(p < 1 for p in self.patch_size):
             raise ValueError("patch_size 必须是时间维为 1 的三个正整数")
@@ -494,6 +497,7 @@ class GigaExpTransformer(nn.Module):
             "patch_size": list(self.patch_size),
             "rope_theta": self.rope.theta,
             "rope_axes": list(self.rope.axes_dims),
+            "activation_checkpointing": self.activation_checkpointing,
             "mod_adaln": self.mod_adaln,
             "adaln_type": self.adaln_type,
             "adaln_rank": self.adaln_rank,
@@ -573,8 +577,19 @@ class GigaExpTransformer(nn.Module):
             for block in self.blocks:
                 block.last_moe_aux = None
         features = [] if feature_layers is not None else None
+        # 激活检查点 (model.activation_checkpointing 开关): 720p/1024/1080p 单图 token 14k~33k,
+        # 36 层 dim2048 无 ckpt 时激活+workspace 数百 GB 直接 OOM (512 桶 b=2 已在 78GB 临界);
+        # per-block use_reentrant=False 重算把激活压到 GB 级, 代价 +~30% 计算。
+        # 与 torch.compile 兼容 (块间 graph break, 块内融合保留); KD 特征路径不启用。
+        use_ckpt = (self.activation_checkpointing and self.training
+                    and torch.is_grad_enabled() and feature_layers is None)
+        from torch.utils.checkpoint import checkpoint as _ckpt
         for block_idx, block in enumerate(self.blocks):
-            x = block(x, cond, cos, sin, attention_mask, pack, n_img, denoising_step=self._moe_denoising_step)
+            if use_ckpt:
+                x = _ckpt(block, x, cond, cos, sin, attention_mask, pack, n_img,
+                          denoising_step=self._moe_denoising_step, use_reentrant=False)
+            else:
+                x = block(x, cond, cos, sin, attention_mask, pack, n_img, denoising_step=self._moe_denoising_step)
             if block.last_moe_aux is not None:
                 self.moe_aux_losses.append(block.last_moe_aux)
             if features is not None and block_idx in feature_layers:

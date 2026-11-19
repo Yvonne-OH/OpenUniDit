@@ -161,10 +161,14 @@ training:
   t2v_only: true
   cfg_dropout: 0.1
   batch_size_per_device: 1
-  num_workers: 8
+  # 16 workers: collate 走 numpy 管道不占 /dev/shm (collate_image_batch 设计), 翻倍掩盖 NFS 延迟;
+  # 注意每节点 8 rank × 16 worker = 128 解码进程, 需节点 CPU 核数 >= ~160
+  num_workers: 16
   max_epochs: 2
   mixed_precision: bf16
   optimizer: adamw
+  # dynamic=True + cache_size_limit=64 + L>=2 clamp 已消除 text 长度变化引发的反复重编译;
+  # 首次开请观察 TORCH_LOGS=recompiles 确认无中途冷编译 (单 rank 编译会拖死全体 allreduce)
   torch_compile: false
   muon:
     enabled: false
@@ -177,7 +181,7 @@ training:
     betas: [0.9, 0.95]
     epsilon: 1.0e-8
   # Wan 预训练续训 (非从零): lr 下调至 2e-5, warmup 缩短
-  learning_rate: 2.0e-5
+  learning_rate: 8.0e-5
   weight_decay: 0.005
   lr_scheduler: cosine
   lr_warmup_steps: 500

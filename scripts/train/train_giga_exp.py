@@ -722,7 +722,7 @@ def run_next_batch_validation(engine, vae, tokenizer, text_encoder, device, dtyp
             logger.warning("⚠️ step=%d MoE 统计/绘图失败 (训练继续): %s", step, repr(exc))
     if ode_error is not None:
         raise ode_error
-    gen = vae.decode(x / std_inv + mean).sample
+    gen = vae.decode((x / std_inv + mean).to(vae.dtype)).sample
 
     def to_uint8(t):  # [C,T,H,W] → HWC uint8
         frame = t[:, 0].float().clamp(-1, 1).permute(1, 2, 0).cpu().numpy()
@@ -848,7 +848,9 @@ def main():
     if len(tokenizer) <= 1:
         raise ValueError(f"tokenizer 词表异常: {tc['tokenizer_path']}")
     text_encoder = build_text_encoder(tc, dtype, device)
-    vae = AutoencoderKLWan.from_pretrained(dc["pretrained_path"], subfolder=dc.get("subfolder", "vae"), torch_dtype=torch.float32, local_files_only=True).eval().to(device)
+    # VAE bf16 推理: encode 每 micro step 都跑, fp32 全程无必要; 归一化 mean/std 仍 fp32,
+    # sample bf16 → 减 fp32 mean 自动升回 fp32, 下游 latents/xt 精度不变
+    vae = AutoencoderKLWan.from_pretrained(dc["pretrained_path"], subfolder=dc.get("subfolder", "vae"), torch_dtype=torch.bfloat16, local_files_only=True).eval().to(device)
     # model.type 分发 (缺省 giga = GigaExpTransformer): wan5b_ss 为 Wan2.2 5B 单流化结构
     model_cfg = dict(cfg["model"])
     model_cls = {"giga": GigaExpTransformer, "wan5b_ss": Wan5BSingleStream}[model_cfg.pop("type", "giga")]
@@ -867,6 +869,11 @@ def main():
         # 输入所有维度默认按 dynamic 编译, 从源头消除"新 shape → 中途重编译"风暴:
         # 单 rank 重编译时其余 rank 会在梯度 allreduce 上干等数分钟, 表现为整卡集体假死。
         dynamo_config.assume_static_by_default = False
+        # 关闭 duck shaping (2026-11-19 48卡实测): 首次编译 H==W 时 dynamo 把两个空间维合并
+        # 成同一符号并加 x.size()[3]==x.size()[4] 守卫, 换矩形桶 (512x384/384x512/256x192 等)
+        # 即守卫失败整图重编译。关闭后 H/W 始终独立符号, 桶间零重编译。
+        from torch.fx.experimental import _config as fx_config
+        fx_config.use_duck_shape = False
         model.compile(dynamic=True)
         if rank == 0:
             _blue_print("⚡ torch.compile 已启用 (dynamic=True): 前几步为编译 warmup, step 耗时会先长后短, 属正常现象")
@@ -1025,8 +1032,12 @@ def main():
         warm_b = 2
         warm_dtype = next(engine.module.parameters()).dtype
         warm_text_dim = engine.module.text_in.in_features
-        # stage_1.yaml 的三个分辨率桶对应的 latent 空间尺寸 (VAE /8): 512 / 512x384 / 384x512
-        warm_buckets = ((64, 64), (64, 48), (48, 64))
+        # stage_1 各分辨率桶对应的 latent 空间尺寸: Wan2.2 TI2V VAE 空间压缩 16 (48ch),
+        # 512 桶→32x32 等, 256 桶→16x16 等; 720p→80x45, 1024→64x64。
+        # 所有配置里的桶都要预热, 否则训练中首个该桶 batch 会现场冷编译, 单 rank 卡 10 分钟级。
+        # 每桶配 短/长 两个文本长度把 inductor 小尺寸分界 (guard: b*L+b*C <= 1536 一类) 两类都编完
+        warm_buckets = ((32, 32), (32, 24), (24, 32), (16, 16), (16, 12), (12, 16),
+                        (80, 45), (45, 80), (64, 64))
         # inductor 对小尺寸还有内部分界 (guard: b*L+b*C <= 1536, 约 L<=368 一类), 因此每个桶
         # 用 短/长 两个文本长度把两个尺寸类都编完, 否则真实数据里的长 prompt batch 仍会触发
         # 每 rank 一次的现场重编译
@@ -1110,7 +1121,7 @@ def main():
             last_captions = captions
             with torch.no_grad():
                 # Wan 官方约定: encode 后标准化 z_norm = (z - mean) * latents_std_inv
-                latents = (vae.encode(pixels.float()).latent_dist.sample() - latents_mean) * latents_std_inv
+                latents = (vae.encode(pixels.to(dtype)).latent_dist.sample() - latents_mean) * latents_std_inv
                 prompts = [str(c).strip() or tokenizer.eos_token for c in captions]
                 cfg_dropout = float(cfg["training"].get("cfg_dropout", 0.0))
                 if cfg_dropout > 0:

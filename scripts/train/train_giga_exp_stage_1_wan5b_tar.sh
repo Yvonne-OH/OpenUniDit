@@ -18,9 +18,10 @@ fi
 # 沿用 LMDB 版预算: 样本预算 120s → 每候选 min(48, 120/3)=40s 真实读取窗口。
 export YISU_IMAGE_TIMEOUT_SECONDS=48
 export YISU_IMAGE_SAMPLE_TIMEOUT_SECONDS=120
-# 常驻解码子进程已关闭 (=0): 存储 stall 时常驻通道 select 烧满候选超时;
-# 关闭后每次尝试直接一次性解码, fork+tar open 仅毫秒级。存储稳定后可改回 1 提速。
-export YISU_IMAGE_PERSISTENT_DECODER=0
+# 常驻解码子进程恢复 =1 (2026-11-19 重评估): slow decode 集中在 blip3o-long-caption-wds/
+# fine_t2i/sa1b_en 的冷 NFS 读, fork 每次冷 open 反复付 NFS 延迟; 常驻通道可复用连接。
+# 若存储 stall 期间再次出现 select 烧满候选超时, 再改回 0。
+export YISU_IMAGE_PERSISTENT_DECODER=1
 
 # NCCL 只在 WARN 及以上时输出: 平时静默, 通信异常(超时/降级/连接失败)时能看到原因
 export NCCL_DEBUG=WARN
