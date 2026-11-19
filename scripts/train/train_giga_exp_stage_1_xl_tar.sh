@@ -18,11 +18,11 @@ fi
 # 沿用 LMDB 版预算: 样本预算 120s → 每候选 min(48, 120/3)=40s 真实读取窗口。
 export YISU_IMAGE_TIMEOUT_SECONDS=48
 export YISU_IMAGE_SAMPLE_TIMEOUT_SECONDS=120
-# 常驻解码子进程恢复 =1 (2026-11-19 重评估): slow decode 集中在 blip3o-long-caption-wds/
-# fine_t2i/sa1b_en 的冷 NFS 读, fork 每次冷 open 反复付 NFS 延迟; 常驻通道可复用连接。
-# 本机压测 (wan5b 同配置): persistent=0→1 + workers 8→16 吞吐 16.4→88.4 samples/s (5.4x)。
-# 若存储 stall 期间再次出现 select 烧满候选超时, 再改回 0。
-export YISU_IMAGE_PERSISTENT_DECODER=1
+# persistent decoder 保持 =0 (2026-11-19 64 卡实测): 常驻通道解码经 /dev/shm 回传,
+# 128 解码进程/节点会打爆 shm (ENOSPC → 39.9s 超时风暴 → 数分钟级 stall)。
+# one-shot 0.4s/样本对每 rank ~1 样本/s 的需求余量足够; 若要用 persistent 模式
+# 需先修 shm 用量 (限流/减 worker/加大 sharedMemory 资源)。
+export YISU_IMAGE_PERSISTENT_DECODER=0
 
 # NCCL 只在 WARN 及以上时输出: 平时静默, 通信异常(超时/降级/连接失败)时能看到原因
 export NCCL_DEBUG=WARN

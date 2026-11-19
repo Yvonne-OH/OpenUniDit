@@ -167,8 +167,11 @@ training:
   max_epochs: 2
   mixed_precision: bf16
   optimizer: adamw
-  # dynamic=True + cache_size_limit=64 + L>=2 clamp 已消除 text 长度变化引发的反复重编译;
-  # 首次开请观察 TORCH_LOGS=recompiles 确认无中途冷编译 (单 rank 编译会拖死全体 allreduce)
+  # torch.compile 暂禁用 (2026-11-19 48 卡实测崩溃): wan5b_single_stream.py:196 FA3 pack
+  # 布尔掩码索引产生 graph break, 变 batch 触发 resume 函数重编译时 inductor/sympy
+  # 内部断言崩溃 (InductorError AssertionError), elastic 全队团灭。
+  # 数据管线 (workers 16 + persistent decoder) 与 VAE bf16 的收益不受影响。
+  # 重新启用条件: torch 升级修复 sympy bug, 或重写 pack 构建消除 graph break
   torch_compile: false
   muon:
     enabled: false
