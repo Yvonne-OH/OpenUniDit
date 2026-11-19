@@ -458,6 +458,61 @@ def enum_bilibili(args, limiter: RateLimiter):
         yield _bili_task(pic, bvid, it, source)
 
 
+PIXABAY_MAX_LONG = 1280   # 免费 key largeImageURL 最长边 1280
+
+
+def enum_pixabay(kw: str, args, limiter: RateLimiter):
+    """Pixabay 图库搜索：免费 key 最大 largeImageURL（长边≤1280），
+    走 pixabay-min-short 例外档，并用 API 尺寸模拟输出尺寸做预筛。
+    免费接口限 100 请求/小时，这里独立节流（每页间隔 37s）。"""
+    s = _new_session()
+    per_page = 50
+    for pn in range(1, args.pages + 1):
+        try:
+            time.sleep(37)
+            r = s.get("https://pixabay.com/api/", params={
+                "key": args.pixabay_key, "q": kw, "lang": "zh",
+                "image_type": "photo", "per_page": per_page,
+                "page": pn, "order": "popular", "safesearch": "true"},
+                headers={"Referer": "https://pixabay.com/"}, timeout=20)
+            if r.status_code == 429:
+                say(f"[pixabay/{kw}] 429 限流，休眠 120s 后跳过本页")
+                time.sleep(120)
+                break
+            r.raise_for_status()
+            d = r.json()
+        except Exception as e:
+            say(f"[pixabay/{kw}] page {pn} 请求失败: {e}")
+            break
+        hits = d.get("hits") or []
+        if not hits:
+            break
+        say(f"[pixabay/{kw}] page {pn}: {len(hits)} 候选"
+            f"（total={d.get('totalHits')}）")
+        for h in hits:
+            url = h.get("largeImageURL") or h.get("webformatURL")
+            if not url:
+                continue
+            w, hh = h.get("imageWidth") or 0, h.get("imageHeight") or 0
+            if w and hh:
+                # 预筛：模拟 largeImage 输出（长边压到 1280）后的短边是否达标
+                scale = min(1.0, PIXABAY_MAX_LONG / max(w, hh))
+                if round(min(w, hh) * scale) < args.pixabay_min_short:
+                    continue
+            yield Task([url], "https://pixabay.com/", f"pixabay_{h.get('id')}",
+                       "pixabay", kw,
+                       {"origin_url": url,
+                        "page_url": h.get("pageURL"),
+                        "pixabay_id": h.get("id"),
+                        "tags": h.get("tags", ""),
+                        "user": h.get("user"),
+                        "downloads": h.get("downloads"),
+                        "likes": h.get("likes"),
+                        "api_width": w, "api_height": hh},
+                       min_short_override=args.pixabay_min_short)
+    say(f"[pixabay/{kw}] 枚举完成（{args.pages} 页上限）")
+
+
 # --------------------------------------------------------------------------
 # Runner：调度、过滤、落盘、去重、metadata
 # --------------------------------------------------------------------------
@@ -674,7 +729,7 @@ def parse_args():
         description="图虫/堆糖/B站 三平台统一小样本采集（≥1080p + CPU 质量过滤 + 去重）",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     ap.add_argument("--platform", default="all",
-                    help="all / tuchong / duitang / bilibili，可逗号组合")
+                    help="all / tuchong / duitang / bilibili / pixabay，可逗号组合")
     ap.add_argument("--queries", default="猫,夜景", help="图虫标签 & 堆糖关键词，逗号分隔")
     ap.add_argument("--queries-file", type=Path, default=None,
                     help="从文件读词表（每行一个词或 类别<TAB>词，# 开头为注释），优先于 --queries")
@@ -697,6 +752,10 @@ def parse_args():
     ap.add_argument("--min-short", type=int, default=1080, help="短边最小像素（1080p）")
     ap.add_argument("--tuchong-min-short", type=int, default=800,
                     help="图虫例外档短边最小值（匿名上限为长边1200，如 800x1200）")
+    ap.add_argument("--pixabay-key", default="57266037-11262474244f4bf51a89b120c",
+                    help="Pixabay API key")
+    ap.add_argument("--pixabay-min-short", type=int, default=720,
+                    help="Pixabay 例外档短边最小值（免费 key 上限长边1280，横图短边≈853）")
     ap.add_argument("--min-long", type=int, default=0, help="长边最小像素，0=不限")
     ap.add_argument("--max-aspect", type=float, default=3.5, help="宽高比上限（同时取倒数下限）")
     ap.add_argument("--sharpness-min", type=float, default=60.0,
@@ -757,7 +816,7 @@ def main() -> int:
     # 使两个平台数据同步增长；bilibili 单 feed 计划放最前。
     query_plans = []          # (platform, query)
     for p in platforms:
-        if p in ("tuchong", "duitang"):
+        if p in ("tuchong", "duitang", "pixabay"):
             for q in queries:
                 if args.queries_file and skip_info.get(p, {}).get(q, 0) >= args.per_query:
                     continue
@@ -783,10 +842,13 @@ def main() -> int:
         if p == "tuchong":
             plans.append(("tuchong", f"tuchong[{q}]",
                           lambda q=q: enum_tuchong(q, args, runner.limiter), args.per_query))
+        elif p == "pixabay":
+            plans.append(("pixabay", f"pixabay[{q}]",
+                          lambda q=q: enum_pixabay(q, args, runner.limiter), args.per_query))
         else:
             plans.append(("duitang", f"duitang[{q}]",
                           lambda q=q: enum_duitang(q, args, runner.limiter), args.per_query))
-    skipped = sum(1 for p in ("tuchong", "duitang")
+    skipped = sum(1 for p in ("tuchong", "duitang", "pixabay")
                   if p in platforms for q in queries
                   if skip_info.get(p, {}).get(q, 0) >= args.per_query)
     if skipped:

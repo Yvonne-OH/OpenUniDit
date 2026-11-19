@@ -33,6 +33,7 @@ from transformers import AutoTokenizer, Qwen3VLForConditionalGeneration
 
 from models.giga_transformer import (GigaExpTransformer, apply_adaln_basis_migration,
                                      apply_mod_adaln_migration)
+from models.wan5b_single_stream import Wan5BSingleStream
 
 try:
     from tqdm import tqdm, trange
@@ -340,13 +341,18 @@ def main():
     vae = AutoencoderKLWan.from_pretrained(
         dc["pretrained_path"], subfolder=dc.get("subfolder", "vae"),
         torch_dtype=torch.float32, local_files_only=True).eval().to(device)
+    # model.type 分发 (与 train_giga_exp.py 一致): 缺省 giga = GigaExpTransformer;
+    # wan5b_ss = Wan2.2 5B 单流化结构 (configs/stage_1_wan5b_tar.yaml)
     # mHC 配置 (mhc.enabled=true 或 model 含 n_streams) 构建 GigaExpTransformerMHC,
     # 输入输出接口与 GigaExpTransformer 完全一致, 采样循环无需改动
-    if cfg.get("mhc", {}).get("enabled") or "n_streams" in cfg["model"]:
+    model_cfg = dict(cfg["model"])
+    model_type = model_cfg.pop("type", "giga")
+    if cfg.get("mhc", {}).get("enabled") or "n_streams" in model_cfg:
         from models.giga_transformer_mhc import GigaExpTransformerMHC
-        model = GigaExpTransformerMHC(**cfg["model"]).to(device, dtype=dtype)
+        model_cls = GigaExpTransformerMHC
     else:
-        model = GigaExpTransformer(**cfg["model"]).to(device, dtype=dtype)
+        model_cls = {"giga": GigaExpTransformer, "wan5b_ss": Wan5BSingleStream}[model_type]
+    model = model_cls(**model_cfg).to(device, dtype=dtype)
     state = load_file(str(checkpoint)) if checkpoint.suffix == ".safetensors" \
         else torch.load(str(checkpoint), map_location="cpu")
     load_compatible_state_dict(model, state, _read_weight_metadata(checkpoint))
