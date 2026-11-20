@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import datetime
 import hashlib
 import json
 import logging
@@ -831,7 +832,10 @@ def main():
     parser.add_argument("--config", default="configs/stage_1.yaml")
     args = parser.parse_args()
     cfg = yaml.safe_load((ROOT / args.config).read_text()) if not Path(args.config).is_absolute() else yaml.safe_load(Path(args.config).read_text())
-    deepspeed.init_distributed()
+    # distributed.timeout_seconds 应用到 default PG (原裸调用用 torch/DS 默认 1800s,
+    # yaml 里的 7200s 从未生效; 2026-11-19 数据挂起事故里 watchdog 提前到 30min 团灭)
+    _pg_timeout = datetime.timedelta(seconds=int(cfg.get("distributed", {}).get("timeout_seconds", 1800)))
+    deepspeed.init_distributed(timeout=_pg_timeout)
     rank = dist.get_rank()
     print_banner(cfg, rank)
     device = torch.device("cuda", int(os.environ.get("LOCAL_RANK", 0)))
@@ -980,9 +984,14 @@ def main():
     batch_sampler.set_start_batch(batch_offset, epoch=epoch)
     if rank == 0:
         logger.info("📅 max_epochs=%d steps_per_epoch=%d total_steps=%d grad_accum=%d; 从 epoch=%d batch=%d step=%d 继续", max_epochs, steps_per_epoch, max_steps, grad_accum, epoch, batch_offset, step)
+    # worker 卡死防护: NFS 偶发静默挂起 (read syscall 永不返回) 时, 默认 timeout=0 会让 rank
+    # 永久卡在取 batch, 不抛异常也不触发 skip 机制, 其余 rank 在 skip_flag allreduce 上等满
+    # NCCL watchdog 后全队团灭 (2026-11-19 20:21 n8 实测: step-216505 后 6 rank 卡 30min)。
+    # timeout 到点抛 RuntimeError → skip 机制接住并重建 iterator, fail-fast 优于挂死。
     loader = torch.utils.data.DataLoader(data, batch_sampler=batch_sampler,
                                          num_workers=cfg["training"].get("num_workers", 4),
-                                         prefetch_factor=4, persistent_workers=True, collate_fn=collate)
+                                         prefetch_factor=4, persistent_workers=True,
+                                         timeout=180, collate_fn=collate)
     iterator = iter(loader)
 
     wandb_run = None
@@ -1104,6 +1113,16 @@ def main():
                 consecutive_batch_skips += 1
                 if category == "executor_bug" or consecutive_batch_skips > max_consecutive_batch_skips:
                     raise
+                if "DataLoader timed out" in str(exc):
+                    # 🚨 NFS 静默挂起特征: read syscall 不返回连异常都不抛, 只能靠 DataLoader
+                    # timeout 兜底 (2026-11-19 20:21 n8 事故: 无 timeout 时 6 rank 卡 30min 团灭)。
+                    logger.error(
+                        "🚨🚨🚨 rank=%d step=%d micro=%d DataLoader 取 batch 超时 (180s)! "
+                        "worker 大概率卡死在 NFS 静默挂起 (D 状态 hard mount read) 🚨🚨🚨\n"
+                        "   -> 跳过该 batch 并重建 iterator; 若连续出现请检查存储端 (%s)",
+                        rank, step, micro_idx, str(exc)[:200])
+                    # worker 卡死超时后 persistent_workers iterator 已不可复用, 重建恢复拉取
+                    iterator = iter(loader)
                 logger.warning("⏭️ step=%d micro=%d 跳过坏数据 batch (category=%s, consecutive=%d/%d): %s",
                                step, micro_idx, category, consecutive_batch_skips,
                                max_consecutive_batch_skips, exc)

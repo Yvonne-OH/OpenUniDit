@@ -193,7 +193,7 @@ training:
   batch_size_per_device: 2
   # NFS tar 版 dataloader: 8→16 workers (2026-11-19 本机压测 5.4x, persistent_decoder 同步恢复=1)。
   # collate 走 numpy 管道不占 /dev/shm; 注意每节点 8 rank × 16 worker = 128 解码进程, 需 CPU 核数够
-  num_workers: 16
+  num_workers: 10
   max_epochs: 2
   mixed_precision: bf16
   optimizer: adamw

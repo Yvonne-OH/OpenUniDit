@@ -94,6 +94,13 @@ mkdir -p "$RUN_LOG_DIR"
 export GIGA_RUN_LOG_DIR="$RUN_LOG_DIR"
 export GIGA_NODE_RANK="$RANK"
 
+# persistent decoder 回传临时文件目录: 集群节点 /dev/shm 实际容量远小于申请值, 解码进程
+# 轮番写直接 ENOSPC (2026-11-20 copy4 实测 44 万条 Errno 28 → 39.9s 超时风暴)。
+# 改放 output 下 PFS 目录, 解码用完即删 (decoder finally unlink); 启动时清残留。
+export YISU_IMAGE_TMP_DIR="$OUTPUT_DIR/decode_tmp"
+mkdir -p "$YISU_IMAGE_TMP_DIR"
+rm -f "$YISU_IMAGE_TMP_DIR"/yisu-img-*.npy 2>/dev/null || true
+
 # torch.compile/Triton 编译缓存放共享存储 (OUTPUT_DIR 在 PFS 上, 所有机器可见):
 # 重启/换机零重编译。首次启用时把本机 /tmp 的 warm 缓存一次性搬入, 保留已完成的 warmup。
 COMPILE_CACHE_DIR="$OUTPUT_DIR/compile_cache"

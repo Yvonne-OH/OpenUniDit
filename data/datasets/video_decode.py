@@ -1021,7 +1021,11 @@ def decode_isolated(request, timeout, context):
         cooldown = float(os.environ.get('YISU_IMAGE_PERSISTENT_COOLDOWN_SECONDS', '600'))
         request = dict(request)
         request.pop('_trace_context', None)
-        output = tempfile.mkstemp(prefix='yisu-img-', suffix='.npy', dir='/dev/shm')[1]
+        # 回传临时文件目录可配置: 集群节点 /dev/shm 实际容量远小于申请值, 256 个解码进程
+        # 轮番写直接 ENOSPC (2026-11-20 copy4 实测 44 万条 Errno 28)。用 YISU_IMAGE_TMP_DIR
+        # 指到磁盘目录 (如 OUTPUT_DIR/decode_tmp, PFS), 父进程 finally unlink 用完即删。
+        output = tempfile.mkstemp(prefix='yisu-img-', suffix='.npy',
+                                  dir=os.environ.get('YISU_IMAGE_TMP_DIR', '/dev/shm'))[1]
         persistent_started = time.monotonic()
         try:
             _persistent_decode_request(dict(request, _output_path=output), min(timeout, cap))
