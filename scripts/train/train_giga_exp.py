@@ -425,6 +425,26 @@ def _report_text_trans_reinit(model, state, logger=None):
     print(f"\033[1;33m{message}\033[0m", flush=True)
 
 
+def _report_image_pre_reinit(model, state, logger=None):
+    """yaml 开启 image_pre_layers 但 ckpt 无 image_pre_blocks.* 权重 → 保持恒等初始化并警告 (rank0)。
+
+    image-only 前置块 res_scale=0 恒等初始化, 初始 forward 为恒等映射: step0 行为与
+    无前置块版本逐位一致 (FLUX.3 Klein 风格结构增量, 旧 ckpt 平滑热启动)。"""
+    if _dist_rank() != 0:
+        return
+    pre_keys = [key for key in model.state_dict() if key.startswith("image_pre_blocks.")]
+    if not pre_keys or any(key in state for key in pre_keys):
+        return
+    logger = logger or logging.getLogger("giga_exp")
+    params = sum(p.numel() for name, p in model.named_parameters() if name.startswith("image_pre_blocks."))
+    n_pre = getattr(model, "image_pre_layers", len([k for k in pre_keys if k.endswith("res_scale")])) or 0
+    message = (f"⚠️ image_pre_layers={n_pre}: checkpoint 缺少 image_pre_blocks.* 权重但 yaml 已开启, "
+               f"{len(pre_keys)} 个 tensor / {params / 1e6:.2f}M 参数保持恒等初始化 "
+               f"(res_scale=0, step0 forward 与无前置块版本一致, 平滑增量学习)")
+    logger.warning(message)
+    print(f"\033[1;33m{message}\033[0m", flush=True)
+
+
 def _report_moe_dense_upcycle(migration, logger=None):
     """dense→MoE 热启动迁移播报 (rank0): dense FFN 拷贝到全部 experts (强制均衡初始化)。"""
     if _dist_rank() != 0:
@@ -511,6 +531,7 @@ def load_compatible_state_dict(model, state, metadata=None):
     else:
         _report_adaln_basis_migration(basis)
     _report_text_trans_reinit(model, state)
+    _report_image_pre_reinit(model, state)
     _report_moe_dense_upcycle(apply_dense_to_moe_migration(current, state))
     matched = {key: value for key, value in state.items()
                if key in current and current[key].shape == value.shape}

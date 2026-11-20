@@ -127,7 +127,8 @@ class Wan5BSingleStream(GigaExpTransformer):
                  dim: int = 3072, ffn_dim: int = 14336, heads: int = 24, layers: int = 30,
                  pretrained_layers: int | None = None,
                  rope_theta: float = 10000.0, rope_axes_dims=(16, 48, 48, 16),
-                 patch_size=(1, 1, 1), text_trans=False, eps: float = 1e-6, **kwargs):
+                 patch_size=(1, 1, 1), text_trans=False, eps: float = 1e-6,
+                 image_pre_layers: int = 0, **kwargs):
         # 父类 layers=0 只建 embed/text_refiner/rope/out, Wan 块在下方重建。
         # adaln_type 由 yaml 经 **kwargs 传入 (Wan 结构用 shared), 缺省时父类推导同为 shared。
         super().__init__(
@@ -145,6 +146,15 @@ class Wan5BSingleStream(GigaExpTransformer):
             WanGigaBlock(dim, ffn_dim, heads, eps=eps,
                          zero_init_residual=i >= self.pretrained_layers)
             for i in range(layers))
+        # FLUX.3 Klein 风格 image-only 前置块 (yaml model.image_pre_layers, 默认 0 不开启):
+        # 在共享块之前只对 image token 做模态内自注意力+FFN (文本不参与, 延迟跨模态交互)。
+        # 恒等初始化 (res_scale=0): 旧 ckpt 无 image_pre_blocks.* 时保持零初始化,
+        # step0 前向与无前置块逐位一致, matched-only 加载自动兼容; 关闭时这些键被忽略。
+        self.image_pre_layers = int(image_pre_layers)
+        self.image_pre_blocks = (nn.ModuleList(
+            WanGigaBlock(dim, ffn_dim, heads, eps=eps, zero_init_residual=True)
+            for _ in range(self.image_pre_layers))
+            if self.image_pre_layers > 0 else None)
         # Wan head 结构: norm_out(affine=False) + 全局 shift/scale 调制 + proj_out
         self.norm = nn.LayerNorm(dim, eps=eps, elementwise_affine=False)
         self.mod_proj = nn.Linear(dim, dim * 6)
@@ -155,6 +165,7 @@ class Wan5BSingleStream(GigaExpTransformer):
         meta.update({
             "class": "wan5b_single_stream",
             "pretrained_layers": int(self.pretrained_layers),
+            "image_pre_layers": int(self.image_pre_layers),
             "implementation": {
                 "version": "wan22_ti2v_5b_single_stream_v1",
                 "rope": "fp32_cos_sin_and_rotation",
@@ -208,6 +219,22 @@ class Wan5BSingleStream(GigaExpTransformer):
         # Wan 调制: cond6 = mod_proj(time_in(timestep)); 文本调制成分 (text_embedder) 单流化后移除
         cond6 = self.mod_proj(self.time_in(emb.to(self.time_in[0].weight.dtype)))
         cos, sin = self.rope(t, h, w, text.shape[1], x.device, x.dtype)
+        # FLUX.3 Klein 风格 image-only 前置块: 只处理 image token (模态内自注意力),
+        # 文本 token 不参与; varlen pack 退化为逐样本定长 n_img (image 全有效无 padding)
+        if self.image_pre_blocks is not None:
+            xi = x[:, :n_img]
+            cos_i, sin_i = cos[:n_img], sin[:n_img]
+            pre_pack = None
+            if pack is not None:
+                cols_i = torch.arange(n_img, device=x.device)
+                pack_i = (torch.arange(b, device=x.device)[:, None] * n_img
+                          + cols_i[None, :]).reshape(-1)
+                pos_i = cols_i[None, :].expand(b, -1).reshape(-1)
+                cu_i = torch.arange(b + 1, device=x.device, dtype=torch.int32) * n_img
+                pre_pack = (pack_i, pos_i, cu_i, n_img)
+            for blk in self.image_pre_blocks:
+                xi = blk(xi, cond6, cos_i, sin_i, None, pre_pack, n_img)
+            x = torch.cat((xi, x[:, n_img:]), 1)
         self.moe_aux_losses = []
         features = [] if feature_layers is not None else None
         for block_idx, block in enumerate(self.blocks):

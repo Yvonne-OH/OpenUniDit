@@ -29,6 +29,11 @@ model:
   type: wan5b_ss              # 模型分发: GigaExpTransformer (缺省) | wan5b_ss
   adaln_type: shared          # Wan 原生调制结构 (全局 cond6 + per-layer scale_shift_table),
                               # 不使用本库 basis/dual AdaLN; 此键仅供 semantic metadata 记录
+  # FLUX.3 Klein 风格 image-only 前置块 (默认 0 不开启): 开启如 2, 在共享块之前对 image token
+  # 做模态内自注意力+FFN (文本不参与, 延迟跨模态交互)。恒等初始化 (res_scale=0):
+  # 旧 ckpt 无 image_pre_blocks.* 时 step0 前向逐位一致, 续训自动兼容热启动;
+  # 关闭时 ckpt 里已有的这些键自动忽略。每块 ~126M (dim3072/ffn14336)。
+  image_pre_layers: 0
   text_trans:
     enabled: true
     layers: 8                 # 深度增长: 2 层 Wan 对齐 + 6 层新增 (恒等初始化, step0 不改变前向)
