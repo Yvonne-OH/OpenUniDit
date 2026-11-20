@@ -1110,12 +1110,12 @@ def main():
                 # 数据级错误 (坏图/坏视频/解码子进程 MemoryError 等) 跳过该 micro batch,
                 # 不再炸掉整个多卡作业; executor_bug 或连续跳过超限仍然终止。
                 category = _data_error_category(exc)
-                consecutive_batch_skips += 1
-                if category == "executor_bug" or consecutive_batch_skips > max_consecutive_batch_skips:
-                    raise
                 if "DataLoader timed out" in str(exc):
                     # 🚨 NFS 静默挂起特征: read syscall 不返回连异常都不抛, 只能靠 DataLoader
                     # timeout 兜底 (2026-11-19 20:21 n8 事故: 无 timeout 时 6 rank 卡 30min 团灭)。
+                    # torch 抛的是无 category 属性的裸 RuntimeError → 会被归类 executor_bug
+                    # 当场炸死全队 (copy12 13:43 教训: 归类覆盖必须在 raise 检查之前)。
+                    category = "deadline"
                     logger.error(
                         "🚨🚨🚨 rank=%d step=%d micro=%d DataLoader 取 batch 超时 (180s)! "
                         "worker 大概率卡死在 NFS 静默挂起 (D 状态 hard mount read) 🚨🚨🚨\n"
@@ -1123,6 +1123,9 @@ def main():
                         rank, step, micro_idx, str(exc)[:200])
                     # worker 卡死超时后 persistent_workers iterator 已不可复用, 重建恢复拉取
                     iterator = iter(loader)
+                consecutive_batch_skips += 1
+                if category == "executor_bug" or consecutive_batch_skips > max_consecutive_batch_skips:
+                    raise
                 logger.warning("⏭️ step=%d micro=%d 跳过坏数据 batch (category=%s, consecutive=%d/%d): %s",
                                step, micro_idx, category, consecutive_batch_skips,
                                max_consecutive_batch_skips, exc)

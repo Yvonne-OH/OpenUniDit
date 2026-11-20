@@ -6,7 +6,7 @@ import random
 import hashlib
 from pathlib import Path
 import subprocess
-import select
+import selectors
 from collections import OrderedDict
 import sys
 import tempfile
@@ -968,7 +968,12 @@ class _PersistentDecoderClient:
         try:
             self.proc.stdin.write(json.dumps(request) + '\n')
             self.proc.stdin.flush()
-            ready, _, _ = select.select([self.proc.stdout], [], [], timeout)
+            # 不用 select.select: 1024 fd 硬顶, 64 rank × 16 worker 场景下常驻通道管道
+            # fd 号超限 → ValueError: filedescriptor out of range → 通道永久失效,
+            # 全部样本退化 one-shot 拖慢 batch (2026-11-20 copy12 团灭诱因)。poll 无此限制。
+            with selectors.DefaultSelector() as sel:
+                sel.register(self.proc.stdout, selectors.EVENT_READ)
+                ready = sel.select(timeout)
             if not ready:
                 self.close()
                 raise MediaDeadlineError(f'persistent decoder timeout {timeout}s', 'TimeoutExpired')
@@ -1024,8 +1029,12 @@ def decode_isolated(request, timeout, context):
         # 回传临时文件目录可配置: 集群节点 /dev/shm 实际容量远小于申请值, 256 个解码进程
         # 轮番写直接 ENOSPC (2026-11-20 copy4 实测 44 万条 Errno 28)。用 YISU_IMAGE_TMP_DIR
         # 指到磁盘目录 (如 OUTPUT_DIR/decode_tmp, PFS), 父进程 finally unlink 用完即删。
-        output = tempfile.mkstemp(prefix='yisu-img-', suffix='.npy',
-                                  dir=os.environ.get('YISU_IMAGE_TMP_DIR', '/dev/shm'))[1]
+        # ⚠️ mkstemp 返回的 fd 必须立即关闭: 之前 [1] 丢弃 fd → 每次解码泄漏 1 个 fd,
+        # worker fd 号单调上涨撞 1024 (copy12 "filedescriptor out of range" 真根因,
+        # 亦是 unlink/Popen EMFILE 静默失败 → decode_tmp 47k 残留的元凶)。
+        _tmp_fd, output = tempfile.mkstemp(prefix='yisu-img-', suffix='.npy',
+                                           dir=os.environ.get('YISU_IMAGE_TMP_DIR', '/dev/shm'))
+        os.close(_tmp_fd)
         persistent_started = time.monotonic()
         try:
             _persistent_decode_request(dict(request, _output_path=output), min(timeout, cap))
