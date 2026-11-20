@@ -16,3 +16,11 @@ tools/data_tools/logs/
 *.log
 *.bak
 *.error
+
+# 本地环境 / 缓存 / 备份 / 日志变体 (2026-11-20)
+.trae/
+*.bak_*
+*.log.*
+tools/quality_cache/
+tools/.quality_metrics_ckpt.json
+Module imported successfully*
