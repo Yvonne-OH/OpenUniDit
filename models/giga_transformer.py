@@ -193,46 +193,69 @@ def apply_adaln_basis_migration(current, state):
             "layers": sorted(layers)}
 
 
-class TextRefinerBlock(nn.Module):
-    """文本侧残差自注意力+FFN block (MOSS-Image Text Refiner)。
+def _situ(hidden, gate):
+    """MOSS _TextBlock 的门控激活: silu 形 gate × soft-clip(hidden) (ckpt 内逐字实现)。"""
+    return (4.0 * torch.tanh(gate / 4.0) * torch.sigmoid(gate)) * (25.0 * torch.tanh(hidden / 25.0))
 
-    - 只处理文本 token (text_in 投影后), 不与图像 token 交互, 无 timestep AdaLN;
-    - 残差支路输出层 (attn.out_proj / ffn 末层) 零初始化 → block 初始为恒等映射,
-      step0 推理与原版逐位一致, 旧 ckpt (无 text_refiner.*) 可无损热启动平滑增量学习;
-    - padding 位置的输出会被主 DiT 的 attention mask / FA3 varlen 丢弃, 不影响数值。
+
+class TextRefinerBlock(nn.Module):
+    """文本侧残差自注意力+FFN block (逐项对齐 MOSS-Image _TextBlock)。
+
+    - q/k per-head RMSNorm + q/k RoPE: 使用主 rope 的 text 位置切片 (同一套 4 轴频率,
+      text 轴 16 维), 修复旧版 nn.MultiheadAttention 无位置编码的置换不变问题;
+    - FFN 为 MOSS 同款 SwiGLU 式门控 (_situ), hidden 取主 ffn_dim;
+    - 残差支路输出层 (attn proj / ffn down) 零初始化 → block 初始为恒等映射,
+      step0 与无 refiner 逐位一致 (从零训练无害, 旧 ckpt 热启动兼容语义保留);
+    - padding 位置输出会被主 DiT 的 varlen pack 丢弃, 不影响数值。
     """
 
-    def __init__(self, dim, num_heads):
+    def __init__(self, dim, ffn_dim, num_heads):
         super().__init__()
-        self.norm1 = nn.LayerNorm(dim, eps=1e-6)
-        self.attn = nn.MultiheadAttention(dim, num_heads, batch_first=True)
-        self.norm2 = nn.LayerNorm(dim, eps=1e-6)
-        self.ffn = nn.Sequential(nn.Linear(dim, dim * 4), nn.GELU(), nn.Linear(dim * 4, dim))
-        # 恒等初始化: 残差支路输出层权重+bias 置零, 初始 forward = identity
-        nn.init.zeros_(self.attn.out_proj.weight)
-        nn.init.zeros_(self.attn.out_proj.bias)
-        nn.init.zeros_(self.ffn[-1].weight)
-        nn.init.zeros_(self.ffn[-1].bias)
+        self.heads = num_heads
+        self.norm1 = RMSNorm(dim)
+        self.q_norm = RMSNorm(dim // num_heads)
+        self.k_norm = RMSNorm(dim // num_heads)
+        self.qkv = nn.Linear(dim, dim * 3, bias=False)
+        self.proj = nn.Linear(dim, dim, bias=False)
+        self.norm2 = RMSNorm(dim)
+        self.ffn_gate = nn.Linear(dim, ffn_dim, bias=False)
+        self.ffn_up = nn.Linear(dim, ffn_dim, bias=False)
+        self.ffn_down = nn.Linear(ffn_dim, dim, bias=False)
+        # 恒等初始化: 残差支路输出层置零 (无 bias)
+        nn.init.zeros_(self.proj.weight)
+        nn.init.zeros_(self.ffn_down.weight)
 
-    def forward(self, x, key_padding_mask=None):
-        # x: [B, L_txt, D]
-        h = self.norm1(x)
-        attn_out, _ = self.attn(h, h, h, key_padding_mask=key_padding_mask, need_weights=False)
-        x = x + attn_out
-        x = x + self.ffn(self.norm2(x))
-        return x
+    def forward(self, x, cos, sin, attn_mask=None):
+        # x: [B, L, D]; cos/sin: [L, head_dim] fp32 (主 rope 的 text 段); attn_mask: [B,1,1,L] True=有效
+        b, n, _ = x.shape
+        q, k, v = self.qkv(self.norm1(x)).chunk(3, -1)
+        q = self.q_norm(q.view(b, n, self.heads, -1))
+        k = self.k_norm(k.view(b, n, self.heads, -1))
+        # RoPE 与主块相同约定: fp32 旋转后 cast 回 v dtype
+        cos = cos[None, :, None, :]
+        sin = sin[None, :, None, :]
+        qf, kf = q.float(), k.float()
+        q = (qf * cos + rotate_half(qf) * sin).to(v.dtype)
+        k = (kf * cos + rotate_half(kf) * sin).to(v.dtype)
+        v = v.view(b, n, self.heads, -1)
+        a = F.scaled_dot_product_attention(
+            q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
+            attn_mask=attn_mask).transpose(1, 2).reshape(b, n, -1)
+        x = x + self.proj(a)
+        y = self.norm2(x)
+        return x + self.ffn_down(_situ(self.ffn_up(y), self.ffn_gate(y)))
 
 
 class TextRefiner(nn.Module):
-    def __init__(self, dim, num_heads, num_layers=2):
+    def __init__(self, dim, ffn_dim, num_heads, num_layers=2):
         super().__init__()
-        self.blocks = nn.ModuleList(TextRefinerBlock(dim, num_heads) for _ in range(num_layers))
+        self.blocks = nn.ModuleList(TextRefinerBlock(dim, ffn_dim, num_heads) for _ in range(num_layers))
 
-    def forward(self, text_hidden, text_mask=None):
-        # text_mask: bool [B, L], True=有效 token; MHA key_padding_mask 语义相反 (True=padding)
-        key_padding_mask = ~text_mask if text_mask is not None else None
+    def forward(self, text_hidden, text_mask, cos, sin):
+        # text_mask: bool [B, L] True=有效 → SDPA attn_mask [B,1,1,L]
+        attn_mask = None if text_mask is None else text_mask.bool()[:, None, None, :]
         for blk in self.blocks:
-            text_hidden = blk(text_hidden, key_padding_mask)
+            text_hidden = blk(text_hidden, cos, sin, attn_mask)
         return text_hidden
 
 
@@ -406,9 +429,12 @@ class GigaExpTransformer(nn.Module):
         self.text_trans = None if refiner_cfg is None else {
             "layers": int(refiner_cfg.get("layers", 2)),
             "heads": int(refiner_cfg.get("heads", heads)),
+            "ffn_dim": int(ffn_dim),
+            "rope": True,
         }
         if self.text_trans is not None:
-            self.text_refiner = TextRefiner(dim, self.text_trans["heads"], self.text_trans["layers"])
+            self.text_refiner = TextRefiner(dim, ffn_dim, self.text_trans["heads"],
+                                            self.text_trans["layers"])
         patch_volume = math.prod(self.patch_size)
         self.patch_in = nn.Linear(in_channels * patch_volume, dim)
         self.text_in = nn.Linear(text_dim, dim)
@@ -457,6 +483,12 @@ class GigaExpTransformer(nn.Module):
                 block.ff._stats_layer = str(idx)
         self.norm = RMSNorm(dim)
         self.out = nn.Linear(dim, out_channels * patch_volume)
+        # final adaLN (MOSS-Image shift+scale 风格): 输出头显式接收 timestep 调制,
+        # 不再只靠末层残差 gate 捎带 t。cond 与 blocks 同源 (basis 模式下为 r 维投影), 参数
+        # basis r=64 时仅 ~0.5M / shared 全秩时 29.5M。DiT/SD3 是 shift+scale+gate 三项,
+        # Z-Image/Qwen-Image-2.1 精简为 scale-only, MOSS-Image 保留 shift+scale。
+        self.head_mod = nn.Sequential(
+            nn.SiLU(), nn.Linear(dim if self.adaln_rank is None else self.adaln_rank, dim * 2))
 
     def set_moe_routing_step(self, step: int):
         """同步 RoutingSchedule 步数 (A 强制均衡 → B 渐进 → C 学习), 训练循环每 step 调用。"""
@@ -502,9 +534,10 @@ class GigaExpTransformer(nn.Module):
             "adaln_type": self.adaln_type,
             "adaln_rank": self.adaln_rank,
             "text_trans": self.text_trans,
+            "head_mod": True,
             "moe": self.moe_cfg,
             "implementation": {
-                "version": "giga_semantics_v1",
+                "version": "giga_semantics_v2",
                 "rope": "fp32_cos_sin_and_rotation",
                 "qk_norm": "per_head_rms_norm",
                 "rotate_layout": "half_chunk",
@@ -533,11 +566,13 @@ class GigaExpTransformer(nn.Module):
         image = x.reshape(b, self.in_channels, t, pt, h, ph, w, pw)
         image = self.patch_in(image.permute(0, 2, 4, 6, 3, 5, 7, 1).reshape(b, t * h * w, -1))
         text = self.text_in(text)
-        if self.text_trans is not None:
-            # Text Refiner: 恒等初始化的残差自注意力+FFN, 只精炼文本 token, padding mask 透传
-            text = self.text_refiner(text, text_mask)
         n_img = image.shape[1]
         n_total = n_img + text.shape[1]
+        # rope 提前计算: text refiner 需要 text 位置切片 (与主块同一套 4 轴频率)
+        cos, sin = self.rope(t, h, w, text.shape[1], image.device, image.dtype)
+        if self.text_trans is not None:
+            # Text Refiner (MOSS _TextBlock 对齐版): qk norm + text 位置 RoPE + SwiGLU
+            text = self.text_refiner(text, text_mask, cos[n_img:], sin[n_img:])
         attention_mask = None
         pack = None
         if text_mask is not None:
@@ -570,7 +605,7 @@ class GigaExpTransformer(nn.Module):
         if self.adaln_basis is not None:
             # basis 模式: 全模型一次投影 z = P·cond, blocks 的双分支系数头只吃 r 维 z
             cond = self.adaln_basis(cond.to(self.adaln_basis.weight.dtype))
-        cos, sin = self.rope(t, h, w, text.shape[1], x.device, x.dtype)
+        # cos/sin 已在 text refiner 之前计算 (L571), 此处直接复用
         # MoE: 每 forward 重置 aux 收集 (训练循环在 backward 前读取 moe_aux_losses)
         self.moe_aux_losses = []
         if self.has_moe:
@@ -594,7 +629,11 @@ class GigaExpTransformer(nn.Module):
                 self.moe_aux_losses.append(block.last_moe_aux)
             if features is not None and block_idx in feature_layers:
                 features.append(x)  # [B, n_img+n_text, D] 全序列, KD 侧再切 image 前缀
-        image = self.out(self.norm(x[:, :t * h * w]))
+        image = self.norm(x[:, :t * h * w])
+        # final adaLN shift+scale 调制 (MOSS-Image 顺序): x·(1+scale)+shift
+        shift, scale = self.head_mod(cond).to(image.dtype).chunk(2, -1)
+        image = image * (1 + scale).unsqueeze(1) + shift.unsqueeze(1)
+        image = self.out(image)
         image = image.reshape(b, t, h, w, pt, ph, pw, self.out_channels)
         out = image.permute(0, 7, 1, 4, 2, 5, 3, 6).reshape(b, self.out_channels, t * pt, h * ph, w * pw)
         if features is not None:

@@ -32,9 +32,9 @@ export PYTORCH_ALLOC_CONF=expandable_segments:True
 # 打印每次 dynamo 重编译的具体 guard 失败原因, 用于定位反复重编译的元凶
 export TORCH_LOGS=recompiles
 
-# stage_1 Wan5B 单流版: 默认 configs/stage_1_wan5b_tar.yaml
-# (Wan2.2 TI2V-5B 初始化单流 DiT, 权重需先跑 tools/convert_wan22_5b.py 生成 init_from 指向的 safetensors)
-CONFIG="${CONFIG:-${1:-configs/stage_1_wan5b_tar.yaml}}"
+# stage_1 5B attention 加重型 (从零训练): 默认 configs/stage_1_5b_tar.yaml
+# CONFIG="${CONFIG:-${1:-configs/stage_1_wan5b_tar.yaml}}"
+CONFIG="${CONFIG:-${1:-configs/stage_1_5b_tar.yaml}}"
 GPUS="${NPROC_PER_NODE:-${GPUS:-8}}"
 
 # 启动前预检: tar 根目录必须已挂载且非空, 避免 8 个 rank 全部在 FileNotFoundError 上失败后重试

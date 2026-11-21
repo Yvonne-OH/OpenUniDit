@@ -1,21 +1,25 @@
 # Giga-Exp Image stage_1 5B — attention 加重型 (NFS unified tar 数据版)。
 # 参考 configs/stage_1_xl_tar.yaml (数据/调度/组件完全一致), 唯一区别是模型结构。
 #
-# 设计目标: 总参 ~5B, attention (QKV+out) ~2B (~40%)。
-# XL (dim 2048, ratio 4) 的 attn:ffn = 4d² : 8d² = 1:2, attn 只占 ~32%。
-# 提到 40% 的合理路径不是拉宽, 而是降低 MLP ratio (Gemma-2 ratio 2.0 / Phi-3-medium ratio 3.0
-# 的宽注意力窄 FFN 设计): DiT 的核心算子是跨 1024 image token + 2048 text token 的全局混合,
-# FFN 只是逐 token 变换, attn:ffn 比例上调有明确动机。
-#   4d²·L = 2B 且 ffn = 2.5d → dim=4096, layers=30, ffn_dim=10240:
-#     attn  2.01B (39.7%)   qkv+out: 4·4096²·30
-#     FFN   2.52B (49.6%)   2·4096·10240·30 (ratio 2.5)
-#     adaLN 94M  (1.9%)     basis r=64: 共享 P 4096·64 + 每层 2×Linear(64, 6·4096)
-#     refiner 403M (7.9%)   text_refiner 2 层 (每层 12·4096², MOSS 风格恒等初始化)
-#     embed/out ~45M (0.9%) text_in 2560→4096, time_in 256→4096→4096, patch_in/out
-#   合计 ≈ 5.07B, bf16 ≈ 10.1GB。
-# 其余按惯例: heads=32 → head_dim 128, 与 rope_axes_dims [16,48,48,16] (合计 128) 严格对齐;
-# depth 30 在 SD3-Large (32 层/8B) 区间; dim 翻倍 → 显存激活 ~2x, b=2 → b=1 + grad_accum 2
-# (有效 batch 与 XL 一致), 256 桶 b 4→2。
+# 设计目标: attn (QKV+out) ~2.5B (~37%), FFN 膨胀比压到 3.0 (新一代生图模型窄 FFN 风格:
+# Qwen-Image-2.1 mlp_ratio=3 / MOSS-Image 2.67, 上一代 DiT/SD3/FLUX/Qwen v1 均为 4.0)。
+# DiT 的核心算子是跨 1024 image token + 2048 text token 的全局混合, FFN 只是逐 token 变换,
+# attn:ffn 比例上调有明确动机; 但低于 3x 无生图侧实证, 不再激进。
+#   dim=3840, layers=36, ffn_dim=11520 (ratio 3.0):
+#     attn  2.12B (37.0%)   qkv+out: 4·3840²·36 (no bias)
+#     FFN   3.18B (55.5%)   2·3840·11520·36 (ratio 3.0)  → attn:ffn ≈ 1:1.5 (= Qwen-Image-2.1)
+#     adaLN 108M (1.9%)     basis r=64 双分支: 共享 P 3840·64 + 每层 mod_img/mod_txt 各 Linear(64, 6·3840)
+#     refiner 383M (6.6%)   text_refiner 2 层, 逐项对齐 MOSS _TextBlock: per-head qk RMSNorm +
+#                           text 位置 RoPE (与主块同一套 4 轴频率) + SwiGLU 门控 (ffn 11520),
+#                           每层 4·3840²+3·3840·11520 ≈ 192M, 残差支路零初始化 (恒等起步)
+#     head/emb ~26M (0.4%)  text_in 2560→3840, time_in 256→3840→3840, patch_in/out,
+#                           head_mod (MOSS-Image 风格 shift+scale final adaLN, r=64 时 0.5M)
+#   合计 ≈ 5.83B, bf16 ≈ 11.7GB。
+# 其余按惯例: heads=30 → head_dim 128, 与 rope_axes_dims [16,48,48,16] (合计 128) 严格对齐;
+# depth 36 邻近 Qwen-Image-2.1 (32 层) 区间; dim 缩至 3840 (Z-Image 同款) 控总参 ≤6B,
+# b=2 → b=1 + grad_accum 2 (有效 batch 与 XL 一致), 256 桶 b 4→2。
+# 文本条件: Qwen chat 模板 (use_chat_template: true, 对齐 MOSS-Image / 6B teacher 约定),
+# 从零训练 step0 起即固定, 推理 infer_giga_exp.py 读同一键自动同步。
 stage: stage_1
 output_dir: /home/jovyan/pfs/users/zhanqian.wu/exp/giga_exp_image/stage_1_5b
 seed: 42
@@ -36,13 +40,13 @@ model:
   text_trans:
     enabled: true
     layers: 2
-    heads: 32
+    heads: 30
   in_channels: 48
   out_channels: 48
   text_dim: 2560
-  dim: 4096
-  ffn_dim: 10240        # MLP ratio 2.5 (Gemma-2/Phi-3 风格宽注意力窄 FFN)
-  heads: 32
+  dim: 3840
+  ffn_dim: 11520        # MLP ratio 3.0 (Qwen-Image-2.1 mlp_ratio=3, 新一代窄 FFN 下限)
+  heads: 30
   layers: 36
   rope_theta: 10000.0
   # 4D RoPE: (time, height, width, text_position), head_dim = dim/heads = 128, 不变
@@ -57,6 +61,10 @@ components:
     local_files_only: true
     layer: -2
     max_length: 2048
+    # Qwen chat 模板 (对齐 MOSS-Image / 6B teacher 约定): prompt 包成单条 user 消息 +
+    # add_generation_prompt (enable_thinking=True); CFG 空分支 (eos) 同样走模板保持两分支一致。
+    # 从零训练 step0 起即固定模板约定; 训练与推理必须同时开关 (infer_giga_exp.py 读同一键)。
+    use_chat_template: true
   wan_vae:
     type: AutoencoderKLWan
     pretrained_path: /mnt/nfs/models/huggingface/models--Wan-AI--Wan2.2-TI2V-5B-Diffusers
@@ -181,6 +189,8 @@ training:
     enabled: true
     betas: [0.9, 0.95]
     epsilon: 1.0e-8
+    # 必须写在此处: build_optimizer 只读 adam_cfg.get("weight_decay"), 顶层 weight_decay 不会被读取
+    weight_decay: 0.005
   # 从零训练: lr 按 1/sqrt(width) 从 XL (dim 2048, 5e-5) 下调至 3.5e-5, warmup 相应拉长
   learning_rate: 3.5e-5
   weight_decay: 0.005

@@ -624,6 +624,17 @@ def encode_text(text_encoder, inputs, layer=None):
     return out.hidden_states[layer] if layer is not None else out.last_hidden_state
 
 
+def chat_format_prompts(tokenizer, prompts, use_chat_template):
+    """use_chat_template=true 时把 prompt 包成 Qwen chat 模板 (对齐 MOSS-Image / 6B teacher 约定):
+    单条 user 消息 + add_generation_prompt (enable_thinking=True), 空内容 (CFG 空分支) 同样走
+    模板, 保证 cond/uncond 两分支文本格式一致。关闭时原样返回 (裸文本, 旧行为)。"""
+    if not use_chat_template:
+        return prompts
+    return [tokenizer.apply_chat_template([{"role": "user", "content": p}], tokenize=False,
+                                          add_generation_prompt=True, enable_thinking=True)
+            for p in prompts]
+
+
 def wan_latent_stats(vae, device):
     """官方 Wan 约定 (diffusers WanPipeline): 模型侧 z_norm = (z_vae - mean) / std;
     decode 前 z_vae = z_norm * std + mean. Wan2.2 config 无 scaling_factor, 键为 z_dim/latents_mean/latents_std."""
@@ -656,6 +667,8 @@ def run_next_batch_validation(engine, vae, tokenizer, text_encoder, device, dtyp
     pixels = torch.from_numpy(batch["pixel_values"]).to(device)  # [B,C,T=1,H,W] in [-1,1]
     prompts = [str(c).strip() or tokenizer.eos_token for c in batch["captions"]]
     negative_prompts = [tokenizer.eos_token] * len(prompts)
+    prompts = chat_format_prompts(tokenizer, prompts, tc.get("use_chat_template"))
+    negative_prompts = chat_format_prompts(tokenizer, negative_prompts, tc.get("use_chat_template"))
     inputs = tokenizer(prompts + negative_prompts, return_tensors="pt", padding=True, truncation=True, max_length=tc.get("max_length", 512)).to(device)
     text_all = encode_text(text_encoder, inputs, tc.get("layer"))
     mask_all = inputs.attention_mask.bool()
@@ -1171,6 +1184,7 @@ def main():
                     drop = torch.rand(len(prompts), device=device) < cfg_dropout
                     empty_prompt = tokenizer.eos_token or " "
                     prompts = [empty_prompt if drop[i].item() else prompt for i, prompt in enumerate(prompts)]
+                prompts = chat_format_prompts(tokenizer, prompts, tc.get("use_chat_template"))
                 inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=tc.get("max_length", 512)).to(device)
                 text, mask = encode_text(text_encoder, inputs, tc.get("layer")), inputs.attention_mask.bool()
                 # 钳到 >=2 token: dynamo 对 size 0/1 有 0/1 特化, L<=1 的退化 batch 会在单个 rank

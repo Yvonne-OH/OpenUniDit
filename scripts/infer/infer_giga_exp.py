@@ -243,11 +243,24 @@ def wan_latent_stats(vae, device):
     return mean, std_inv
 
 
-def encode_cfg_prompts(tokenizer, encoder, prompts, negative_prompt, device, layer, max_length):
+def chat_format_prompts(tokenizer, prompts, use_chat_template):
+    """use_chat_template=true 时把 prompt 包成 Qwen chat 模板 (与 train_giga_exp.py 训练侧
+    完全一致, 对齐 MOSS-Image / 6B teacher 约定); 空内容 (EOS 无条件分支) 同样走模板。
+    训练与推理必须同时开启或同时关闭, 否则文本条件分布错位。"""
+    if not use_chat_template:
+        return prompts
+    return [tokenizer.apply_chat_template([{"role": "user", "content": p}], tokenize=False,
+                                          add_generation_prompt=True, enable_thinking=True)
+            for p in prompts]
+
+
+def encode_cfg_prompts(tokenizer, encoder, prompts, negative_prompt, device, layer, max_length,
+                       use_chat_template=False):
     """正样本 + negative prompt 一次性编码, 统一 padding 长度后拆分 (供 CFG cat)."""
     filled = [p.strip() if p and p.strip() else tokenizer.eos_token for p in prompts]
     negative = negative_prompt.strip() if negative_prompt and negative_prompt.strip() else tokenizer.eos_token
-    inputs = tokenizer(filled + [negative] * len(filled),
+    texts = chat_format_prompts(tokenizer, filled + [negative] * len(filled), use_chat_template)
+    inputs = tokenizer(texts,
                        return_tensors="pt", padding=True, truncation=True, max_length=max_length).to(device)
     out = encoder(**inputs, use_cache=False, return_dict=True, output_hidden_states=layer is not None)
     text_all = out.hidden_states[layer] if layer is not None else out.last_hidden_state
@@ -325,6 +338,7 @@ def main():
         ("steps", str(args.steps)),
         ("guidance_scale", str(args.guidance_scale)),
         ("negative_prompt", args.negative_prompt or "<|im_end|>"),
+        ("chat_template", "on" if tc.get("use_chat_template") else "off"),
         ("shift", str(shift)),
         ("seed", str(args.seed)),
         ("batch_size", str(args.batch_size)),
@@ -399,7 +413,8 @@ def main():
         batch_index = list(range(start, min(start + args.batch_size, len(prompts))))
         batch_prompts = prompts[start:start + args.batch_size]
         text, mask, neg, neg_mask = encode_cfg_prompts(
-            tokenizer, encoder, batch_prompts, args.negative_prompt, device, layer, max_length)
+            tokenizer, encoder, batch_prompts, args.negative_prompt, device, layer, max_length,
+            use_chat_template=bool(tc.get("use_chat_template")))
         # 所有 prompt 固定同一 seed (逐条独立生成器, 结果与 batch_size 无关, 可复现)
         noises = []
         for _ in batch_index:

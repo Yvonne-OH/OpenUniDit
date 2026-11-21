@@ -59,6 +59,11 @@ components:
     local_files_only: true
     layer: -2                     # 取倒数第二层 hidden states (对齐 gigaworld stage1 约定)
     max_length: 2048
+    # Qwen chat 模板开关 (对齐 MOSS-Image / 6B teacher 约定): true 时 prompt 包成单条 user
+    # 消息 + add_generation_prompt (enable_thinking=True); CFG 空分支 (eos) 同样走模板保持
+    # 两分支一致。训练与推理必须同时开关 (infer_giga_exp.py 读同一键), 只切一侧会文本条件
+    # 分布错位。当前 false = 裸文本条件 (与已训 step 对齐); 切 true 需评估 ckpt 适配成本。
+    use_chat_template: false
   wan_vae:
     type: AutoencoderKLWan
     pretrained_path: /mnt/nfs/models/huggingface/models--Wan-AI--Wan2.2-TI2V-5B-Diffusers

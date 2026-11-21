@@ -36,10 +36,20 @@ class GigaLMDBDataset(LmdbParquetDataset):
                 max_upscale_ratio=cfg.get("max_upscale_ratio", 1.2),
                 max_retries=cfg.get("max_retries", 16),
                 seed=seed,
+                image_training_enabled=cfg.get("image_training_enabled", True),
+                edit_training_enabled=cfg.get("edit_training_enabled", False),
+                edit_database_path=cfg.get("edit_database_path"),
+                edit_sources=cfg.get("edit_sources"),
+                max_edit_samples=cfg.get("max_edit_samples"),
                 refresh_index_cache=cfg.get("refresh_index_cache", False),
                 index_cache_dir=index_cache_dir,
                 bucket_sampling_weights=cfg.get("bucket_sampling_weights"),
                 preprocess_style=cfg.get("preprocess_style", "cover"),
+                # t2i_caption 编辑库 7 源: 之前漏传导致 t2i_active=False, 指纹算出
+                # 无 t2i 版本并永久命中复制来的旧缓存 (46.8M 无编辑库行);
+                # 传参后指纹变化自动重建, ~741 万 t2i 行进训练
+                t2i_edit_database_path=cfg.get("t2i_edit_database_path"),
+                t2i_edit_sources_t2i_mode=cfg.get("t2i_edit_sources_t2i_mode"),
             )
             return
         if dataset_type != "lmdb_parquet":

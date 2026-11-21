@@ -1152,9 +1152,11 @@ class LmdbParquetDataset(ImageDatabaseDataset):
                     continue
                 try:
                     pq_subdir = "parquet_t2i" if label == "t2i" else "parquet"
+                    # t2i 分片文件不带 meta_ 前缀 (如 hqedit_0020-00001.parquet), 与 _read_parquet 对齐
+                    pq_prefix = "" if label == "t2i" else "meta_"
                     parquet_count = sum(
                         1 for entry in os.listdir(source_dir / pq_subdir)
-                        if entry.startswith("meta_") and entry.endswith(".parquet")
+                        if entry.startswith(pq_prefix) and entry.endswith(".parquet")
                     )
                     mdb_count = sum(
                         1 for entry in os.listdir(source_dir / "mdb")
@@ -1564,7 +1566,11 @@ class LmdbParquetDataset(ImageDatabaseDataset):
             for source_dir in source_dirs:
                 if not source_dir.is_dir():
                     continue
-                shard_parquets = sorted((source_dir / pq_subdir).glob("meta_*.parquet"))
+                # t2i 的 parquet_t2i/ 文件按源内分片名 (如 hqedit_0020-00001.parquet),
+                # 不带 image 源 meta_ 前缀; 此前统一 glob meta_*.parquet 读到 0 个文件,
+                # 是 t2i 编辑库 7 源进不了索引的第二处根因 (第一处: 工厂漏传 t2i 配置)
+                shard_parquets = sorted((source_dir / pq_subdir).glob(
+                    "meta_*.parquet" if not t2i else "*.parquet"))
                 if shard_parquets:
                     files.extend((file, source_dir) for file in shard_parquets)
                 elif not t2i and (source_dir / "mdb").is_dir() and \
@@ -1608,8 +1614,17 @@ class LmdbParquetDataset(ImageDatabaseDataset):
                     return None
                 item = {"caption": cap, "width": row.get("w_before"), "height": row.get("h_before")}
                 item.update(sample_id=sid, source=source, is_edit=False)
-                item["image_path"] = f"lmdb://{dataset_dir}/{stem}/{sid}:before"
-                item["uri_kind"] = 1   # 行级 uri 后缀: 0=single, 1=before (列式索引 kind 列)
+                # 载荷定位优先列式 blob: images[0]=before 图, off/size 与 .idx 一致,
+                # tar://{stem}/{off}:{size} seek+read (tar 后端唯一可用路径)。
+                # 旧行式 lmdb://+uri_kind=1 依赖真实 mdb, tar 后端无 mdb 解码必失败, 仅作 fallback。
+                imgs = row.get("images")
+                blob = imgs[0] if isinstance(imgs, (list, tuple)) and imgs and isinstance(imgs[0], dict) else None
+                if blob and "off" in blob and "size" in blob:
+                    item["image_path"] = f"tar://{dataset_dir}/{stem}/{int(blob['off'])}:{int(blob['size'])}"
+                    item["uri_kind"] = 0
+                else:
+                    item["image_path"] = f"lmdb://{dataset_dir}/{stem}/{sid}:before"
+                    item["uri_kind"] = 1
                 return item
             item = {
                 key: row[key]
@@ -1633,10 +1648,17 @@ class LmdbParquetDataset(ImageDatabaseDataset):
 
         for file, source_dir in file_iterator:
             if source_dir not in source_shards:
-                parquet_files = sorted((source_dir / pq_subdir).glob("meta_*.parquet"))
+                parquet_files = sorted((source_dir / pq_subdir).glob(
+                    "meta_*.parquet" if not t2i else "*.parquet"))
                 mdb_files = sorted((source_dir / "mdb").glob("*.mdb"))
                 if not mdb_files:
-                    continue
+                    if t2i and parquet_files:
+                        # parquet_t2i 形态: blob off/size 由 images 列直供, tar 四件套与
+                        # parquet_t2i 文件名一一对应, 无 mdb/ 目录; stem = parquet 分片 stem
+                        source_shards[source_dir] = {f: f.stem for f in parquet_files}
+                        continue
+                    else:
+                        continue
                 if not parquet_files:
                     merged = source_dir / "parquet" / "meta.parquet"
                     if not merged.exists():
@@ -1717,7 +1739,9 @@ class LmdbParquetDataset(ImageDatabaseDataset):
                 if sid is None:
                     source_stats["filtered_no_id"] += 1
                     continue
-                sid = int(sid)
+                # t2i 行 id 是字符串键 (如 hqedit_0020_12438...), 不参与 LMDB int 编号
+                if not t2i:
+                    sid = int(sid)
                 # URI 必须指向实际包含 mdb/ 的 source 目录；lmdb_root 用于
                 # database_path 是 parquet 路径、但载荷位于另一根目录的情况。
                 item = _item_from_row(row, sid, stem, source, is_edit, dataset_dir)
