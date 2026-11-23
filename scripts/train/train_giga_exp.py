@@ -67,6 +67,115 @@ def _data_error_category(exc):
         return "executor_bug"
 
 
+class TrainingDataStream:
+    """Keep the requested batch cursor independent of DataLoader prefetching."""
+
+    def __init__(self, data, sampler, training_cfg, logger, epoch=0, batch_offset=0):
+        self.data, self.sampler = data, sampler
+        self.training_cfg, self.logger = training_cfg, logger
+        self.epoch, self.batch_offset = epoch, batch_offset
+        self.loader = self.iterator = None
+        self._start()
+
+    def _start(self):
+        self.sampler.set_start_batch(self.batch_offset, epoch=self.epoch)
+        workers = int(self.training_cfg.get("num_workers", 4))
+        kwargs = dict(num_workers=workers, collate_fn=collate)
+        if workers:
+            kwargs.update(prefetch_factor=4, persistent_workers=True,
+                          timeout=float(self.training_cfg.get("dataloader_timeout_seconds", 180)))
+        self.loader = torch.utils.data.DataLoader(self.data, batch_sampler=self.sampler, **kwargs)
+        self.iterator = iter(self.loader)
+
+    def next_batch(self):
+        if self.batch_offset >= len(self.sampler):
+            self.epoch += 1
+            self.batch_offset = 0
+            self.sampler.set_start_batch(0, epoch=self.epoch)
+            self.iterator = iter(self.loader)
+        # A failed request is skipped as well; prefetched tasks do not advance this cursor.
+        self.batch_offset += 1
+        return next(self.iterator)
+
+    def close(self):
+        iterator, loader = self.iterator, self.loader
+        self.iterator = self.loader = None
+        if iterator is None:
+            return
+        workers = list(getattr(iterator, "_workers", ()))
+        if not workers:
+            return
+        # Force-close this iterator's own workers. Graceful PyTorch shutdown waits on
+        # worker queues/events, which may be held by a worker stuck in I/O.
+        import psutil
+        from torch.utils.data._utils import signal_handling
+        iterator._shutdown = True
+        if iterator._worker_pids_set:
+            signal_handling._remove_worker_pids(id(iterator))
+            iterator._worker_pids_set = False
+        descendants = []
+        for worker in workers:
+            try:
+                descendants.extend(psutil.Process(worker.pid).children(recursive=True))
+            except psutil.NoSuchProcess:
+                pass
+        for child in reversed(descendants):
+            try:
+                child.kill()
+            except psutil.NoSuchProcess:
+                pass
+        for worker in workers:
+            if worker.is_alive():
+                worker.kill()
+        deadline = time.monotonic() + 5.0
+        for worker in workers:
+            worker.join(timeout=max(0.0, deadline - time.monotonic()))
+        for queue in [*iterator._index_queues, iterator._worker_result_queue]:
+            queue.cancel_join_thread()
+            queue.close()
+        loader._iterator = None
+        alive = [worker.pid for worker in workers if worker.is_alive()]
+        if alive:
+            raise RuntimeError(f"DataLoader workers did not exit after SIGKILL: {alive}")
+
+    def restart(self):
+        self.close()
+        self._start()
+        self.logger.warning("DataLoader workers rebuilt at epoch=%d batch=%d", self.epoch, self.batch_offset)
+
+
+def next_training_batch(stream, device, logger, step, micro_idx, pending_batch=None):
+    """Synchronize failures before rebuilding workers or starting any backward."""
+    batch, error, status = None, None, 0
+    try:
+        batch = pending_batch if pending_batch is not None else stream.next_batch()
+    except Exception as exc:
+        error = exc
+        if "DataLoader timed out" in str(exc):
+            status = 2
+        else:
+            status = 3 if _data_error_category(exc) == "executor_bug" else 1
+        logger.warning("step=%d micro=%s batch read failed (status=%d): %s", step, micro_idx, status, exc)
+    flag = torch.tensor([status], device=device)
+    dist.all_reduce(flag, op=dist.ReduceOp.MAX)
+    status = int(flag.item())
+    if status == 3:
+        raise RuntimeError("A rank encountered a fatal DataLoader error") from error
+    if status == 2:
+        recovery_error = None
+        try:
+            # All ranks discard the same requested slot and restart at the same cursor.
+            stream.restart()
+        except Exception as exc:
+            recovery_error = exc
+            logger.exception("DataLoader worker rebuild failed")
+        flag.fill_(int(recovery_error is not None))
+        dist.all_reduce(flag, op=dist.ReduceOp.MAX)
+        if flag.item():
+            raise RuntimeError("A rank could not rebuild its DataLoader workers") from recovery_error
+    return None if status else batch
+
+
 def _blue_print(message):
     """蓝色高亮提示: 只走 stdout (终端/console 可见), 不进 train.log, 文件日志保持纯文本。"""
     print(f"\033[1;34m{message}\033[0m", flush=True)
@@ -320,16 +429,22 @@ def _warn_semantic_mismatch(model, metadata, source, logger=None):
     print(f"\033[1;31m{message}\033[0m", flush=True)
 
 
-def _read_weight_metadata(path):
+def _read_checkpoint_metadata(path):
     if path.suffix == ".safetensors":
         from safetensors import safe_open
         with safe_open(str(path), framework="pt", device="cpu") as handle:
-            raw = (handle.metadata() or {}).get("giga_semantic_metadata")
-        return json.loads(raw) if raw else None
+            metadata = handle.metadata() or {}
+        if metadata.get("giga_semantic_metadata"):
+            metadata["giga_semantic_metadata"] = json.loads(metadata["giga_semantic_metadata"])
+        return metadata
     sidecar = path.with_suffix(".json")
     if not sidecar.is_file():
-        return None
-    return json.loads(sidecar.read_text(encoding="utf-8")).get("giga_semantic_metadata")
+        return {}
+    return json.loads(sidecar.read_text(encoding="utf-8"))
+
+
+def _read_weight_metadata(path):
+    return _read_checkpoint_metadata(path).get("giga_semantic_metadata")
 
 
 def load_training_checkpoint(engine, checkpoint_dir, tag):
@@ -338,6 +453,7 @@ def load_training_checkpoint(engine, checkpoint_dir, tag):
     if not load_path:
         raise RuntimeError("load_checkpoint 返回空路径")
     client_state = client_state or {}
+    engine.giga_samples_seen = int(client_state.get("samples_seen", 0))
     _warn_semantic_mismatch(engine.module, client_state.get("giga_semantic_metadata"), f"DeepSpeed {tag}")
     return load_path, client_state
 
@@ -349,16 +465,20 @@ def save_pure_weights(engine, output_dir, step):
     weight_dir.mkdir(parents=True, exist_ok=True)
     state = {key: value.detach().cpu() for key, value in engine.module.state_dict().items()}
     semantic = _semantic_metadata(engine.module)
+    progress_metadata = {"step": step, "samples_seen": int(getattr(engine, "giga_samples_seen", 0)),
+                         "giga_semantic_metadata": semantic}
     target = weight_dir / f"step-{step:08d}.safetensors"
     try:
         from safetensors.torch import save_file
-        save_file(state, str(target), metadata={"format": "pt", "step": str(step), "giga_semantic_metadata": json.dumps(semantic, sort_keys=True)})
+        save_file(state, str(target), metadata={"format": "pt", "step": str(step),
+                  "samples_seen": str(progress_metadata["samples_seen"]),
+                  "giga_semantic_metadata": json.dumps(semantic, sort_keys=True)})
     except ImportError:
         target = target.with_suffix(".pt")
         torch.save(state, target)
-        target.with_suffix(".json").write_text(json.dumps({"giga_semantic_metadata": semantic}, sort_keys=True), encoding="utf-8")
+        target.with_suffix(".json").write_text(json.dumps(progress_metadata, sort_keys=True), encoding="utf-8")
     torch.save(state, weight_dir / "latest.pt")
-    (weight_dir / "latest.json").write_text(json.dumps({"giga_semantic_metadata": semantic}, sort_keys=True), encoding="utf-8")
+    (weight_dir / "latest.json").write_text(json.dumps(progress_metadata, sort_keys=True), encoding="utf-8")
 
 
 def prune_state_checkpoints(checkpoint_dir, keep):
@@ -572,6 +692,10 @@ def load_pure_weights(engine, output_dir, checkpoint_path=None):
         target = max(candidates, key=lambda path: int(path.name.split("-")[1].split(".")[0]))
     step_match = re.search(r"step-(\d+)", target.name)
     step = int(step_match.group(1)) if step_match else 0
+    progress_metadata = _read_checkpoint_metadata(target)
+    engine.giga_samples_seen = int(progress_metadata.get("samples_seen", 0))
+    if step and "samples_seen" not in progress_metadata and _dist_rank() == 0:
+        logging.getLogger("giga_exp").warning("旧权重未保存 samples_seen; 样本计数从本次恢复起重新累计")
     _warn_semantic_mismatch(engine.module, _read_weight_metadata(target), str(target))
     if target.suffix == ".safetensors":
         from safetensors.torch import load_file
@@ -1022,11 +1146,9 @@ def main():
     # 永久卡在取 batch, 不抛异常也不触发 skip 机制, 其余 rank 在 skip_flag allreduce 上等满
     # NCCL watchdog 后全队团灭 (2026-11-19 20:21 n8 实测: step-216505 后 6 rank 卡 30min)。
     # timeout 到点抛 RuntimeError → skip 机制接住并重建 iterator, fail-fast 优于挂死。
-    loader = torch.utils.data.DataLoader(data, batch_sampler=batch_sampler,
-                                         num_workers=cfg["training"].get("num_workers", 4),
-                                         prefetch_factor=4, persistent_workers=True,
-                                         timeout=180, collate_fn=collate)
-    iterator = iter(loader)
+    data_stream = TrainingDataStream(data, batch_sampler, cfg["training"], logger,
+                                     epoch=epoch, batch_offset=batch_offset)
+    samples_seen = int(getattr(engine, "giga_samples_seen", 0))
 
     wandb_run = None
     if rank == 0 and cfg["logging"]["wandb"]["enabled"]:
@@ -1117,61 +1239,27 @@ def main():
         logger.info("✅ compile warmup 结束 (耗时 %.0fs)", time.time() - warm_state["t0"])
     progress = tqdm(total=max_steps, initial=step, disable=rank != 0, dynamic_ncols=True, desc="🚂 stage_1")
     while step < max_steps:
-        step += 1
-        micro_losses = []
-        micro_sigmas = []
+        next_step = step + 1
+        updates_before = engine.global_steps
+        micro_metrics = torch.zeros(3, device=device)  # loss sum, sigma sum, actual sample count
         micro_moe_aux = []
         micro_bucket_sums = torch.zeros(SIGMA_BUCKETS, device=device)
         micro_bucket_counts = torch.zeros(SIGMA_BUCKETS, device=device)
         last_captions = None
-        lr_now = set_lr(client_optimizer, ds_optimizer, step, cfg["training"])
+        lr_now = set_lr(client_optimizer, ds_optimizer, next_step, cfg["training"])
         if getattr(engine.module, "has_moe", False):
-            # 同步 RoutingSchedule (A 强制均衡 → B 渐进混入 → C 学习路由)
-            engine.module.set_moe_routing_step(step)
-        for micro_idx in range(grad_accum):
-            bad_local = 0
-            try:
-                if pending_batch is not None:
-                    batch = pending_batch
-                else:
-                    try:
-                        batch = next(iterator)
-                    except StopIteration:
-                        batch_sampler.set_epoch(batch_sampler.epoch + 1)
-                        iterator = iter(loader)
-                        batch = next(iterator)
-            except Exception as exc:
-                # 数据级错误 (坏图/坏视频/解码子进程 MemoryError 等) 跳过该 micro batch,
-                # 不再炸掉整个多卡作业; executor_bug 或连续跳过超限仍然终止。
-                category = _data_error_category(exc)
-                if "DataLoader timed out" in str(exc):
-                    # 🚨 NFS 静默挂起特征: read syscall 不返回连异常都不抛, 只能靠 DataLoader
-                    # timeout 兜底 (2026-11-19 20:21 n8 事故: 无 timeout 时 6 rank 卡 30min 团灭)。
-                    # torch 抛的是无 category 属性的裸 RuntimeError → 会被归类 executor_bug
-                    # 当场炸死全队 (copy12 13:43 教训: 归类覆盖必须在 raise 检查之前)。
-                    category = "deadline"
-                    logger.error(
-                        "🚨🚨🚨 rank=%d step=%d micro=%d DataLoader 取 batch 超时 (180s)! "
-                        "worker 大概率卡死在 NFS 静默挂起 (D 状态 hard mount read) 🚨🚨🚨\n"
-                        "   -> 跳过该 batch 并重建 iterator; 若连续出现请检查存储端 (%s)",
-                        rank, step, micro_idx, str(exc)[:200])
-                    # worker 卡死超时后 persistent_workers iterator 已不可复用, 重建恢复拉取
-                    iterator = iter(loader)
+            engine.module.set_moe_routing_step(next_step)
+        micro_idx = 0
+        while micro_idx < grad_accum:
+            batch = next_training_batch(data_stream, device, logger, next_step, micro_idx, pending_batch)
+            pending_batch = None
+            if batch is None:
                 consecutive_batch_skips += 1
-                if category == "executor_bug" or consecutive_batch_skips > max_consecutive_batch_skips:
-                    raise
-                logger.warning("⏭️ step=%d micro=%d 跳过坏数据 batch (category=%s, consecutive=%d/%d): %s",
-                               step, micro_idx, category, consecutive_batch_skips,
-                               max_consecutive_batch_skips, exc)
-                bad_local = 1
-            # 跨 rank 同步 skip 决策: 任一 rank 坏数据则全体跳过该 micro,
-            # 否则各 rank 的 backward/step 集合通信次数不一致会挂死整个作业。
-            skip_flag = torch.tensor([bad_local], device=device)
-            dist.all_reduce(skip_flag, op=dist.ReduceOp.MAX)
-            if skip_flag.item() > 0:
+                if consecutive_batch_skips > max_consecutive_batch_skips:
+                    raise RuntimeError(f"Consecutive globally skipped batches exceeded {max_consecutive_batch_skips}")
+                # Refill this slot without consuming an optimizer/LR step.
                 continue
             consecutive_batch_skips = 0
-            pending_batch = None
             pixels = torch.from_numpy(batch["pixel_values"]).to(device)
             captions = batch["captions"]
             last_captions = captions
@@ -1210,27 +1298,33 @@ def main():
                 micro_moe_aux.append(moe_aux_total.detach())
             per_sample_loss = diff_sq.flatten(1).mean(1)
             engine.backward(loss)
-            micro_losses.append(diff_sq.mean().detach())
-            micro_sigmas.append(sigma.detach().sum())
+            # Advance DeepSpeed's micro-step counter after every successful backward.
+            engine.step()
+            micro_idx += 1
+            micro_metrics[0] += per_sample_loss.detach().sum()
+            micro_metrics[1] += sigma.detach().sum()
+            micro_metrics[2] += latents.shape[0]
             bins = (sigma.detach() * SIGMA_BUCKETS).long().clamp_(0, SIGMA_BUCKETS - 1)
             micro_bucket_sums.scatter_add_(0, bins, per_sample_loss.detach().float())
             micro_bucket_counts += torch.bincount(bins, minlength=SIGMA_BUCKETS).float()
-        if not micro_losses:
-            logger.warning("🚫 step=%d 本 step 的全部 micro batch 均因坏数据跳过, 跳过本 step 优化", step)
-            continue
-        engine.step()
-        loss_value = torch.stack(micro_losses).mean().item()
-        sigma_mean = torch.stack(micro_sigmas).sum().item() / (grad_accum * latents.shape[0])
+        if engine.global_steps != updates_before + 1:
+            raise RuntimeError("Expected exactly one DeepSpeed update per training step")
+        step = next_step
+        dist.all_reduce(micro_metrics)
+        samples_seen += int(micro_metrics[2].item())
+        engine.giga_samples_seen = samples_seen
+        loss_value = (micro_metrics[0] / micro_metrics[2]).item()
+        sigma_mean = (micro_metrics[1] / micro_metrics[2]).item()
         if rank == 0:
             progress.update(1)
-            progress.set_postfix(loss=f"{loss_value:.5f}", lr=f"{lr_now:.2e}", samples=step * grad_accum * cfg['training']['batch_size_per_device'] * dist.get_world_size())
+            progress.set_postfix(loss=f"{loss_value:.5f}", lr=f"{lr_now:.2e}", samples=samples_seen)
         if step % log_every == 0:
             stats = torch.stack([micro_bucket_sums, micro_bucket_counts])
             dist.all_reduce(stats)
             data_hash = hashlib.md5("\x1f".join(last_captions).encode("utf-8")).hexdigest()[:8]
             logger.info("rank=%d step=%d loss=%.6f data=%s lr=%.3e time=%s sigma_mean=%.5f", rank, step, loss_value, data_hash, lr_now, time.strftime("%H:%M:%S"), sigma_mean)
             if rank == 0 and (wandb_run or swanlab_run):
-                payload = {"train/loss": loss_value, "train/lr": lr_now, "train/sigma_mean": sigma_mean, "train/samples": step * grad_accum * cfg['training']['batch_size_per_device'] * dist.get_world_size()}
+                payload = {"train/loss": loss_value, "train/lr": lr_now, "train/sigma_mean": sigma_mean, "train/samples": samples_seen}
                 # MoE router aux (只记本 rank 均值; 跨 rank 一致性靠 validation collector 全量统计)
                 if micro_moe_aux:
                     payload["train/moe/aux_loss"] = torch.stack(micro_moe_aux).mean().item()
@@ -1253,16 +1347,8 @@ def main():
                 if swanlab_run:
                     swanlab.log(payload, step=step)
         if cfg["validation"].get("enabled", True) and step % int(cfg["validation"].get("every_n_steps", 1000)) == 0:
-            try:
-                pending_batch = next(iterator)
-            except StopIteration:
-                batch_sampler.set_epoch(batch_sampler.epoch + 1)
-                iterator = iter(loader)
-                pending_batch = next(iterator)
-            except Exception as exc:
-                logger.warning("⏭️ step=%d 验证 batch 数据错误, 跳过本步验证 (category=%s): %s",
-                               step, _data_error_category(exc), exc)
-            else:
+            pending_batch = next_training_batch(data_stream, device, logger, step, "validation")
+            if pending_batch is not None:
                 if rank == 0:
                     logger.info("🔍 step=%d 每卡对 next batch 推理", step)
                 # 验证是纯前向、无集合通信, 单 rank 失败不影响其他 rank; 兜底避免 val OOM 带崩整个作业
@@ -1274,13 +1360,15 @@ def main():
                         torch.cuda.empty_cache()
         if step % cfg["training"].get("checkpointing_steps", 1000) == 0 or step == max_steps:
             engine.save_checkpoint(str(checkpoint_dir), tag=f"step-{step}", client_state={
-                "step": step, "giga_semantic_metadata": _semantic_metadata(engine.module),
+                "step": step, "samples_seen": samples_seen,
+                "giga_semantic_metadata": _semantic_metadata(engine.module),
             })
             save_pure_weights(engine, output_dir, step)
             if rank == 0:
                 prune_state_checkpoints(checkpoint_dir, int(cfg["training"].get("state_checkpoints_keep", 2)))
             dist.barrier()
 
+    data_stream.close()
     if rank == 0:
         progress.close()
     if wandb_run:

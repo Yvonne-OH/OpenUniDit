@@ -29,7 +29,7 @@ distributed:
   backend: deepspeed
   config: configs/zero1.json
   world_size: 8
-  timeout_seconds: 7200
+  timeout_seconds: 14400  # 首次索引构建(33源+741万 t2i 行全量扫 NFS)可超 2h, 4h 兜底
 
 model:
   # AdaLN 结构 (adaln_type: shared | dual | basis): basis 低秩调制沿 XL 验证配置不变,
@@ -200,7 +200,7 @@ training:
   checkpointing_steps: 5000
   state_checkpoints_keep: 1
   # 全新结构从零训练, 不继承任何权重
-  resume_mode: none
+  resume_mode: auto
   resume_optimizer: false
   resume_lr_scheduler: true
 
@@ -211,9 +211,9 @@ logging:
   swanlab:
     enabled: true
     project: giga-exp-image
-    name: giga_exp_image_stage_1_5b
+    name: giga_exp_image_stage_1_5b_1122
     api_key: Dit2ngq8iuiGfUkI88e5b
   wandb:
     enabled: false
     project: giga-exp-image
-    name: giga_exp_image_stage_1_5b
+    name: giga_exp_image_stage_1_5b_1122
