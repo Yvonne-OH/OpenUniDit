@@ -24,7 +24,17 @@ else:
 class GigaLMDBDataset(LmdbParquetDataset):
     def __init__(self, cfg, seed=42, index_cache_dir=None):
         dataset_type = str(cfg.get("dataset_type", "lmdb_parquet"))
+        freeze_index_signature = cfg.get("freeze_index_signature", False)
+        if type(freeze_index_signature) is not bool:
+            raise ValueError("dataset.freeze_index_signature 必须为 bool")
+        if freeze_index_signature and dataset_type != "tar_parquet":
+            raise ValueError("freeze_index_signature 仅支持 tar_parquet 后端")
         if dataset_type == "tar_parquet":
+            if "tar_io_concurrency_per_node" in cfg:
+                concurrency = cfg["tar_io_concurrency_per_node"]
+                if type(concurrency) is not int or concurrency < 0:
+                    raise ValueError("tar_io_concurrency_per_node 必须是非负整数")
+                os.environ["YISU_TAR_IO_CONCURRENCY"] = str(concurrency)
             from data.datasets.tar_database import TarParquetDataset
             # 纯 Python 子类, 实例布局兼容, 直接切换后端类 (保持 GigaLMDBDataset 调用点不变)
             self.__class__ = TarParquetDataset
@@ -42,6 +52,7 @@ class GigaLMDBDataset(LmdbParquetDataset):
                 edit_sources=cfg.get("edit_sources"),
                 max_edit_samples=cfg.get("max_edit_samples"),
                 refresh_index_cache=cfg.get("refresh_index_cache", False),
+                freeze_index_signature=freeze_index_signature,
                 index_cache_dir=index_cache_dir,
                 bucket_sampling_weights=cfg.get("bucket_sampling_weights"),
                 preprocess_style=cfg.get("preprocess_style", "cover"),

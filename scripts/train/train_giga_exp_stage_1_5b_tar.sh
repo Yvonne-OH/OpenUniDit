@@ -1,16 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="/home/jovyan/pfs/users/zhanqian.wu/code/model_exp"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 
 # 修复 CUDA Error 803: ldconfig 优先命中 cuda-12.8/compat 的旧版 libcuda (570.86.10),
 # 与驱动 (nvidia-smi 所报版本) 不匹配; 预加载 /usr/lib 下与驱动同版本的 libcuda。
 # 不用 head -1: pipefail 下 head 提前关管道会让 nvidia-smi 偶发 SIGPIPE(141) 直接杀死脚本
-DRIVER_VER="$(nvidia-smi --query-gpu=driver_version --format=csv,noheader | sed -n '1p')"
-LIBCUDA="/usr/lib/x86_64-linux-gnu/libcuda.so.${DRIVER_VER}"
-if [[ -f "$LIBCUDA" && ":${LD_PRELOAD:-}:" != *":$(basename "$LIBCUDA"):*" ]]; then
-  export LD_PRELOAD="${LD_PRELOAD:+${LD_PRELOAD}:}${LIBCUDA}"
+if [[ "${GIGA_DRY_RUN:-0}" != "1" ]]; then
+  DRIVER_VER="$(nvidia-smi --query-gpu=driver_version --format=csv,noheader | sed -n '1p')"
+  LIBCUDA="/usr/lib/x86_64-linux-gnu/libcuda.so.${DRIVER_VER}"
+  if [[ -f "$LIBCUDA" && ":${LD_PRELOAD:-}:" != *":$(basename "$LIBCUDA"):*" ]]; then
+    export LD_PRELOAD="${LD_PRELOAD:+${LD_PRELOAD}:}${LIBCUDA}"
+  fi
 fi
 
 # 图像样本加载超时预算: DecodeBudget 将样本预算均分给最多 3 个候选。
@@ -35,20 +37,24 @@ CONFIG="${CONFIG:-${1:-configs/stage_1_5b_tar.yaml}}"
 GPUS="${NPROC_PER_NODE:-${GPUS:-8}}"
 
 # 启动前预检: tar 根目录必须已挂载且非空, 避免 8 个 rank 全部在 FileNotFoundError 上失败后重试
-TAR_ROOT="$(python - "$CONFIG" <<'PY' | grep '^/'
+TAR_ROOT="$(python - "$CONFIG" <<'PY' | grep -E '^(/|FROZEN_INDEX_READY$)'
 import sys, yaml
 from pathlib import Path
 path = Path(sys.argv[1])
 if not path.is_absolute():
     path = Path.cwd() / path
-print(yaml.safe_load(path.read_text())["dataset"]["database_path"])
+dataset = yaml.safe_load(path.read_text())["dataset"]
+print("FROZEN_INDEX_READY" if dataset.get("freeze_index_signature", False) else dataset["database_path"])
 PY
 )"
-if [[ ! -d "$TAR_ROOT" ]] || [[ -z "$(ls -A "$TAR_ROOT" 2>/dev/null)" ]]; then
+if [[ "$TAR_ROOT" == "FROZEN_INDEX_READY" ]]; then
+  echo "✅ 固定索引模式: 启动不扫描 NFS 源目录，真实读取由 worker 负责"
+elif [[ ! -d "$TAR_ROOT" ]] || [[ -z "$(ls -A "$TAR_ROOT" 2>/dev/null)" ]]; then
   echo "❌ tar 数据集根目录不可用: $TAR_ROOT (NFS 未挂载或为空)" >&2
   exit 1
+else
+  echo "✅ tar 数据集根目录就绪: $TAR_ROOT"
 fi
-echo "✅ tar 数据集根目录就绪: $TAR_ROOT"
 
 # 单机多卡: 设置 NPROC_PER_NODE 或 GPUS。
 # 多机多卡: 每台机器设置 WORLD_SIZE=机器数、RANK=机器编号、MASTER_ADDR、MASTER_PORT、NPROC_PER_NODE。
@@ -114,6 +120,11 @@ CMD=(torchrun \
 
 printf 'command: %q ' "${CMD[@]}" | tee "$RUN_LOG_DIR/command.txt"
 printf '\n' | tee -a "$RUN_LOG_DIR/command.txt"
+
+if [[ "${GIGA_DRY_RUN:-0}" == "1" ]]; then
+  echo "DRY_RUN: command prepared; no training started"
+  exit 0
+fi
 
 # Keep the launcher output in this run's log directory while preserving exit status.
 set +e

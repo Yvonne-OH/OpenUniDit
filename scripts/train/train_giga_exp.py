@@ -32,13 +32,16 @@ import wandb
 import yaml
 from tqdm.auto import tqdm
 from diffusers import AutoencoderKLWan
-from transformers import AutoModel, AutoTokenizer
+from models.text_encoding import (build_tokenizer, build_text_encoder, encode_text,
+                                  chat_format_prompts, text_encoder_metadata)
 
 from data.lmdb_dataset import GigaLMDBDataset, collate_image_batch
 from data.samplers.bucket_sampler import BucketBatchSampler
 from models.giga_transformer import (GigaExpTransformer, apply_adaln_basis_migration,
                                      apply_mod_adaln_migration)
 from models.wan5b_single_stream import Wan5BSingleStream
+from models.model_factory import build_diffusion_model, mhc_config
+from optimizations.mhc_monitoring import TrainingMonitor
 from models.moe import apply_dense_to_moe_migration
 import models.giga_transformer as _giga_transformer
 
@@ -97,6 +100,13 @@ class TrainingDataStream:
         self.batch_offset += 1
         return next(self.iterator)
 
+    def state_dict(self, pending_batch=False):
+        offset = self.batch_offset - int(pending_batch)
+        if offset < 0:
+            raise ValueError("Pending batch has no corresponding data cursor")
+        return {"epoch": self.epoch, "batch_offset": offset,
+                "sampler_signature": sampler_signature(self.sampler)}
+
     def close(self):
         iterator, loader = self.iterator, self.loader
         self.iterator = self.loader = None
@@ -147,6 +157,7 @@ class TrainingDataStream:
 def next_training_batch(stream, device, logger, step, micro_idx, pending_batch=None):
     """Synchronize failures before rebuilding workers or starting any backward."""
     batch, error, status = None, None, 0
+    read_started = time.perf_counter()
     try:
         batch = pending_batch if pending_batch is not None else stream.next_batch()
     except Exception as exc:
@@ -156,15 +167,19 @@ def next_training_batch(stream, device, logger, step, micro_idx, pending_batch=N
         else:
             status = 3 if _data_error_category(exc) == "executor_bug" else 1
         logger.warning("step=%d micro=%s batch read failed (status=%d): %s", step, micro_idx, status, exc)
+    finally:
+        stream.last_fetch_seconds = (time.perf_counter() - read_started) if pending_batch is None else 0.0
     flag = torch.tensor([status], device=device)
     dist.all_reduce(flag, op=dist.ReduceOp.MAX)
     status = int(flag.item())
     if status == 3:
         raise RuntimeError("A rank encountered a fatal DataLoader error") from error
+    if status and batch is not None and getattr(stream, "ready_first", False):
+        stream.defer_batch(batch)
     if status == 2:
         recovery_error = None
         try:
-            # All ranks discard the same requested slot and restart at the same cursor.
+            # Rebuild workers from each rank's committed cursor.
             stream.restart()
         except Exception as exc:
             recovery_error = exc
@@ -174,6 +189,15 @@ def next_training_batch(stream, device, logger, step, micro_idx, pending_batch=N
         if flag.item():
             raise RuntimeError("A rank could not rebuild its DataLoader workers") from recovery_error
     return None if status else batch
+
+
+def make_training_data_stream(data, sampler, training_cfg, logger, epoch=0, batch_offset=0, resume_state=None):
+    if training_cfg.get("ready_data_pipeline", False):
+        from optimizations.ready_data_stream import ReadyDataStream
+        return ReadyDataStream(data, sampler, training_cfg, logger, epoch=epoch,
+                               batch_offset=batch_offset, resume_state=resume_state,
+                               signature=sampler_signature(sampler))
+    return TrainingDataStream(data, sampler, training_cfg, logger, epoch=epoch, batch_offset=batch_offset)
 
 
 def _blue_print(message):
@@ -407,7 +431,10 @@ def _dist_rank():
 
 
 def _semantic_metadata(model):
-    return model.semantic_metadata()
+    metadata = model.semantic_metadata()
+    if hasattr(model, "giga_text_encoder_metadata"):
+        metadata["text_encoder"] = model.giga_text_encoder_metadata
+    return metadata
 
 
 def _warn_semantic_mismatch(model, metadata, source, logger=None):
@@ -436,11 +463,17 @@ def _read_checkpoint_metadata(path):
             metadata = handle.metadata() or {}
         if metadata.get("giga_semantic_metadata"):
             metadata["giga_semantic_metadata"] = json.loads(metadata["giga_semantic_metadata"])
+        if metadata.get("data_cursor"):
+            metadata["data_cursor"] = json.loads(metadata["data_cursor"])
         return metadata
     sidecar = path.with_suffix(".json")
     if not sidecar.is_file():
         return {}
-    return json.loads(sidecar.read_text(encoding="utf-8"))
+    metadata = json.loads(sidecar.read_text(encoding="utf-8"))
+    stamp = metadata.get("weights_stamp")
+    if stamp and stamp != [path.stat().st_size, path.stat().st_mtime_ns]:
+        raise ValueError(f"Weight/metadata publication incomplete: {path}")
+    return metadata
 
 
 def _read_weight_metadata(path):
@@ -454,8 +487,67 @@ def load_training_checkpoint(engine, checkpoint_dir, tag):
         raise RuntimeError("load_checkpoint 返回空路径")
     client_state = client_state or {}
     engine.giga_samples_seen = int(client_state.get("samples_seen", 0))
+    engine.giga_data_cursor = client_state.get("data_cursor")
     _warn_semantic_mismatch(engine.module, client_state.get("giga_semantic_metadata"), f"DeepSpeed {tag}")
     return load_path, client_state
+
+
+def atomic_write(path, writer):
+    path = Path(path)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        writer(temporary)
+        with temporary.open("rb") as handle:
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def save_torch_weights(state, target, metadata):
+    def publish(temporary):
+        torch.save(state, temporary)
+        # Publish the sidecar first. Readers reject an old/new mixed pair by its stamp.
+        progress = dict(metadata, weights_stamp=[temporary.stat().st_size, temporary.stat().st_mtime_ns])
+        atomic_write(target.with_suffix(".json"), lambda p: p.write_text(json.dumps(progress, sort_keys=True)))
+    atomic_write(target, publish)
+
+
+def sampler_signature(sampler):
+    steps = len(sampler)
+    spec = {key: getattr(sampler, key, None) for key in
+            ("seed", "world_size", "batch_size", "bucket_batch_sizes", "weights", "randomize_order_on_start", "max_repeat_per_epoch")}
+    spec["bucket_counts"] = {key: len(value) for key, value in getattr(sampler, "bucket_indices", {}).items()}
+    spec["steps_per_epoch"] = steps
+    return hashlib.sha256(json.dumps(spec, sort_keys=True).encode()).hexdigest()
+
+
+def restore_data_cursor(engine, sampler, step, grad_accum, logger):
+    cursor = getattr(engine, "giga_data_cursor", None)
+    if isinstance(cursor, dict) and cursor.get("version") == 2:
+        if getattr(engine, "giga_ready_pipeline_enabled", False):
+            from optimizations.ready_data_stream import select_data_state
+            selected = select_data_state(cursor, sampler_signature(sampler), _dist_rank(),
+                                         dist.get_world_size() if checkpoint_distributed() else 1,
+                                         expected_epoch_length=len(sampler))
+            if selected is not None:
+                engine.giga_ready_resume_state = selected
+                logger.info("恢复本 rank 的 ready-first 数据游标: epoch=%d frontier=%d",
+                            selected["epoch"], selected["batch_offset"])
+                return int(selected["epoch"]), int(selected["batch_offset"])
+        logger.warning("ready-first 游标与当前 pipeline/卡数/采样配置不兼容；按 step 估算位置")
+        return divmod(step * grad_accum, len(sampler))
+    if cursor:
+        epoch, offset = int(cursor["epoch"]), int(cursor["batch_offset"])
+        if epoch < 0 or not 0 <= offset <= len(sampler):
+            raise ValueError(f"Invalid saved data cursor: {cursor}")
+        if cursor.get("sampler_signature") == sampler_signature(sampler):
+            logger.info("恢复实际数据游标: epoch=%d batch=%d", epoch, offset)
+            return epoch, offset
+        logger.warning("采样配置/卡数/数据量已变化，旧数据游标不兼容；按 step 估算位置，不能保证精确续读")
+    elif step:
+        logger.warning("旧 checkpoint 没有实际数据游标；按 step 估算位置，历史跳样本无法重建")
+    return divmod(step * grad_accum, len(sampler))
 
 
 def save_pure_weights(engine, output_dir, step):
@@ -466,19 +558,21 @@ def save_pure_weights(engine, output_dir, step):
     state = {key: value.detach().cpu() for key, value in engine.module.state_dict().items()}
     semantic = _semantic_metadata(engine.module)
     progress_metadata = {"step": step, "samples_seen": int(getattr(engine, "giga_samples_seen", 0)),
+                         "data_cursor": getattr(engine, "giga_data_cursor", None),
                          "giga_semantic_metadata": semantic}
     target = weight_dir / f"step-{step:08d}.safetensors"
     try:
         from safetensors.torch import save_file
-        save_file(state, str(target), metadata={"format": "pt", "step": str(step),
-                  "samples_seen": str(progress_metadata["samples_seen"]),
-                  "giga_semantic_metadata": json.dumps(semantic, sort_keys=True)})
+        metadata = {"format": "pt", "step": str(step),
+                    "samples_seen": str(progress_metadata["samples_seen"]),
+                    "giga_semantic_metadata": json.dumps(semantic, sort_keys=True)}
+        if progress_metadata["data_cursor"] is not None:
+            metadata["data_cursor"] = json.dumps(progress_metadata["data_cursor"], sort_keys=True)
+        atomic_write(target, lambda p: save_file(state, str(p), metadata=metadata))
     except ImportError:
         target = target.with_suffix(".pt")
-        torch.save(state, target)
-        target.with_suffix(".json").write_text(json.dumps(progress_metadata, sort_keys=True), encoding="utf-8")
-    torch.save(state, weight_dir / "latest.pt")
-    (weight_dir / "latest.json").write_text(json.dumps(progress_metadata, sort_keys=True), encoding="utf-8")
+        save_torch_weights(state, target, progress_metadata)
+    save_torch_weights(state, weight_dir / "latest.pt", progress_metadata)
 
 
 def prune_state_checkpoints(checkpoint_dir, keep):
@@ -643,6 +737,11 @@ def load_compatible_state_dict(model, state, metadata=None):
     - 模型 patchify、ckpt 未 patchify (patch_volume>1) → patch_in/out 权重复制扩展迁移;
     - ckpt 与模型 patch_size 不兼容 → patchify 入口/出口保持重新随机初始化 (红字警告),
       其余参数全部正常继承。"""
+    if getattr(model, "is_mhc_model", False):
+        from models.giga_transformer_mhc_transfer import load_mhc_compatible_state_dict
+        counts = load_mhc_compatible_state_dict(model, state, metadata, allow_text_input_resize=True)
+        logging.getLogger("giga_exp").info("mHC migration: %s", model.last_migration_report)
+        return counts
     current = model.state_dict()
     basis = apply_adaln_basis_migration(current, state)
     if basis["source"] is None:
@@ -673,45 +772,84 @@ def load_compatible_state_dict(model, state, metadata=None):
     return len(matched), len(result.missing_keys), ignored
 
 
+def checkpoint_distributed():
+    return dist.is_available() and dist.is_initialized()
+
+
+def load_weight_candidates(engine, directory=None, explicit_file=None):
+    logger = logging.getLogger("giga_exp")
+    distributed = checkpoint_distributed()
+    if explicit_file is not None:
+        candidates = [str(explicit_file)]
+    else:
+        candidates = []
+        if not distributed or dist.get_rank() == 0:
+            candidates = [str(p) for p in Path(directory).glob("step-*")
+                          if re.fullmatch(r"step-\d+\.(safetensors|pt)", p.name)]
+            candidates.sort(key=lambda p: (int(Path(p).stem.split("-")[1]),
+                                          Path(p).suffix == ".safetensors"), reverse=True)
+    if distributed:
+        objects = [candidates]
+        dist.broadcast_object_list(objects, src=0)
+        candidates = objects[0]
+    for name in candidates:
+        target, state, metadata, error = Path(name), None, None, None
+        try:
+            metadata = _read_checkpoint_metadata(target)
+            int(metadata.get("samples_seen", 0))
+            int(metadata.get("step", 0))
+            if target.suffix == ".safetensors":
+                from safetensors.torch import load_file
+                state = load_file(str(target))
+            else:
+                state = torch.load(str(target), map_location="cpu", weights_only=True)
+            if not isinstance(state, dict) or not state or not all(isinstance(v, torch.Tensor) for v in state.values()):
+                raise ValueError("Checkpoint is not a nonempty tensor state_dict")
+        except Exception as exc:
+            error = exc
+            logger.warning("权重读取失败: %s (%s)", target, exc)
+        failed = int(error is not None)
+        if distributed:
+            flag = torch.tensor([failed], device=engine.device)
+            dist.all_reduce(flag, op=dist.ReduceOp.MAX)
+            failed = int(flag.item())
+        if failed:
+            del state
+            if explicit_file is not None:
+                raise RuntimeError(f"指定权重无法在所有 rank 加载: {target}") from error
+            logger.warning("跳过不可读快照，所有 rank 一致回退到更早权重: %s", target)
+            continue
+        return target, state, metadata
+    if candidates:
+        raise RuntimeError(f"没有完整可读的权重快照: {directory}")
+    return None, None, None
+
+
 def load_pure_weights(engine, output_dir, checkpoint_path=None):
-    """兼容加载纯权重；checkpoint_path 可指定权重文件或包含 step-* 权重的目录。"""
-    if checkpoint_path:
-        target = Path(checkpoint_path).expanduser()
-        if target.is_dir():
-            candidates = sorted(target.glob("step-*.safetensors")) + sorted(target.glob("step-*.pt"))
-            if not candidates:
-                raise FileNotFoundError(f"指定目录没有 step-* 权重文件: {target}")
-            target = max(candidates, key=lambda path: int(path.name.split("-")[1].split(".")[0]))
-        if not target.is_file():
-            raise FileNotFoundError(f"指定权重不存在: {target}")
-    else:
-        weight_dir = output_dir / "checkpoints" / "weights"
-        candidates = sorted(weight_dir.glob("step-*.safetensors")) + sorted(weight_dir.glob("step-*.pt")) if weight_dir.is_dir() else []
-        if not candidates:
-            return 0
-        target = max(candidates, key=lambda path: int(path.name.split("-")[1].split(".")[0]))
+    """Directory/auto resumes fall back together; an explicit weight file fails strictly."""
+    source = Path(checkpoint_path).expanduser() if checkpoint_path else output_dir / "checkpoints" / "weights"
+    explicit_file = source if checkpoint_path and not source.is_dir() else None
+    target, state, metadata = load_weight_candidates(engine, directory=source, explicit_file=explicit_file)
+    if target is None:
+        if checkpoint_path:
+            raise FileNotFoundError(f"指定目录没有 step-* 权重文件: {source}")
+        return 0
     step_match = re.search(r"step-(\d+)", target.name)
-    step = int(step_match.group(1)) if step_match else 0
-    progress_metadata = _read_checkpoint_metadata(target)
-    engine.giga_samples_seen = int(progress_metadata.get("samples_seen", 0))
-    if step and "samples_seen" not in progress_metadata and _dist_rank() == 0:
+    step = int(step_match.group(1)) if step_match else int(metadata.get("step", 0))
+    engine.giga_samples_seen = int(metadata.get("samples_seen", 0))
+    engine.giga_data_cursor = metadata.get("data_cursor")
+    if step and "samples_seen" not in metadata and _dist_rank() == 0:
         logging.getLogger("giga_exp").warning("旧权重未保存 samples_seen; 样本计数从本次恢复起重新累计")
-    _warn_semantic_mismatch(engine.module, _read_weight_metadata(target), str(target))
-    if target.suffix == ".safetensors":
-        from safetensors.torch import load_file
-        state = load_file(str(target))
-    else:
-        state = torch.load(str(target), map_location="cpu")
-    matched, missing, unexpected = load_compatible_state_dict(engine.module, state, _read_weight_metadata(target))
-    # ZeRO-2 的 FP32 主参数独立于模型权重；所有 rank 都必须同步自己的分片。
+    semantic = metadata.get("giga_semantic_metadata")
+    _warn_semantic_mismatch(engine.module, semantic, str(target))
+    matched, missing, unexpected = load_compatible_state_dict(engine.module, state, semantic)
     engine.optimizer.refresh_fp32_params()
     if _dist_rank() == 0:
-        logger = logging.getLogger("giga_exp")
-        logger.info("兼容恢复权重: %s, matched=%d, reinitialized=%d, ignored=%d", target, matched, missing, unexpected)
+        logging.getLogger("giga_exp").info("兼容恢复权重: %s, matched=%d, reinitialized=%d, ignored=%d", target, matched, missing, unexpected)
     return step
 
 
-def load_init_weights(model, init_path):
+def load_init_weights(model, init_path, strict=False):
     """SFT 初始化: 加载纯权重 (safetensors/pt) 到 model, 必须在 optimizer 创建前调用.
 
     init_path 可以是权重文件, 也可以是 checkpoints/weights 目录 (自动取最新 step-*)."""
@@ -728,35 +866,10 @@ def load_init_weights(model, init_path):
     else:
         state = torch.load(str(path), map_location="cpu")
     matched, missing, unexpected = load_compatible_state_dict(model, state, _read_weight_metadata(path))
+    if strict and (missing or unexpected) and not getattr(model, "is_mhc_model", False):
+        raise RuntimeError(f"init_from_strict: matched={matched}, missing={missing}, ignored={unexpected}")
     logging.getLogger("giga_exp").info("兼容初始化权重: %s, matched=%d, reinitialized=%d, ignored=%d", path, matched, missing, unexpected)
     return path
-
-
-def build_text_encoder(tc, dtype, device):
-    """按 type 构建文本编码器: qwen3_vl 用 ForConditionalGeneration, 其他走 AutoModel。"""
-    if tc.get("type") == "qwen3_vl":
-        from transformers import Qwen3VLForConditionalGeneration
-        encoder = Qwen3VLForConditionalGeneration.from_pretrained(tc["pretrained_path"], torch_dtype=dtype, local_files_only=True)
-    else:
-        encoder = AutoModel.from_pretrained(tc["pretrained_path"], torch_dtype=dtype, local_files_only=True)
-    return encoder.eval().to(device)
-
-
-def encode_text(text_encoder, inputs, layer=None):
-    """文本前向: layer 为 None 取 last_hidden_state, 否则取 hidden_states[layer] (如 -2)。"""
-    out = text_encoder(**inputs, use_cache=False, return_dict=True, output_hidden_states=layer is not None)
-    return out.hidden_states[layer] if layer is not None else out.last_hidden_state
-
-
-def chat_format_prompts(tokenizer, prompts, use_chat_template):
-    """use_chat_template=true 时把 prompt 包成 Qwen chat 模板 (对齐 MOSS-Image / 6B teacher 约定):
-    单条 user 消息 + add_generation_prompt (enable_thinking=True), 空内容 (CFG 空分支) 同样走
-    模板, 保证 cond/uncond 两分支文本格式一致。关闭时原样返回 (裸文本, 旧行为)。"""
-    if not use_chat_template:
-        return prompts
-    return [tokenizer.apply_chat_template([{"role": "user", "content": p}], tokenize=False,
-                                          add_generation_prompt=True, enable_thinking=True)
-            for p in prompts]
 
 
 def wan_latent_stats(vae, device):
@@ -783,25 +896,31 @@ def sigma_bucket_loss_stats(sigma, per_sample_loss):
 
 
 @torch.no_grad()
-def run_next_batch_validation(engine, vae, tokenizer, text_encoder, device, dtype, batch, step, rank, cfg, output_dir, logger, wandb_run, swanlab_run=None):
+def run_next_batch_validation(engine, vae, tokenizer, text_encoder, device, dtype, batch, step, rank, cfg, output_dir, logger, wandb_run, swanlab_run=None,
+                              group="next_batch", fixed_seed=None, case_id=None):
     """每卡对 next batch 做真实推理: flow ODE 采样 → VAE 解码 → 黑底黄字 prompt 对比图 + JSON 信息."""
     import textwrap
     from PIL import Image, ImageDraw
     tc, val_cfg = cfg["components"]["text_encoder"], cfg["validation"]
-    pixels = torch.from_numpy(batch["pixel_values"]).to(device)  # [B,C,T=1,H,W] in [-1,1]
+    pixels = torch.from_numpy(batch["pixel_values"]).to(device) if "pixel_values" in batch else None
     prompts = [str(c).strip() or tokenizer.eos_token for c in batch["captions"]]
     negative_prompts = [tokenizer.eos_token] * len(prompts)
-    prompts = chat_format_prompts(tokenizer, prompts, tc.get("use_chat_template"))
-    negative_prompts = chat_format_prompts(tokenizer, negative_prompts, tc.get("use_chat_template"))
+    prompts = chat_format_prompts(tokenizer, prompts, tc.get("use_chat_template"), tc.get("enable_thinking", True))
+    negative_prompts = chat_format_prompts(tokenizer, negative_prompts, tc.get("use_chat_template"), tc.get("enable_thinking", True))
     inputs = tokenizer(prompts + negative_prompts, return_tensors="pt", padding=True, truncation=True, max_length=tc.get("max_length", 512)).to(device)
     text_all = encode_text(text_encoder, inputs, tc.get("layer"))
     mask_all = inputs.attention_mask.bool()
     text, neg = text_all[:len(prompts)], text_all[len(prompts):]
     mask, neg_mask = mask_all[:len(prompts)], mask_all[len(prompts):]
-    b, _, _, h, w = pixels.shape
+    if pixels is not None:
+        b, _, _, h, w = pixels.shape
+    else:
+        b = len(batch["captions"])
+        h, w = batch["image_size"]
     compress = vae.config.scale_factor_spatial
     mean, std_inv = wan_latent_stats(vae, device)
-    generator = torch.Generator(device=device).manual_seed(int(val_cfg.get("seed", 42)) + step * 1000 + rank)
+    noise_seed = int(fixed_seed) if fixed_seed is not None else int(val_cfg.get("seed", 42)) + step * 1000 + rank
+    generator = torch.Generator(device=device).manual_seed(noise_seed)
     x = torch.randn(b, vae.config.z_dim, 1, h // compress, w // compress, device=device, dtype=torch.float32, generator=generator)
     num_steps = int(val_cfg.get("num_inference_steps", 20))
     # σ schedule 与训练分布一致: u 线性 1→0 经 shift 变换 σ = s·u/(1+(s-1)·u), Euler 步长取相邻 σ 差
@@ -829,7 +948,8 @@ def run_next_batch_validation(engine, vae, tokenizer, text_encoder, device, dtyp
         # 注意 torch 2.10 的 compiler.disable 只支持装饰器用法: context manager 会在
         # __enter__ 直接 raise (曾导致 36000/37000/38000 验证全部静默跳过)。故在循环外
         # 把 engine 包成禁编译版本, ODE 循环全程 eager。
-        eager_engine = torch.compiler.disable(engine)
+        # Fixed cases are sharded across ranks; replicated ZeRO-1 weights need no engine collectives.
+        eager_engine = torch.compiler.disable(module if group == "fixed" else engine)
         for i in range(num_steps):  # σ: 1(噪声) → 0(数据), v = noise - data
             if collector is not None:
                 # ODE 步序号 (0..N-1): collector 用它统计去噪步用量 + 相邻步 routing stability
@@ -891,31 +1011,38 @@ def run_next_batch_validation(engine, vae, tokenizer, text_encoder, device, dtyp
     black, yellow = (0, 0, 0), (255, 255, 0)
     rows = []
     for i in range(min(b, 8)):
-        src, out = to_uint8(pixels[i]), to_uint8(gen[i])
+        src = to_uint8(pixels[i]) if pixels is not None else None
+        out = to_uint8(gen[i])
         lines = textwrap.wrap(prompts[i], width=60) or [""]  # 黑底顶部用黄色写 prompt, 自动换行
         prompt_h = 14 * len(lines) + 8
-        row = Image.new("RGB", (src.shape[1] * 2 + gap, prompt_h + label_h + src.shape[0]), black)
+        row = Image.new("RGB", (w * 2 + gap if src is not None else w, prompt_h + label_h + h), black)
         draw = ImageDraw.Draw(row)
         for li, line in enumerate(lines):
             draw.text((4, 4 + li * 14), line, fill=yellow)
         top = prompt_h
-        draw.text((4, top + 3), "INPUT", fill=(180, 0, 0))
-        draw.text((src.shape[1] + gap + 4, top + 3), "GEN", fill=(0, 0, 180))
-        row.paste(Image.fromarray(src), (0, top + label_h))
-        row.paste(Image.fromarray(out), (src.shape[1] + gap, top + label_h))
+        if src is not None:
+            draw.text((4, top + 3), "INPUT", fill=(180, 0, 0))
+            row.paste(Image.fromarray(src), (0, top + label_h))
+        gen_left = w + gap if src is not None else 0
+        draw.text((gen_left + 4, top + 3), "GEN", fill=(0, 0, 180))
+        row.paste(Image.fromarray(out), (gen_left, top + label_h))
         rows.append(row)
     grid = Image.new("RGB", (rows[0].width, sum(r.height + 4 for r in rows) - 4), black)
     y = 0
     for r in rows:
         grid.paste(r, (0, y))
         y += r.height + 4
-    val_dir = output_dir / "validation" / f"step-{step:08d}"
+    val_dir = output_dir / ("validation_fixed" if group == "fixed" else "validation") / f"step-{step:08d}"
     val_dir.mkdir(parents=True, exist_ok=True)
-    grid.save(val_dir / f"rank{rank}.png")
+    stem = case_id if case_id is not None else f"rank{rank}"
+    grid.save(val_dir / f"{stem}.png")
     info = {  # 验证信息落盘 JSON, 便于追溯每个样本的生成条件
         "step": step,
         "rank": rank,
-        "seed": int(val_cfg.get("seed", 42)) + step * 1000 + rank,
+        "seed": noise_seed,
+        "group": group,
+        "case_id": case_id,
+        "raw_prompts": list(batch["captions"]),
         "num_inference_steps": num_steps,
         "guidance_scale": float(val_cfg.get("guidance_scale", 3.0)),
         "validation_shift": shift,
@@ -923,14 +1050,72 @@ def run_next_batch_validation(engine, vae, tokenizer, text_encoder, device, dtyp
         "latent_size": [h // compress, w // compress],
         "negative_prompt": tokenizer.eos_token,
         "prompts": prompts,
-        "grid_image": f"rank{rank}.png",
+        "grid_image": f"{stem}.png",
     }
-    (val_dir / f"rank{rank}.json").write_text(json.dumps(info, ensure_ascii=False, indent=2))
-    logger.info("🖼️ step=%d rank=%d next-batch 推理完成: %d samples → %s", step, rank, b, val_dir / f"rank{rank}.png")
+    (val_dir / f"{stem}.json").write_text(json.dumps(info, ensure_ascii=False, indent=2))
+    logger.info("🖼️ step=%d rank=%d %s 推理完成: %d samples → %s", step, rank,
+                "next-batch" if group == "next_batch" else group, b, val_dir / f"{stem}.png")
     if wandb_run and rank == 0:
         wandb.log({"val/grid": wandb.Image(grid)}, step=step)
     if swanlab_run and rank == 0:
         swanlab.log({"val/grid": swanlab.Image(grid)}, step=step)
+
+
+def fixed_validation_plan(cfg):
+    fixed = cfg.get("validation", {}).get("fixed", {})
+    if not fixed.get("enabled", False):
+        return []
+    if int(fixed.get("every_n_steps", cfg["validation"].get("every_n_steps", 1000))) <= 0:
+        raise ValueError("Fixed validation interval must be positive")
+    size = fixed.get("image_size", [512, 512])
+    if len(size) != 2 or any(int(v) <= 0 or int(v) % 16 for v in size):
+        raise ValueError("validation.fixed.image_size must contain two positive multiples of 16")
+    plan, names = [], set()
+    for i, item in enumerate(fixed.get("prompts", [])):
+        name = str(item.get("id", f"case-{i:02d}"))
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", name) or name in names:
+            raise ValueError(f"Invalid or duplicate fixed validation id: {name}")
+        prompt = str(item["prompt"]).strip()
+        if not prompt:
+            raise ValueError(f"Empty fixed prompt: {name}")
+        names.add(name)
+        plan.append(dict(id=name, category=item.get("category", "other"), prompt=prompt,
+                         seed=int(item.get("seed", int(fixed.get("seed", 42)) + i)),
+                         image_size=list(map(int, size))))
+    if not plan:
+        raise ValueError("Fixed validation enabled without any prompts")
+    return plan
+
+
+def run_fixed_validation(engine, vae, tokenizer, text_encoder, device, dtype, step, rank, cfg, output_dir, logger, wandb_run, swanlab_run=None):
+    if engine.zero_optimization_stage() > 1:
+        raise ValueError("Sharded fixed validation requires replicated model weights (ZeRO-0/1)")
+    plan = fixed_validation_plan(cfg)
+    world = dist.get_world_size() if checkpoint_distributed() else 1
+    fixed_cfg = dict(cfg, moe_metrics={"enabled": False})
+    for i, case in enumerate(plan):
+        if i % world != rank:
+            continue
+        try:
+            batch = {"captions": [case["prompt"]], "image_size": case["image_size"]}
+            run_next_batch_validation(engine, vae, tokenizer, text_encoder, device, dtype,
+                                      batch, step, rank, fixed_cfg, output_dir, logger, None,
+                                      group="fixed", fixed_seed=case["seed"], case_id=case["id"])
+        except Exception:
+            logger.exception("固定验证失败: step=%d case=%s", step, case["id"])
+            torch.cuda.empty_cache()
+    if checkpoint_distributed():
+        dist.barrier()
+    if rank == 0:
+        val_dir = output_dir / "validation_fixed" / f"step-{step:08d}"
+        val_dir.mkdir(parents=True, exist_ok=True)
+        atomic_write(val_dir / "cases.json", lambda p: p.write_text(json.dumps(plan, ensure_ascii=False, indent=2)))
+        for tracker, run in ((wandb, wandb_run), (swanlab, swanlab_run)):
+            if run:
+                payload = {f"val_fixed/{case['id']}": tracker.Image(str(val_dir / f"{case['id']}.png"))
+                           for case in plan if (val_dir / f"{case['id']}.png").is_file()}
+                if payload:
+                    tracker.log(payload, step=step)
 
 
 def print_banner(cfg, rank):
@@ -990,11 +1175,16 @@ def main():
     parser.add_argument("--config", default="configs/stage_1.yaml")
     args = parser.parse_args()
     cfg = yaml.safe_load((ROOT / args.config).read_text()) if not Path(args.config).is_absolute() else yaml.safe_load(Path(args.config).read_text())
+    swanlab_key = cfg.get("logging", {}).get("swanlab", {}).pop("api_key", None)
+    if swanlab_key and cfg["logging"]["swanlab"].get("enabled"):
+        os.environ["SWANLAB_API_KEY"] = str(swanlab_key)
+    fixed_validation_plan(cfg)
     # distributed.timeout_seconds 应用到 default PG (原裸调用用 torch/DS 默认 1800s,
     # yaml 里的 7200s 从未生效; 2026-11-19 数据挂起事故里 watchdog 提前到 30min 团灭)
     _pg_timeout = datetime.timedelta(seconds=int(cfg.get("distributed", {}).get("timeout_seconds", 1800)))
     deepspeed.init_distributed(timeout=_pg_timeout)
     rank = dist.get_rank()
+    cfg["distributed"]["world_size"] = dist.get_world_size()
     print_banner(cfg, rank)
     device = torch.device("cuda", int(os.environ.get("LOCAL_RANK", 0)))
     output_dir = Path(cfg["output_dir"])
@@ -1006,7 +1196,7 @@ def main():
 
     tc, dc = cfg["components"]["text_encoder"], cfg["components"]["wan_vae"]
     dtype = torch.bfloat16 if cfg["training"].get("mixed_precision", "bf16") == "bf16" else torch.float16
-    tokenizer = AutoTokenizer.from_pretrained(tc["tokenizer_path"], local_files_only=True)
+    tokenizer = build_tokenizer(tc)
     if len(tokenizer) <= 1:
         raise ValueError(f"tokenizer 词表异常: {tc['tokenizer_path']}")
     text_encoder = build_text_encoder(tc, dtype, device)
@@ -1014,9 +1204,8 @@ def main():
     # sample bf16 → 减 fp32 mean 自动升回 fp32, 下游 latents/xt 精度不变
     vae = AutoencoderKLWan.from_pretrained(dc["pretrained_path"], subfolder=dc.get("subfolder", "vae"), torch_dtype=torch.bfloat16, local_files_only=True).eval().to(device)
     # model.type 分发 (缺省 giga = GigaExpTransformer): wan5b_ss 为 Wan2.2 5B 单流化结构
-    model_cfg = dict(cfg["model"])
-    model_cls = {"giga": GigaExpTransformer, "wan5b_ss": Wan5BSingleStream}[model_cfg.pop("type", "giga")]
-    model = model_cls(**model_cfg).to(device, dtype=dtype)
+    model = build_diffusion_model(cfg).to(device, dtype=dtype)
+    model.giga_text_encoder_metadata = text_encoder_metadata(tc)
     if getattr(model, "has_moe", False):
         # router 要求全 fp32: .to(bf16) 会把 gate 一并降精度, 这里回浮 (权重常驻 fp32)
         model.cast_router_fp32()
@@ -1044,10 +1233,10 @@ def main():
     for parameter in (*text_encoder.parameters(), *vae.parameters()):
         parameter.requires_grad_(False)
 
-    # SFT 初始化: 无可恢复 checkpoint 时用 init_from 纯权重载入 (optimizer 状态全新)
+    # 初始化基底先于 optimizer 创建；若存在本分支 checkpoint，后面的恢复会覆盖基底。
     init_from = cfg["training"].get("init_from")
-    if init_from and latest_state_tag(checkpoint_dir) is None:
-        resolved = load_init_weights(model, init_from)
+    if init_from:
+        resolved = load_init_weights(model, init_from, strict=bool(cfg["training"].get("init_from_strict", False)))
         if rank == 0:
             logger.info("🎓 SFT 初始化: 从 %s 加载纯权重 (step 从 0 开始)", resolved)
 
@@ -1102,8 +1291,12 @@ def main():
                 _blue_print(f"🔁 已恢复纯权重: 从 step={step} 继续训练 (optimizer 状态已重置)")
                 logger.info("🔁 已恢复纯权重，从 step=%d 继续训练 (optimizer 状态已重置)", step)
             else:
-                _blue_print("🆕 未发现 checkpoint, 从 step=0 开始训练")
-                logger.info("🆕 未发现 checkpoint, 从 step=0 开始训练")
+                if init_from:
+                    message = f"🎓 已继承 {init_from} 的模型权重；新分支 step=0，优化器和 warmup 重新开始"
+                else:
+                    message = "🆕 未发现 checkpoint, 从 step=0 开始训练"
+                _blue_print(message)
+                logger.info(message)
     elif resume_mode not in {"none", "false", "off"}:
         with _loud_phase(rank, logger, f"🔄 从指定路径恢复纯权重 {resume_mode}"):
             step = load_pure_weights(engine, output_dir, resume_mode)
@@ -1137,8 +1330,8 @@ def main():
     cfg["training"]["total_steps"] = max_steps
     if step > max_steps:
         raise ValueError(f"恢复 step={step} 超过 {max_epochs} epoch 的总步数 {max_steps}")
-    consumed_micro_steps = min(step * grad_accum, total_micro_steps)
-    epoch, batch_offset = divmod(consumed_micro_steps, steps_per_epoch)
+    engine.giga_ready_pipeline_enabled = bool(cfg["training"].get("ready_data_pipeline", False))
+    epoch, batch_offset = restore_data_cursor(engine, batch_sampler, step, grad_accum, logger)
     batch_sampler.set_start_batch(batch_offset, epoch=epoch)
     if rank == 0:
         logger.info("📅 max_epochs=%d steps_per_epoch=%d total_steps=%d grad_accum=%d; 从 epoch=%d batch=%d step=%d 继续", max_epochs, steps_per_epoch, max_steps, grad_accum, epoch, batch_offset, step)
@@ -1146,8 +1339,17 @@ def main():
     # 永久卡在取 batch, 不抛异常也不触发 skip 机制, 其余 rank 在 skip_flag allreduce 上等满
     # NCCL watchdog 后全队团灭 (2026-11-19 20:21 n8 实测: step-216505 后 6 rank 卡 30min)。
     # timeout 到点抛 RuntimeError → skip 机制接住并重建 iterator, fail-fast 优于挂死。
-    data_stream = TrainingDataStream(data, batch_sampler, cfg["training"], logger,
-                                     epoch=epoch, batch_offset=batch_offset)
+    data_stream = make_training_data_stream(data, batch_sampler, cfg["training"], logger,
+        epoch=epoch, batch_offset=batch_offset, resume_state=getattr(engine, "giga_ready_resume_state", None))
+    if engine.giga_ready_pipeline_enabled:
+        ready_status = data_stream.wait_ready(int(cfg["training"].get("ready_min_batches", 8)),
+            float(cfg["training"].get("ready_warmup_timeout_seconds", 180)))
+        logger.info("数据预取水位: %s", ready_status)
+        failed = torch.tensor([not ready_status["ready"]], device=device, dtype=torch.int32)
+        dist.all_reduce(failed, op=dist.ReduceOp.MAX)
+        if failed.item():
+            data_stream.close()
+            raise RuntimeError("至少一个 rank 未达到数据就绪水位；未进入训练循环，请检查 NFS/本地数据准备")
     samples_seen = int(getattr(engine, "giga_samples_seen", 0))
 
     wandb_run = None
@@ -1168,8 +1370,6 @@ def main():
     swanlab_run = None
     if rank == 0 and cfg["logging"].get("swanlab", {}).get("enabled"):
         sl_cfg = cfg["logging"]["swanlab"]
-        if sl_cfg.get("api_key"):
-            os.environ["SWANLAB_API_KEY"] = str(sl_cfg["api_key"])
         swanlab_dir = output_dir / "swanlab"
         swanlab_dir.mkdir(exist_ok=True)
         run_file = swanlab_dir / "run.json"
@@ -1180,6 +1380,7 @@ def main():
 
     sigma_bucket_ema = [float("nan")] * SIGMA_BUCKETS  # rank0: 各 sigma 桶 loss 的 EMA (α=0.1)
     log_every = int(cfg["logging"].get("log_every_n_steps", 1))
+    monitor = TrainingMonitor(cfg, device, engine.module, mhc_enabled=mhc_config(cfg)["enabled"])
     pending_batch = None
     consecutive_batch_skips = 0
     max_consecutive_batch_skips = int(os.environ.get("GIGA_MAX_CONSECUTIVE_BATCH_SKIPS", "64"))
@@ -1240,6 +1441,10 @@ def main():
     progress = tqdm(total=max_steps, initial=step, disable=rank != 0, dynamic_ncols=True, desc="🚂 stage_1")
     while step < max_steps:
         next_step = step + 1
+        monitoring_step = monitor.begin_update(next_step)
+        skipped_this_update = 0
+        data_wait_seconds = data_wait_max = data_read_seconds = data_read_max = 0.0
+        data_requests = 0
         updates_before = engine.global_steps
         micro_metrics = torch.zeros(3, device=device)  # loss sum, sigma sum, actual sample count
         micro_moe_aux = []
@@ -1251,9 +1456,18 @@ def main():
             engine.module.set_moe_routing_step(next_step)
         micro_idx = 0
         while micro_idx < grad_accum:
+            fetch_started = time.perf_counter()
             batch = next_training_batch(data_stream, device, logger, next_step, micro_idx, pending_batch)
+            fetch_seconds = time.perf_counter() - fetch_started
+            read_seconds = data_stream.last_fetch_seconds
+            data_wait_seconds += fetch_seconds
+            data_wait_max = max(data_wait_max, fetch_seconds)
+            data_read_seconds += read_seconds
+            data_read_max = max(data_read_max, read_seconds)
+            data_requests += 1
             pending_batch = None
             if batch is None:
+                skipped_this_update += 1
                 consecutive_batch_skips += 1
                 if consecutive_batch_skips > max_consecutive_batch_skips:
                     raise RuntimeError(f"Consecutive globally skipped batches exceeded {max_consecutive_batch_skips}")
@@ -1265,27 +1479,41 @@ def main():
             last_captions = captions
             with torch.no_grad():
                 # Wan 官方约定: encode 后标准化 z_norm = (z - mean) * latents_std_inv
-                latents = (vae.encode(pixels.to(dtype)).latent_dist.sample() - latents_mean) * latents_std_inv
-                prompts = [str(c).strip() or tokenizer.eos_token for c in captions]
-                cfg_dropout = float(cfg["training"].get("cfg_dropout", 0.0))
-                if cfg_dropout > 0:
-                    drop = torch.rand(len(prompts), device=device) < cfg_dropout
-                    empty_prompt = tokenizer.eos_token or " "
-                    prompts = [empty_prompt if drop[i].item() else prompt for i, prompt in enumerate(prompts)]
-                prompts = chat_format_prompts(tokenizer, prompts, tc.get("use_chat_template"))
-                inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=tc.get("max_length", 512)).to(device)
-                text, mask = encode_text(text_encoder, inputs, tc.get("layer")), inputs.attention_mask.bool()
-                # 钳到 >=2 token: dynamo 对 size 0/1 有 0/1 特化, L<=1 的退化 batch 会在单个 rank
-                # 上现场触发冷编译 (00:53:11 卡死: rank0 编译 10min+, 其余 rank allreduce 等满 600s 团灭)。
-                # 补零嵌入 + False mask, FA3 varlen 按 valid 长度跳过补位, 对训练数值无任何影响。
-                if text.shape[1] < 2:
-                    text = torch.nn.functional.pad(text, (0, 0, 0, 2 - text.shape[1]))
-                    mask = torch.nn.functional.pad(mask, (0, 2 - mask.shape[1]))
+                with monitor.phase("vae"):
+                    latents = (vae.encode(pixels.to(dtype)).latent_dist.sample() - latents_mean) * latents_std_inv
+                with monitor.phase("text_encode"):
+                    prompts = [str(c).strip() or tokenizer.eos_token for c in captions]
+                    cfg_dropout = float(cfg["training"].get("cfg_dropout", 0.0))
+                    if cfg_dropout > 0:
+                        empty_prompt = tokenizer.eos_token or " "
+                        if cfg["training"].get("cpu_cfg_dropout", False):
+                            # Prompt decisions belong on CPU. Reading a CUDA bool
+                            # here waits for the just-enqueued VAE encode to finish.
+                            # Seed from the requested data cursor so restarts and
+                            # globally skipped batches do not shift this decision.
+                            drop_seed = (int(cfg.get("seed", 42)) + rank * 1_000_003
+                                         + data_stream.epoch * 1_000_000_007
+                                         + data_stream.batch_offset)
+                            generator = torch.Generator(device="cpu").manual_seed(drop_seed)
+                            drop = (torch.rand(len(prompts), generator=generator) < cfg_dropout).tolist()
+                        else:
+                            drop = (torch.rand(len(prompts), device=device) < cfg_dropout).tolist()
+                        prompts = [empty_prompt if dropped else prompt for dropped, prompt in zip(drop, prompts)]
+                    prompts = chat_format_prompts(tokenizer, prompts, tc.get("use_chat_template"), tc.get("enable_thinking", True))
+                    inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=tc.get("max_length", 512)).to(device)
+                    text, mask = encode_text(text_encoder, inputs, tc.get("layer")), inputs.attention_mask.bool()
+                    # 钳到 >=2 token: dynamo 对 size 0/1 有 0/1 特化, L<=1 的退化 batch 会在单个 rank
+                    # 上现场触发冷编译 (00:53:11 卡死: rank0 编译 10min+, 其余 rank allreduce 等满 600s 团灭)。
+                    # 补零嵌入 + False mask, FA3 varlen 按 valid 长度跳过补位, 对训练数值无任何影响。
+                    if text.shape[1] < 2:
+                        text = torch.nn.functional.pad(text, (0, 0, 0, 2 - text.shape[1]))
+                        mask = torch.nn.functional.pad(mask, (0, 2 - mask.shape[1]))
             sigma = torch.rand(latents.shape[0], device=device)
             sigma = sigma * cfg["scheduler"]["shift"] / (1 + (cfg["scheduler"]["shift"] - 1) * sigma)
             noise = torch.randn_like(latents)
             xt = (1 - sigma[:, None, None, None, None]) * latents + sigma[:, None, None, None, None] * noise
-            pred = engine(xt.to(dtype), sigma * 1000, text, mask)
+            with monitor.phase("dit_forward"):
+                pred = engine(xt.to(dtype), sigma * 1000, text, mask)
             diff_sq = (pred.float() - (noise - latents).float()).square()
             # DeepSpeed 会在 gradient_accumulation_steps > 1 时自动缩放 backward loss；这里不要再次除以 grad_accum。
             loss = diff_sq.mean()
@@ -1297,34 +1525,49 @@ def main():
                 loss = loss + moe_aux_total
                 micro_moe_aux.append(moe_aux_total.detach())
             per_sample_loss = diff_sq.flatten(1).mean(1)
-            engine.backward(loss)
+            with monitor.phase("backward"):
+                engine.backward(loss)
             # Advance DeepSpeed's micro-step counter after every successful backward.
-            engine.step()
+            with monitor.phase("optimizer"):
+                engine.step()
+            monitor.record_micro(latents.shape[0], math.prod(latents.shape[-3:]) // math.prod(engine.module.patch_size), mask, text.shape[1])
             micro_idx += 1
             micro_metrics[0] += per_sample_loss.detach().sum()
             micro_metrics[1] += sigma.detach().sum()
             micro_metrics[2] += latents.shape[0]
             bins = (sigma.detach() * SIGMA_BUCKETS).long().clamp_(0, SIGMA_BUCKETS - 1)
             micro_bucket_sums.scatter_add_(0, bins, per_sample_loss.detach().float())
-            micro_bucket_counts += torch.bincount(bins, minlength=SIGMA_BUCKETS).float()
+            micro_bucket_counts.scatter_add_(0, bins, torch.ones_like(per_sample_loss, dtype=torch.float32))
         if engine.global_steps != updates_before + 1:
             raise RuntimeError("Expected exactly one DeepSpeed update per training step")
         step = next_step
-        dist.all_reduce(micro_metrics)
-        samples_seen += int(micro_metrics[2].item())
+        # One small collective/copy for loss, sigma and all diagnostic bins.
+        # Per-bin .item() calls otherwise create a series of tiny CUDA launches
+        # and host round trips at every logged update.
+        global_metrics = torch.cat((micro_metrics, micro_bucket_sums, micro_bucket_counts))
+        dist.all_reduce(global_metrics)
+        global_metrics = global_metrics.tolist()
+        metric_loss, metric_sigma, metric_samples = global_metrics[:3]
+        bucket_sums = global_metrics[3:3 + SIGMA_BUCKETS]
+        bucket_counts = global_metrics[3 + SIGMA_BUCKETS:]
+        samples_seen += int(metric_samples)
         engine.giga_samples_seen = samples_seen
-        loss_value = (micro_metrics[0] / micro_metrics[2]).item()
-        sigma_mean = (micro_metrics[1] / micro_metrics[2]).item()
+        loss_value = metric_loss / metric_samples
+        sigma_mean = metric_sigma / metric_samples
+        perf_payload = monitor.end_update(step, lr=lr_now,
+            grad_norm=engine.get_global_grad_norm() if monitoring_step else None,
+            skipped_batches=skipped_this_update, data_requests=data_requests,
+            data_wait_seconds=data_wait_seconds, data_wait_max_seconds=data_wait_max,
+            data_read_seconds=data_read_seconds, data_read_max_seconds=data_read_max)
         if rank == 0:
             progress.update(1)
             progress.set_postfix(loss=f"{loss_value:.5f}", lr=f"{lr_now:.2e}", samples=samples_seen)
-        if step % log_every == 0:
-            stats = torch.stack([micro_bucket_sums, micro_bucket_counts])
-            dist.all_reduce(stats)
+        if step % log_every == 0 or perf_payload:
             data_hash = hashlib.md5("\x1f".join(last_captions).encode("utf-8")).hexdigest()[:8]
             logger.info("rank=%d step=%d loss=%.6f data=%s lr=%.3e time=%s sigma_mean=%.5f", rank, step, loss_value, data_hash, lr_now, time.strftime("%H:%M:%S"), sigma_mean)
             if rank == 0 and (wandb_run or swanlab_run):
                 payload = {"train/loss": loss_value, "train/lr": lr_now, "train/sigma_mean": sigma_mean, "train/samples": samples_seen}
+                payload.update(perf_payload)
                 # MoE router aux (只记本 rank 均值; 跨 rank 一致性靠 validation collector 全量统计)
                 if micro_moe_aux:
                     payload["train/moe/aux_loss"] = torch.stack(micro_moe_aux).mean().item()
@@ -1335,9 +1578,9 @@ def main():
                     for key, value in comps.items():
                         payload[f"train/moe/aux_{key}"] = value / len(engine.module.blocks)
                 for i in range(SIGMA_BUCKETS):
-                    if stats[1, i] <= 0:
+                    if bucket_counts[i] <= 0:
                         continue
-                    bucket_loss = (stats[0, i] / stats[1, i]).item()
+                    bucket_loss = bucket_sums[i] / bucket_counts[i]
                     if math.isfinite(bucket_loss):
                         prev = sigma_bucket_ema[i]
                         sigma_bucket_ema[i] = bucket_loss if not math.isfinite(prev) else 0.9 * prev + 0.1 * bucket_loss
@@ -1358,9 +1601,19 @@ def main():
                     logger.warning("⏭️ step=%d 验证异常, 跳过本步验证 (训练继续): %s", step, repr(exc))
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
+        fixed_cfg = cfg["validation"].get("fixed", {})
+        if (cfg["validation"].get("enabled", True) and fixed_cfg.get("enabled", False)
+                and step % int(fixed_cfg.get("every_n_steps", cfg["validation"].get("every_n_steps", 1000))) == 0):
+            run_fixed_validation(engine, vae, tokenizer, text_encoder, device, dtype, step, rank,
+                                 cfg, output_dir, logger, wandb_run, swanlab_run)
         if step % cfg["training"].get("checkpointing_steps", 1000) == 0 or step == max_steps:
+            if cfg["training"].get("ready_data_pipeline", False):
+                from optimizations.ready_data_stream import gather_data_state
+                engine.giga_data_cursor = gather_data_state(data_stream, pending_batch=pending_batch)
+            else:
+                engine.giga_data_cursor = data_stream.state_dict(pending_batch=pending_batch is not None)
             engine.save_checkpoint(str(checkpoint_dir), tag=f"step-{step}", client_state={
-                "step": step, "samples_seen": samples_seen,
+                "step": step, "samples_seen": samples_seen, "data_cursor": engine.giga_data_cursor,
                 "giga_semantic_metadata": _semantic_metadata(engine.module),
             })
             save_pure_weights(engine, output_dir, step)

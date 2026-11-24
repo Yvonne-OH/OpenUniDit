@@ -1,0 +1,260 @@
+# Qwen3.5-9B + DeepSeek mHC 独立实验。
+# 从 Qwen3-VL 原分支最新完整快照继承，来源及 step 见 output/initialization.json。
+# Qwen3.5-9B 文本条件适配分支。DiT 结构保持当前 5.83B SiLU MLP / 30 heads。
+# 原始 checkpoint step 和来源记录在 output_dir/initialization.json。
+mhc:
+  enabled: true  # 未配置/false 时仍构建原始 dense DiT
+  n_streams: 4
+  sinkhorn_iters: 20
+  mhc_mapping_fp32: true
+  init_mode: transfer
+  routing_backend: fused  # 4x4 Triton Sinkhorn + 仅 routing 融合；未配置默认 eager
+
+monitoring:
+  enabled: true
+  every_n_steps: 50
+  phase_timings: true
+  peak_tflops_per_gpu: 989  # H800 dense BF16；MFU 为 DiT 解析估计，非硬件采样
+  per_layer: [0, 17, 35]
+
+stage: stage_1
+output_dir: /home/jovyan/pfs/users/zhanqian.wu/exp/giga_exp_image/stage_1_5b_qwen35_9b_mhc_20261124
+seed: 42
+
+# DeepSpeed launcher: deepspeed --num_gpus=8 train_giga_exp.py --config configs/stage_1_5b_tar.yaml
+distributed:
+  backend: deepspeed
+  config: configs/zero1_qwen35_9b_mhc.json
+  world_size: 8
+  timeout_seconds: 14400  # 首次索引构建(33源+741万 t2i 行全量扫 NFS)可超 2h, 4h 兜底
+
+model:
+  activation_checkpointing: true  # 4 个 residual streams + 9B encoder 控制显存
+  # AdaLN 结构 (adaln_type: shared | dual | basis): basis 低秩调制沿 XL 验证配置不变,
+  # dim 翻倍后全秩 adaLN 会到 ~1.6B, basis r=64 只 94M。
+  adaln_type: basis
+  adaln_rank: 64
+  # 继承原分支两层 Text Refiner，隐藏宽度与主 DiT 一致。
+  text_trans:
+    enabled: true
+    layers: 2
+    heads: 30
+  in_channels: 48
+  out_channels: 48
+  text_dim: 4096  # 9B 输出 4096；原 text_in.weight 单独重建，其余已有参数严格继承
+  dim: 3840
+  ffn_dim: 11520        # MLP ratio 3.0 (Qwen-Image-2.1 mlp_ratio=3, 新一代窄 FFN 下限)
+  heads: 30
+  layers: 36
+  rope_theta: 10000.0
+  # 4D RoPE: (time, height, width, text_position), head_dim = dim/heads = 128, 不变
+  rope_axes_dims: [16, 48, 48, 16]
+  patch_size: [1, 1, 1]
+
+components:
+  text_encoder:
+    type: qwen3_5
+    revision: c202236235762e1c871ad0ccb60c8ee5ba337b9a
+    pretrained_path: /home/jovyan/pfs/users/zhanqian.wu/exp/giga_exp_image/stage_1_5b_qwen35_9b_mhc_20261124/pretrained/Qwen3.5-9B
+    tokenizer_path: /home/jovyan/pfs/users/zhanqian.wu/exp/giga_exp_image/stage_1_5b_qwen35_9b_mhc_20261124/pretrained/Qwen3.5-9B
+    local_files_only: true
+    layer: -1  # 最后一个 full-attention block 后经最终 RMSNorm 的特征，训练/验证/推理共用
+    padding_side: right
+    enable_thinking: false
+    attn_implementation: sdpa
+    max_length: 2048
+    frozen_inference_mode: true
+    reference_gdn_cuda_graph: true  # 原参考算法图重放，短文本特征逐位一致
+    gdn_graph_max_entries: 8
+    gdn_graph_max_chunks: 8  # >512 token 保留原参考路径
+    # 只进行 frozen hidden-state forward，不生成回复；CFG 两支使用同一模板。
+    use_chat_template: true
+  wan_vae:
+    type: AutoencoderKLWan
+    pretrained_path: /mnt/nfs/models/huggingface/models--Wan-AI--Wan2.2-TI2V-5B-Diffusers
+    subfolder: vae
+    local_files_only: true
+
+scheduler:
+  type: flow_matching
+  num_train_timesteps: 1000
+  shift: 3.0
+  timestep_sampling: uniform
+  validation_shift: 3.0
+
+dataset:
+  # ── 数据后端: NFS unified tar 分片, 与 XL tar 版完全一致 (含 edit 库 t2i_caption 7 源) ──
+  dataset_type: tar_parquet
+  image_training_enabled: true
+  edit_training_enabled: false
+  database_path: /mnt/nfs/data/zhanqian.wu/unified_images_tar
+  image_sources:
+    - 4KLSDB
+    - Aesthetic-4K
+    - HumanCaption-10M
+    - LAION_Aesthetics_1024
+    - Poster100K
+    - anime_captions
+    - bg_photo_concepts
+    - blip3o-long-caption-wds
+    - blip3o-long-caption
+    - caption3o-xl-v4
+    - ffhq_captioned_1024
+    - fine_t2i
+    - pexels-advertisement-photography
+    - pexels_aesth_2_1024
+    - qwen-synth-characters-fused
+    - sa1b_en
+    - anyword_3m
+    - pixelprose_cc12m
+    - pixelprose_commonpool
+    - pixelprose_redcaps
+    - monet_cc12m
+    - monet_commoncatalog_cc_by
+    - monet_coyo
+    - GenPoster100K
+    - Text-Render-2M
+    - moss_synth_sa1b_10h
+    - FLUX-Reason-6M
+    - JourneyDB
+    - moss_synth
+    - moss_synth_eval100k
+    - h3image_synth_webcap_10h
+    - moss_synth_300k_48h
+  # edit 库 7 个单图对源的 t2i_caption 模式: before 原图 + Qwen3-VL 描述 caption 作普通
+  # image 样本 (~741 万行); parquet_t2i 由 tools/build_tar_parquet_t2i.py 生成。
+  t2i_edit_database_path: /mnt/nfs/data/zhanqian.wu/unified_edit_images_tar
+  t2i_edit_sources_t2i_mode:
+    - HQ-Edit
+    - GPT-UltraEdit
+    - GPT-HQEdit
+    - pico-banana-400k
+    - GPT-OmniEdit
+    - CrispEdit
+    - SEED-Data-Edit
+  contract: "[B,C,T,H,W]"
+  num_frames: 1
+  preprocess_style: cover
+  resolution: 512
+  long_edge: 512
+  max_upscale_ratio: 1.2
+  max_retries: 16
+  refresh_index_cache: false
+  freeze_index_signature: true  # 固定本次复制的索引签名，避免64 rank重扫NFS分片目录
+  tar_io_concurrency_per_node: 8  # 每节点共享读取槽位，限制在途tar请求；正在做64rank验证
+  index_cache_dir: /home/jovyan/pfs/users/zhanqian.wu/exp/giga_exp_image/stage_1_5b_qwen35_9b_mhc_20261124/dataset_index_cache
+  buckets:
+    - 256_square
+    - 256x192
+    - 192x256
+    - 512_square
+    - 512x384
+    - 384x512
+  bucket_sampling_weights:
+    256_square: 0.14
+    256x192: 0.08
+    192x256: 0.08
+    512_square: 0.315
+    512x384: 0.1925
+    384x512: 0.1925
+  # 小分辨率桶每个 micro-batch 两张图；大分辨率桶沿用一张。
+  bucket_batch_sizes:
+    256_square: 2
+    256x192: 2
+    192x256: 2
+
+validation:
+  enabled: true
+  every_n_steps: 1000
+  per_rank: true
+  use_next_batch: true
+  num_inference_steps: 20
+  seed: 42
+  guidance_scale: 3.0
+  fixed:
+    enabled: true
+    every_n_steps: 1000
+    seed: 42
+    image_size: [512, 512]
+    prompts:
+      - id: portrait-01
+        category: people
+        prompt: 'A realistic portrait of a woman with curly brown hair wearing a red coat, soft window light, natural skin texture, neutral background.'
+      - id: portrait-02
+        category: people
+        prompt: 'A full-body photograph of a man walking along a city sidewalk, holding a closed umbrella in his right hand, both hands visible, realistic anatomy.'
+      - id: text-01
+        category: typography
+        prompt: 'A clean white poster with the exact words "HELLO WORLD" printed in large black uppercase letters, centered, no other text.'
+      - id: text-02
+        category: typography
+        prompt: 'A blue shop sign displaying the exact text "GIGA 2026" in crisp white letters, straight-on view, no other text.'
+      - id: count-01
+        category: counting
+        prompt: 'Exactly three red apples arranged in a row on a white table, all three fully visible, no other fruit, studio photograph.'
+      - id: count-02
+        category: counting
+        prompt: 'Exactly two yellow ducks swimming on a calm blue pond, both ducks fully visible, no other animals.'
+      - id: relation-01
+        category: spatial_relations
+        prompt: 'A red cube to the left of a blue sphere on a white table, both objects fully visible, plain gray background.'
+      - id: relation-02
+        category: spatial_relations
+        prompt: 'A small green cup inside a large transparent glass bowl, with a yellow plate to the right of the bowl, all objects fully visible.'
+
+training:
+  enabled: true
+  t2v_only: true
+  cfg_dropout: 0.1
+  # 8 卡累积两次更新；256 桶的每 micro-batch 样本数由上方覆盖。
+  batch_size_per_device: 1
+  cpu_cfg_dropout: true  # 避免读取 GPU bool 时等待 VAE，概率仍为 cfg_dropout
+  num_workers: 2
+  ready_data_pipeline: true
+  dataloader_prefetch_factor: 4  # 每rank最多8批后台准备，完成即可消费，慢图不挡后续就绪批
+  ready_min_batches: 8
+  ready_warmup_timeout_seconds: 180
+  max_epochs: 2
+  mixed_precision: bf16
+  optimizer: adamw
+  torch_compile: false
+  muon:
+    enabled: false
+    momentum: 0.95
+    learning_rate: 3x
+    adjust_lr_fn: match_rms_adamw
+    weight_decay: 0.0
+  adam:
+    enabled: true
+    betas: [0.9, 0.95]
+    epsilon: 1.0e-8
+    # 必须写在此处: build_optimizer 只读 adam_cfg.get("weight_decay"), 顶层 weight_decay 不会被读取
+    weight_decay: 0.005
+  # 编码器切换适配：继承 DiT，重新 warmup；峰值 LR 先用 3e-5。
+  learning_rate: 3e-5
+  weight_decay: 0.005
+  lr_scheduler: cosine
+  lr_warmup_steps: 1500
+  gradient_accumulation_steps: 2
+  checkpointing_steps: 5000
+  state_checkpoints_keep: 1
+  # 首次启动严格加载 initialization 的冻结快照；分支 step 从 0 warmup。
+  # 后续 auto 恢复本分支 checkpoints/weights，不覆盖当前主训练。
+  init_from: /home/jovyan/pfs/users/zhanqian.wu/exp/giga_exp_image/stage_1_5b_qwen35_9b_mhc_20261124/initialization
+  init_from_strict: true
+  resume_mode: auto
+  resume_optimizer: false
+  resume_lr_scheduler: true
+
+logging:
+  report_to: [console, swanlab]
+  log_every_n_steps: 1
+  save_samples: true
+  swanlab:
+    enabled: true
+    project: giga-exp-image
+    name: giga_exp_image_stage_1_5b_qwen35_9b_mhc_20261124
+  wandb:
+    enabled: false
+    project: giga-exp-image
+    name: giga_exp_image_stage_1_5b_qwen35_9b_mhc_20261124

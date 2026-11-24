@@ -166,6 +166,36 @@ validation:
   num_inference_steps: 20
   seed: 42
   guidance_scale: 3.0
+  fixed:
+    enabled: true
+    every_n_steps: 1000
+    seed: 42
+    image_size: [512, 512]
+    prompts:
+      - id: portrait-01
+        category: people
+        prompt: 'A realistic portrait of a woman with curly brown hair wearing a red coat, soft window light, natural skin texture, neutral background.'
+      - id: portrait-02
+        category: people
+        prompt: 'A full-body photograph of a man walking along a city sidewalk, holding a closed umbrella in his right hand, both hands visible, realistic anatomy.'
+      - id: text-01
+        category: typography
+        prompt: 'A clean white poster with the exact words "HELLO WORLD" printed in large black uppercase letters, centered, no other text.'
+      - id: text-02
+        category: typography
+        prompt: 'A blue shop sign displaying the exact text "GIGA 2026" in crisp white letters, straight-on view, no other text.'
+      - id: count-01
+        category: counting
+        prompt: 'Exactly three red apples arranged in a row on a white table, all three fully visible, no other fruit, studio photograph.'
+      - id: count-02
+        category: counting
+        prompt: 'Exactly two yellow ducks swimming on a calm blue pond, both ducks fully visible, no other animals.'
+      - id: relation-01
+        category: spatial_relations
+        prompt: 'A red cube to the left of a blue sphere on a white table, both objects fully visible, plain gray background.'
+      - id: relation-02
+        category: spatial_relations
+        prompt: 'A small green cup inside a large transparent glass bowl, with a yellow plate to the right of the bowl, all objects fully visible.'
 
 training:
   enabled: true
@@ -192,7 +222,7 @@ training:
     # 必须写在此处: build_optimizer 只读 adam_cfg.get("weight_decay"), 顶层 weight_decay 不会被读取
     weight_decay: 0.005
   # 从零训练: lr 按 1/sqrt(width) 从 XL (dim 2048, 5e-5) 下调至 3.5e-5, warmup 相应拉长
-  learning_rate: 3.5e-5
+  learning_rate: 6e-5
   weight_decay: 0.005
   lr_scheduler: cosine
   lr_warmup_steps: 1500
@@ -212,7 +242,6 @@ logging:
     enabled: true
     project: giga-exp-image
     name: giga_exp_image_stage_1_5b_1122
-    api_key: Dit2ngq8iuiGfUkI88e5b
   wandb:
     enabled: false
     project: giga-exp-image

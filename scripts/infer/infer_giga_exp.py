@@ -29,11 +29,13 @@ import torch
 import yaml
 from diffusers import AutoencoderKLWan
 from safetensors.torch import load_file
-from transformers import AutoTokenizer, Qwen3VLForConditionalGeneration
+from models.text_encoding import (build_tokenizer, build_text_encoder, encode_text,
+                                  chat_format_prompts, text_encoder_metadata)
 
 from models.giga_transformer import (GigaExpTransformer, apply_adaln_basis_migration,
                                      apply_mod_adaln_migration)
 from models.wan5b_single_stream import Wan5BSingleStream
+from models.model_factory import build_diffusion_model, mhc_config
 
 try:
     from tqdm import tqdm, trange
@@ -201,6 +203,11 @@ def load_compatible_state_dict(model, state, metadata=None):
     - 模型 patchify、ckpt 未 patchify (patch_volume>1) → patch_in/out 权重复制扩展迁移;
     - ckpt 与模型 patch_size 不兼容 → patchify 入口/出口保持重新随机初始化 (红字警告),
       其余参数全部正常继承。"""
+    if getattr(model, "is_mhc_model", False):
+        from models.giga_transformer_mhc_transfer import load_mhc_compatible_state_dict
+        counts = load_mhc_compatible_state_dict(model, state, metadata, allow_text_input_resize=True)
+        log_info(f"mHC weight load: {model.last_migration_report}")
+        return counts
     current = model.state_dict()
     basis = apply_adaln_basis_migration(current, state)
     if basis["source"] is None:
@@ -243,27 +250,15 @@ def wan_latent_stats(vae, device):
     return mean, std_inv
 
 
-def chat_format_prompts(tokenizer, prompts, use_chat_template):
-    """use_chat_template=true 时把 prompt 包成 Qwen chat 模板 (与 train_giga_exp.py 训练侧
-    完全一致, 对齐 MOSS-Image / 6B teacher 约定); 空内容 (EOS 无条件分支) 同样走模板。
-    训练与推理必须同时开启或同时关闭, 否则文本条件分布错位。"""
-    if not use_chat_template:
-        return prompts
-    return [tokenizer.apply_chat_template([{"role": "user", "content": p}], tokenize=False,
-                                          add_generation_prompt=True, enable_thinking=True)
-            for p in prompts]
-
-
 def encode_cfg_prompts(tokenizer, encoder, prompts, negative_prompt, device, layer, max_length,
-                       use_chat_template=False):
+                       use_chat_template=False, enable_thinking=True):
     """正样本 + negative prompt 一次性编码, 统一 padding 长度后拆分 (供 CFG cat)."""
     filled = [p.strip() if p and p.strip() else tokenizer.eos_token for p in prompts]
     negative = negative_prompt.strip() if negative_prompt and negative_prompt.strip() else tokenizer.eos_token
-    texts = chat_format_prompts(tokenizer, filled + [negative] * len(filled), use_chat_template)
+    texts = chat_format_prompts(tokenizer, filled + [negative] * len(filled), use_chat_template, enable_thinking)
     inputs = tokenizer(texts,
                        return_tensors="pt", padding=True, truncation=True, max_length=max_length).to(device)
-    out = encoder(**inputs, use_cache=False, return_dict=True, output_hidden_states=layer is not None)
-    text_all = out.hidden_states[layer] if layer is not None else out.last_hidden_state
+    text_all = encode_text(encoder, inputs, layer)
     mask_all = inputs.attention_mask.bool()
     n = len(filled)
     return text_all[:n], mask_all[:n], text_all[n:], mask_all[n:]
@@ -349,27 +344,23 @@ def main():
     ]), flush=True)
 
     log_info(f"🧩 加载组件: encoder={tc['pretrained_path']} · vae={dc['pretrained_path']}")
-    tokenizer = AutoTokenizer.from_pretrained(tc["tokenizer_path"], local_files_only=True)
-    encoder = Qwen3VLForConditionalGeneration.from_pretrained(
-        tc["pretrained_path"], torch_dtype=dtype, local_files_only=True).eval().to(device)
+    tokenizer = build_tokenizer(tc)
+    encoder = build_text_encoder(tc, dtype, device)
     vae = AutoencoderKLWan.from_pretrained(
         dc["pretrained_path"], subfolder=dc.get("subfolder", "vae"),
         torch_dtype=torch.float32, local_files_only=True).eval().to(device)
     # model.type 分发 (与 train_giga_exp.py 一致): 缺省 giga = GigaExpTransformer;
     # wan5b_ss = Wan2.2 5B 单流化结构 (configs/stage_1_wan5b_tar.yaml)
-    # mHC 配置 (mhc.enabled=true 或 model 含 n_streams) 构建 GigaExpTransformerMHC,
+    # 只有显式 mhc.enabled=true / mhc:true 构建 GigaExpTransformerMHC,
     # 输入输出接口与 GigaExpTransformer 完全一致, 采样循环无需改动
-    model_cfg = dict(cfg["model"])
-    model_type = model_cfg.pop("type", "giga")
-    if cfg.get("mhc", {}).get("enabled") or "n_streams" in model_cfg:
-        from models.giga_transformer_mhc import GigaExpTransformerMHC
-        model_cls = GigaExpTransformerMHC
-    else:
-        model_cls = {"giga": GigaExpTransformer, "wan5b_ss": Wan5BSingleStream}[model_type]
-    model = model_cls(**model_cfg).to(device, dtype=dtype)
+    model = build_diffusion_model(cfg).to(device, dtype=dtype)
     state = load_file(str(checkpoint)) if checkpoint.suffix == ".safetensors" \
         else torch.load(str(checkpoint), map_location="cpu")
-    load_compatible_state_dict(model, state, _read_weight_metadata(checkpoint))
+    metadata = _read_weight_metadata(checkpoint)
+    expected_encoder = text_encoder_metadata(tc)
+    if isinstance(metadata, dict) and metadata.get("text_encoder") != expected_encoder:
+        log_warn("checkpoint 的文本编码器元数据与当前配置不同/缺失；旧编码器权重需要先适配新条件特征")
+    load_compatible_state_dict(model, state, metadata)
     log_ok(f"📦 模型就绪: {checkpoint.name} (step {step})")
 
     z_dim = vae.config.z_dim
@@ -414,7 +405,8 @@ def main():
         batch_prompts = prompts[start:start + args.batch_size]
         text, mask, neg, neg_mask = encode_cfg_prompts(
             tokenizer, encoder, batch_prompts, args.negative_prompt, device, layer, max_length,
-            use_chat_template=bool(tc.get("use_chat_template")))
+            use_chat_template=bool(tc.get("use_chat_template")),
+            enable_thinking=bool(tc.get("enable_thinking", True)))
         # 所有 prompt 固定同一 seed (逐条独立生成器, 结果与 batch_size 无关, 可复现)
         noises = []
         for _ in batch_index:

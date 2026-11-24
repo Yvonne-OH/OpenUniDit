@@ -27,6 +27,94 @@ _MAX_STRANDED = 2
 _STAGE_CONTEXT = None
 _STAGE_STARTED = 0.0
 _REQUEST_DEADLINE = float('inf')
+_TAR_IO_SLOT_CACHE = {}
+
+
+def _tar_io_slot_paths(concurrency):
+    """Create stable local lock inodes before any source I/O starts.
+
+    Each physical host shares /tmp. A namespace can divide one test host into
+    virtual nodes; it never incorporates the training rank automatically.
+    Lock files must never be unlinked while any decoder may still hold them.
+    """
+    namespace = os.environ.get('YISU_TAR_IO_NAMESPACE', 'host')
+    key = (namespace, concurrency)
+    cached = _TAR_IO_SLOT_CACHE.get(key)
+    if cached is not None:
+        return cached
+    base = f'/tmp/yisu-tar-io-{os.getuid()}'
+    root = os.path.join(base, hashlib.sha256(namespace.encode()).hexdigest()[:24])
+    for directory in (base, root):
+        try:
+            os.mkdir(directory, mode=0o700)
+        except FileExistsError:
+            pass
+        info = os.lstat(directory)
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+            raise MediaExecutorBugError(f'tar I/O lease directory must be private: {directory}')
+    paths = tuple(os.path.join(root, f'slot-{index}.lock') for index in range(concurrency))
+    for path in paths:
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR | os.O_CLOEXEC, 0o600)
+        except FileExistsError:
+            # All contenders open the same existing inode, never replace it.
+            continue
+        else:
+            os.close(fd)
+    _TAR_IO_SLOT_CACHE[key] = paths
+    return paths
+
+
+@contextmanager
+def _tar_io_lease():
+    """Limit source tar open/read/close concurrency inside killable children.
+
+    A D-state child retains its flock until its real exit, even after the
+    parent's deadline and SIGKILL. The parent never owns or reclaims a lease.
+    """
+    try:
+        concurrency = int(os.environ.get('YISU_TAR_IO_CONCURRENCY', '0'))
+    except ValueError as exc:
+        raise MediaExecutorBugError('YISU_TAR_IO_CONCURRENCY must be a nonnegative integer') from exc
+    if concurrency < 0:
+        raise MediaExecutorBugError('YISU_TAR_IO_CONCURRENCY must be a nonnegative integer')
+    if concurrency == 0:
+        yield
+        return
+    paths = _tar_io_slot_paths(concurrency)
+    lease = None
+    start = os.getpid() % concurrency
+    # Deterministic process jitter avoids advancing the augmentation RNG.
+    poll_seconds = 0.01 + (os.getpid() % 13)*0.001
+    try:
+        while lease is None:
+            if time.monotonic() >= _REQUEST_DEADLINE:
+                raise MediaDeadlineError('tar I/O admission exceeded request deadline')
+            for offset in range(concurrency):
+                candidate = os.open(paths[(start + offset) % concurrency],
+                                    os.O_RDWR | os.O_CLOEXEC | getattr(os, 'O_NOFOLLOW', 0))
+                try:
+                    fcntl.flock(candidate, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    os.close(candidate)
+                except BaseException:
+                    os.close(candidate)
+                    raise
+                else:
+                    lease = candidate
+                    break
+            if lease is None:
+                remaining = _REQUEST_DEADLINE - time.monotonic()
+                if remaining <= 0:
+                    raise MediaDeadlineError('tar I/O admission exceeded request deadline')
+                time.sleep(min(poll_seconds, remaining))
+                start = (start + 1) % concurrency
+        if time.monotonic() >= _REQUEST_DEADLINE:
+            raise MediaDeadlineError('tar I/O admission exceeded request deadline')
+        yield
+    finally:
+        if lease is not None:
+            os.close(lease)
 
 # LMDB 环境文件最小合法尺寸: 至少 2 个元数据页 (4KB 页 -> 8KB)。
 # 0 字节/残缺文件进 lmdb.open 会对元数据页 pread 到 EOF -> lmdb.Error "Bad file descriptor",
@@ -567,9 +655,10 @@ def read_image(path, records=None, target_width=None, target_height=None):
         off_part, size_part = rest.rsplit(':', 1)
         shard_dir, off_s = off_part.rsplit('/', 1)
         off, size = int(off_s), int(size_part)
-        with open(shard_dir + '.tar', 'rb') as handle:
-            handle.seek(off)
-            blob = handle.read(size)
+        with _tar_io_lease():
+            with open(shard_dir + '.tar', 'rb') as handle:
+                handle.seek(off)
+                blob = handle.read(size)
         with _stage_call('pil_open', Image.open, io.BytesIO(blob)) as image:
             if image.width * image.height > 150_000_000:
                 raise ValueError('image exceeds pixel limit')

@@ -15,6 +15,7 @@
 """
 from __future__ import annotations
 
+import json
 import os
 import time
 from pathlib import Path
@@ -38,11 +39,23 @@ class TarParquetDataset(LmdbParquetDataset):
                  bucket_sampling_weights: dict | None = None, max_decode_candidates: int = 3,
                  preprocess_style: str = "cover",
                  t2i_edit_database_path: str | None = None, t2i_edit_sources_t2i_mode: list[str] | None = None,
+                 freeze_index_signature: bool = False,
                  **kwargs):
         if edit_training_enabled or edit_database_path:
             raise NotImplementedError("TarParquetDataset 暂不支持 edit 对训练 (edit 库仍走 lmdb_parquet 后端)")
+        if type(freeze_index_signature) is not bool:
+            raise ValueError("freeze_index_signature 必须为 bool")
+        self.freeze_index_signature = freeze_index_signature
+        if freeze_index_signature:
+            if refresh_index_cache or os.environ.get("GWP_DATASET_INDEX_CACHE_DISABLE"):
+                raise ValueError("freeze_index_signature=true 不允许强制刷新或禁用索引缓存")
+            if not (index_cache_dir or os.environ.get("GWP_DATASET_INDEX_CACHE")):
+                raise ValueError("freeze_index_signature=true 必须显式指定已复制的 index_cache_dir")
+            if not sources:
+                raise ValueError("freeze_index_signature=true 必须显式指定 image_sources")
         self.tar_root = Path(database_path)
-        if not self.tar_root.is_dir():
+        # Frozen runs trust the copied signatures/cache, never stat a remote root.
+        if not freeze_index_signature and not self.tar_root.is_dir():
             raise FileNotFoundError(f"tar 数据集根目录不存在: {self.tar_root}")
         super().__init__(
             database_path=str(database_path), buckets=buckets,
@@ -58,11 +71,62 @@ class TarParquetDataset(LmdbParquetDataset):
             **kwargs,
         )
 
+    def _load_frozen_signature(self, label: str, root: Path, sources) -> dict[str, list[int]]:
+        """Read the copied snapshot without TTL checks or remote source discovery."""
+        if not sources:
+            raise ValueError(f"冻结 {label} 签名必须显式指定 sources")
+        path = self._signature_snapshot_path(self.index_cache_dir, label, root)
+        try:
+            snapshot = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise RuntimeError(f"冻结索引签名缺失或损坏，禁止扫描数据源: {path}") from exc
+        if not isinstance(snapshot, dict):
+            raise RuntimeError(f"冻结索引签名必须为 JSON object: {path}")
+        signature = {}
+        for source in sorted(sources):
+            key = f"{label}:{source}"
+            value = snapshot.get(key)
+            if (not isinstance(value, list) or len(value) != 2
+                    or any(type(count) is not int or count < 0 for count in value)):
+                raise RuntimeError(f"冻结索引签名缺失/无效: {path}: {key} (需两个非负整数)")
+            signature[key] = value
+        return signature
+
+    def _load_or_read_records(self, image_enabled: bool, edit_enabled: bool,
+                              max_samples, max_edit_samples, edit_database_path):
+        if not self.freeze_index_signature:
+            return super()._load_or_read_records(
+                image_enabled, edit_enabled, max_samples, max_edit_samples, edit_database_path)
+        # Keep the existing fingerprint schema, and never enter the rebuild or
+        # distributed "rank 0 might rebuild" path for an immutable cache.
+        self.index_fingerprint = self._index_fingerprint(
+            image_enabled, edit_enabled, max_samples, max_edit_samples, edit_database_path)
+        payload = self._load_index_cache(self.index_fingerprint, allow_fresh=True)
+        if payload is None:
+            raise RuntimeError(
+                "冻结索引缓存缺失或无效，禁止重建/扫描数据源: "
+                f"{self._cache_paths(self.index_fingerprint)[0]}")
+        self.read_stats = payload.get("stats") or {"image": {}, "edit": {}}
+        return payload["store"]
+
+    def _build_bucket_index(self, index_store, max_samples, max_edit_samples, edit_ratio):
+        if not self.freeze_index_signature:
+            return super()._build_bucket_index(index_store, max_samples, max_edit_samples, edit_ratio)
+        runtime_dir = self._runtime_cache_dir(max_samples, max_edit_samples, edit_ratio)
+        if not self._load_runtime_cache(runtime_dir, index_store):
+            raise RuntimeError(f"冻结运行期 bucket 缓存缺失或无效，禁止重建: {runtime_dir}")
+
     # ─── 分片签名: (parquet 分片数, tar 分片数), 数据入库中途指纹变化自动触发索引重建 ───
 
     def _shard_signature(self, edit_database_path: str | None = None,
                          t2i_database_path: str | None = None) -> dict[str, list[int]]:
         signature: dict[str, list[int]] = {}
+        if self.freeze_index_signature:
+            signature.update(self._load_frozen_signature("tar", self.tar_root, self.sources))
+            if t2i_database_path:
+                signature.update(self._load_frozen_signature(
+                    "t2i", Path(t2i_database_path), self.t2i_edit_sources_t2i_mode))
+            return signature
         ttl = float(os.environ.get("GWP_SHARD_SIGNATURE_TTL", 300))
         self.index_cache_dir.mkdir(parents=True, exist_ok=True)
         roots: list[tuple[str, Path, list[str] | None]] = [("tar", self.tar_root, self.sources)]
@@ -90,6 +154,8 @@ class TarParquetDataset(LmdbParquetDataset):
     # ─── 元数据扫描: 只读检索列 (列裁剪), blob 定位信息来自 images 列 ───
 
     def _read_parquet(self, path, sources, is_edit, lmdb_root, limit=None, t2i: bool = False):
+        if self.freeze_index_signature:
+            raise RuntimeError("冻结索引模式禁止扫描 parquet 数据源")
         if is_edit:
             raise NotImplementedError("TarParquetDataset 只支持 image 模式读取 (edit 对训练走 LMDB 库)")
         import pyarrow.parquet as parquet
