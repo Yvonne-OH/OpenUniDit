@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import collections
 import datetime
 import hashlib
 import json
@@ -1459,7 +1460,54 @@ def main():
         finally:
             warm_stop.set()
         logger.info("✅ compile warmup 结束 (耗时 %.0fs)", time.time() - warm_state["t0"])
+    @torch.no_grad()
+    def encode_captions(captions):
+        with monitor.phase("text_encode"):
+            prompts = [str(c).strip() or tokenizer.eos_token for c in captions]
+            cfg_dropout = float(cfg["training"].get("cfg_dropout", 0.0))
+            if cfg_dropout > 0:
+                empty_prompt = tokenizer.eos_token or " "
+                if cfg["training"].get("cpu_cfg_dropout", False):
+                    # Prompt decisions belong on CPU. Reading a CUDA bool
+                    # here waits for the just-enqueued VAE encode to finish.
+                    # Seed from the requested data cursor so restarts and
+                    # globally skipped batches do not shift this decision.
+                    drop_seed = (int(cfg.get("seed", 42)) + rank * 1_000_003
+                                 + data_stream.epoch * 1_000_000_007
+                                 + data_stream.batch_offset)
+                    generator = torch.Generator(device="cpu").manual_seed(drop_seed)
+                    drop = (torch.rand(len(prompts), generator=generator) < cfg_dropout).tolist()
+                else:
+                    drop = (torch.rand(len(prompts), device=device) < cfg_dropout).tolist()
+                prompts = [empty_prompt if dropped else prompt for dropped, prompt in zip(drop, prompts)]
+            prompts = chat_format_prompts(tokenizer, prompts, tc.get("use_chat_template"), tc.get("enable_thinking", True))
+            inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=tc.get("max_length", 512)).to(device)
+            text, mask = encode_text(text_encoder, inputs, tc.get("layer")), inputs.attention_mask.bool()
+            # 钳到 >=2 token: dynamo 对 size 0/1 有 0/1 特化, L<=1 的退化 batch 会在单个 rank
+            # 上现场触发冷编译 (00:53:11 卡死: rank0 编译 10min+, 其余 rank allreduce 等满 600s 团灭)。
+            # 补零嵌入 + False mask, FA3 varlen 按 valid 长度跳过补位, 对训练数值无任何影响。
+            if text.shape[1] < 2:
+                text = torch.nn.functional.pad(text, (0, 0, 0, 2 - text.shape[1]))
+                mask = torch.nn.functional.pad(mask, (0, 2 - mask.shape[1]))
+        return text, mask
+
+    def fetch_microbatch(index, pending=None):
+        started = time.perf_counter()
+        batch = next_training_batch(data_stream, device, logger, next_step, index, pending)
+        return batch, time.perf_counter() - started, data_stream.last_fetch_seconds
+
+    text_stream = None
+    if cfg["training"].get("prefetch_text_encoding", False):
+        # With CUDA CFG dropout, encoding early would reorder the training RNG draws.
+        cpu_dropout = cfg["training"].get("cpu_cfg_dropout", False)
+        if grad_accum > 1 and (cpu_dropout or not cfg["training"].get("cfg_dropout", 0.0)):
+            text_stream = torch.cuda.Stream(device=device)
+            logger.info("Text encoder lookahead enabled within each accumulation window")
+        else:
+            logger.info("Text encoder running serially (single microbatch or CUDA CFG dropout)")
+
     progress = tqdm(total=max_steps, initial=step, disable=rank != 0, dynamic_ncols=True, desc="🚂 stage_1")
+    throughput_window = collections.deque()  # (时刻, 累计样本), 60s 滑动窗口算 samples/s
     while step < max_steps:
         next_step = step + 1
         monitoring_step = monitor.begin_update(next_step)
@@ -1477,11 +1525,14 @@ def main():
         if getattr(engine.module, "has_moe", False):
             engine.module.set_moe_routing_step(next_step)
         micro_idx = 0
+        lookahead = None
         while micro_idx < grad_accum:
-            fetch_started = time.perf_counter()
-            batch = next_training_batch(data_stream, device, logger, next_step, micro_idx, pending_batch)
-            fetch_seconds = time.perf_counter() - fetch_started
-            read_seconds = data_stream.last_fetch_seconds
+            if lookahead is None:
+                batch, fetch_seconds, read_seconds = fetch_microbatch(micro_idx, pending_batch)
+                prepared_text = None
+            else:
+                (batch, fetch_seconds, read_seconds), prepared_text = lookahead
+                lookahead = None
             data_wait_seconds += fetch_seconds
             data_wait_max = max(data_wait_max, fetch_seconds)
             data_read_seconds += read_seconds
@@ -1503,37 +1554,24 @@ def main():
                 # Wan 官方约定: encode 后标准化 z_norm = (z - mean) * latents_std_inv
                 with monitor.phase("vae"):
                     latents = (vae.encode(pixels.to(dtype)).latent_dist.sample() - latents_mean) * latents_std_inv
-                with monitor.phase("text_encode"):
-                    prompts = [str(c).strip() or tokenizer.eos_token for c in captions]
-                    cfg_dropout = float(cfg["training"].get("cfg_dropout", 0.0))
-                    if cfg_dropout > 0:
-                        empty_prompt = tokenizer.eos_token or " "
-                        if cfg["training"].get("cpu_cfg_dropout", False):
-                            # Prompt decisions belong on CPU. Reading a CUDA bool
-                            # here waits for the just-enqueued VAE encode to finish.
-                            # Seed from the requested data cursor so restarts and
-                            # globally skipped batches do not shift this decision.
-                            drop_seed = (int(cfg.get("seed", 42)) + rank * 1_000_003
-                                         + data_stream.epoch * 1_000_000_007
-                                         + data_stream.batch_offset)
-                            generator = torch.Generator(device="cpu").manual_seed(drop_seed)
-                            drop = (torch.rand(len(prompts), generator=generator) < cfg_dropout).tolist()
-                        else:
-                            drop = (torch.rand(len(prompts), device=device) < cfg_dropout).tolist()
-                        prompts = [empty_prompt if dropped else prompt for dropped, prompt in zip(drop, prompts)]
-                    prompts = chat_format_prompts(tokenizer, prompts, tc.get("use_chat_template"), tc.get("enable_thinking", True))
-                    inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=tc.get("max_length", 512)).to(device)
-                    text, mask = encode_text(text_encoder, inputs, tc.get("layer")), inputs.attention_mask.bool()
-                    # 钳到 >=2 token: dynamo 对 size 0/1 有 0/1 特化, L<=1 的退化 batch 会在单个 rank
-                    # 上现场触发冷编译 (00:53:11 卡死: rank0 编译 10min+, 其余 rank allreduce 等满 600s 团灭)。
-                    # 补零嵌入 + False mask, FA3 varlen 按 valid 长度跳过补位, 对训练数值无任何影响。
-                    if text.shape[1] < 2:
-                        text = torch.nn.functional.pad(text, (0, 0, 0, 2 - text.shape[1]))
-                        mask = torch.nn.functional.pad(mask, (0, 2 - mask.shape[1]))
+                if prepared_text is None:
+                    text, mask = encode_captions(captions)
+                else:
+                    train_stream = torch.cuda.current_stream(device)
+                    train_stream.wait_stream(text_stream)
+                    text, mask = prepared_text
+                    text.record_stream(train_stream)
+                    mask.record_stream(train_stream)
             sigma = torch.rand(latents.shape[0], device=device)
             sigma = sigma * cfg["scheduler"]["shift"] / (1 + (cfg["scheduler"]["shift"] - 1) * sigma)
             noise = torch.randn_like(latents)
             xt = (1 - sigma[:, None, None, None, None]) * latents + sigma[:, None, None, None, None] * noise
+            # Admit the next batch collectively before launching DiT. The data
+            # check synchronizes ranks, so doing it after forward would drain the GPU.
+            next_request = None
+            if text_stream is not None and micro_idx + 1 < grad_accum:
+                next_request = fetch_microbatch(micro_idx + 1)
+                text_stream.wait_stream(torch.cuda.current_stream(device))
             with monitor.phase("dit_forward"):
                 pred = engine(xt.to(dtype), sigma * 1000, text, mask)
             diff_sq = (pred.float() - (noise - latents).float()).square()
@@ -1547,6 +1585,15 @@ def main():
                 loss = loss + moe_aux_total
                 micro_moe_aux.append(moe_aux_total.detach())
             per_sample_loss = diff_sq.flatten(1).mean(1)
+            if next_request is not None:
+                next_batch = next_request[0]
+                next_text = None
+                if next_batch is not None:
+                    # The queued DiT kernels and the upcoming backward may overlap this encode.
+                    # All encoder invocations are ordered, including its mutable GDN graph cache.
+                    with torch.cuda.stream(text_stream):
+                        next_text = encode_captions(next_batch["captions"])
+                lookahead = next_request, next_text
             with monitor.phase("backward"):
                 engine.backward(loss)
             # Gather on all ranks, only at the sampled accumulation boundary.
@@ -1592,7 +1639,17 @@ def main():
                         json.dumps(readout_payload, sort_keys=True, allow_nan=False))
         if rank == 0:
             progress.update(1)
-            progress.set_postfix(loss=f"{loss_value:.5f}", lr=f"{lr_now:.2e}", samples=samples_seen)
+            now = time.perf_counter()
+            throughput_window.append((now, samples_seen))
+            while len(throughput_window) > 2 and (now - throughput_window[0][0]) > 60.0:
+                throughput_window.popleft()
+            if len(throughput_window) >= 2:
+                dt = now - throughput_window[0][0]
+                ds = samples_seen - throughput_window[0][1]
+                throughput = f"{ds / dt:.1f}" if dt > 1e-6 else "--"
+            else:
+                throughput = "--"
+            progress.set_postfix(loss=f"{loss_value:.5f}", lr=f"{lr_now:.2e}", samples=samples_seen, samples_per_s=throughput)
         if step % log_every == 0 or perf_payload:
             data_hash = hashlib.md5("\x1f".join(last_captions).encode("utf-8")).hexdigest()[:8]
             logger.info("rank=%d step=%d loss=%.6f data=%s lr=%.3e time=%s sigma_mean=%.5f", rank, step, loss_value, data_hash, lr_now, time.strftime("%H:%M:%S"), sigma_mean)

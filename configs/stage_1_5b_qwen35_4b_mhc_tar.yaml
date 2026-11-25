@@ -200,6 +200,7 @@ training:
   cfg_dropout: 0.1
   batch_size_per_device: 1
   cpu_cfg_dropout: true
+  prefetch_text_encoding: true
   num_workers: 2
   ready_data_pipeline: true
   dataloader_prefetch_factor: 4
@@ -220,7 +221,7 @@ training:
     betas: [0.9, 0.95]
     epsilon: 1.0e-8
     weight_decay: 0.005
-  learning_rate: 3.0e-5
+  learning_rate: 8.0e-5
   weight_decay: 0.005
   lr_scheduler: cosine
   lr_warmup_steps: 500
