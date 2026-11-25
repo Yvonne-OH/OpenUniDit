@@ -28,8 +28,14 @@ def _post_mix(h, update, post, residual):
 def compiled_routing():
     # Dynamic token counts prevent a compilation for each caption length.
     # B=1 and B>1 may still need separate first-use compilations.
-    return tuple(torch.compile(fn, fullgraph=True, dynamic=True)
-                 for fn in (_mapping_logits, _pre_mix, _post_mix))
+    # Allow Python wrapper frames to graph-break (e.g. generator frames in
+    # instrumented training environments). Inductor still compiles the tensor
+    # regions; fullgraph=True makes an unsupported wrapper abort the whole step.
+    return (
+        torch.compile(_mapping_logits, fullgraph=False, dynamic=True),
+        torch.compile(_pre_mix, fullgraph=False, dynamic=True),
+        torch.compile(_post_mix, fullgraph=False, dynamic=True),
+    )
 
 
 def mapping_logits(*args):

@@ -39,7 +39,7 @@ def arguments():
     parser.add_argument("--image-size", type=int, choices=(256, 512), default=512)
     parser.add_argument("--micro-batch", type=int, default=None)
     parser.add_argument("--grad-accum", type=int, default=None)
-    parser.add_argument("--text-tokens", type=int, choices=(128, 512, 2048), default=None)
+    parser.add_argument("--text-tokens", type=int, choices=(128, 512, 1280, 2048), default=None)
     parser.add_argument("--real-data", action="store_true", help="Use actual YAML tar/NFS data and mixed buckets; no synthetic fallback")
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--updates", type=int, default=None)

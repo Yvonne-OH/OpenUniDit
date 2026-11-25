@@ -20,7 +20,7 @@ mhc:
 monitoring:
   enabled: true
   every_n_steps: 10
-  phase_timings: false
+  phase_timings: true
   per_layer: [0, 17, 35]
 
 model:
@@ -208,7 +208,7 @@ training:
   max_epochs: 2
   mixed_precision: bf16
   optimizer: adamw
-  torch_compile: true
+  torch_compile: false
   muon:
     enabled: false
     momentum: 0.95
