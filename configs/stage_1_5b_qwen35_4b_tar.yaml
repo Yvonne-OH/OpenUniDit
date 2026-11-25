@@ -1,22 +1,36 @@
-# Qwen3.5-4B 文本条件适配分支。DiT 结构保持当前 5.83B SiLU MLP / 30 heads。
-# 原始 checkpoint step 和来源记录在 output_dir/initialization.json。
+# Stage 1 · Qwen3.5-4B 冻结文本编码器 + 纯 DiT (无 mHC)
+# 基于 stage_1_5b_qwen35_4b_mhc_tar.yaml, 差异: mhc.enabled=false, 直接从 dense checkpoint 初始化,
+# 索引缓存复制到本实验 output_dir 内 (不再共享 9b 实验的缓存目录)。
 stage: stage_1
-output_dir: /home/jovyan/pfs/users/zhanqian.wu/exp/giga_exp_image/stage_1_5b_qwen35_4b_20261124
+output_dir: /home/jovyan/pfs/users/zhanqian.wu/exp/giga_exp_image/stage_1_5b_qwen35_4b_tar
 seed: 42
 
-# DeepSpeed launcher: deepspeed --num_gpus=8 train_giga_exp.py --config configs/stage_1_5b_tar.yaml
 distributed:
   backend: deepspeed
-  config: configs/zero1.json
-  world_size: 8
-  timeout_seconds: 14400  # 首次索引构建(33源+741万 t2i 行全量扫 NFS)可超 2h, 4h 兜底
+  config: configs/zero2.json
+  world_size: 32
+  timeout_seconds: 14400
+
+mhc:
+  enabled: false
+  n_streams: 4
+  sinkhorn_iters: 20
+  mhc_mapping_fp32: true
+  init_mode: transfer
+  routing_backend: fused
+
+monitoring:
+  enabled: true
+  every_n_steps: 10
+  phase_timings: true
+  per_layer: [0, 17, 35]
 
 model:
-  # AdaLN 结构 (adaln_type: shared | dual | basis): basis 低秩调制沿 XL 验证配置不变,
-  # dim 翻倍后全秩 adaLN 会到 ~1.6B, basis r=64 只 94M。
+  # 选择性 AC: (8,3)+0.8 激活比 (8,2)+0.5 还低 ~24%; (8,4)+0.75 已实测 OOM
+  activation_checkpointing: true
+  activation_checkpointing_ratio: 0.8
   adaln_type: basis
   adaln_rank: 64
-  # Text Refiner (MOSS-Image 风格, 2 层恒等初始化) 沿 XL 验证配置; dim 4096 下占 403M (~8%)。
   text_trans:
     enabled: true
     layers: 2
@@ -25,11 +39,10 @@ model:
   out_channels: 48
   text_dim: 2560
   dim: 3840
-  ffn_dim: 11520        # MLP ratio 3.0 (Qwen-Image-2.1 mlp_ratio=3, 新一代窄 FFN 下限)
+  ffn_dim: 11520
   heads: 30
   layers: 36
   rope_theta: 10000.0
-  # 4D RoPE: (time, height, width, text_position), head_dim = dim/heads = 128, 不变
   rope_axes_dims: [16, 48, 48, 16]
   patch_size: [1, 1, 1]
 
@@ -37,19 +50,22 @@ components:
   text_encoder:
     type: qwen3_5
     revision: 851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a
-    pretrained_path: /mnt/nfs/models/huggingface/Qwen/Qwen3.5-4B
-    tokenizer_path: /mnt/nfs/models/huggingface/Qwen/Qwen3.5-4B
+    pretrained_path: /home/jovyan/pfs/users/zhanqian.wu/ckpt/Qwen3.5-4B
+    tokenizer_path: /home/jovyan/pfs/users/zhanqian.wu/ckpt/Qwen3.5-4B
     local_files_only: true
-    layer: -1  # 最后一个 full-attention block 后经最终 RMSNorm 的特征，训练/验证/推理共用
+    layer: -1
     padding_side: right
     enable_thinking: false
     attn_implementation: sdpa
-    max_length: 2048
-    # 只进行 frozen hidden-state forward，不生成回复；CFG 两支使用同一模板。
+    max_length: 1280
+    frozen_inference_mode: true
+    reference_gdn_cuda_graph: true
+    gdn_graph_max_entries: 8
+    gdn_graph_max_chunks: 8
     use_chat_template: true
   wan_vae:
     type: AutoencoderKLWan
-    pretrained_path: /mnt/nfs/models/huggingface/models--Wan-AI--Wan2.2-TI2V-5B-Diffusers
+    pretrained_path: /home/jovyan/pfs/users/zhanqian.wu/ckpt/Wan2.2-TI2V-5B-Diffusers
     subfolder: vae
     local_files_only: true
 
@@ -61,7 +77,6 @@ scheduler:
   validation_shift: 3.0
 
 dataset:
-  # ── 数据后端: NFS unified tar 分片, 与 XL tar 版完全一致 (含 edit 库 t2i_caption 7 源) ──
   dataset_type: tar_parquet
   image_training_enabled: true
   edit_training_enabled: false
@@ -74,15 +89,15 @@ dataset:
     - Poster100K
     - anime_captions
     - bg_photo_concepts
-    # - blip3o-long-caption-wds  # TODO: PFS 传输未完成, 完成后取消注释
+    - blip3o-long-caption-wds
     - blip3o-long-caption
     - caption3o-xl-v4
     - ffhq_captioned_1024
-    # - fine_t2i  # TODO: PFS 传输未完成, 完成后取消注释
+    - fine_t2i
     - pexels-advertisement-photography
     - pexels_aesth_2_1024
     - qwen-synth-characters-fused
-    # - sa1b_en  # TODO: PFS 传输未完成, 完成后取消注释
+    - sa1b_en
     - anyword_3m
     - pixelprose_cc12m
     - pixelprose_commonpool
@@ -94,13 +109,11 @@ dataset:
     - Text-Render-2M
     - moss_synth_sa1b_10h
     - FLUX-Reason-6M
-    # - JourneyDB  # TODO: PFS 传输未完成, 完成后取消注释
+    - JourneyDB
     - moss_synth
     - moss_synth_eval100k
     - h3image_synth_webcap_10h
-    # - moss_synth_300k_48h  # TODO: PFS 传输未完成, 完成后取消注释
-  # edit 库 7 个单图对源的 t2i_caption 模式: before 原图 + Qwen3-VL 描述 caption 作普通
-  # image 样本 (~741 万行); parquet_t2i 由 tools/build_tar_parquet_t2i.py 生成。
+    - moss_synth_300k_48h
   t2i_edit_database_path: /home/jovyan/pfs/data/public/image_data
   t2i_edit_sources_t2i_mode:
     - HQ-Edit
@@ -118,7 +131,10 @@ dataset:
   max_upscale_ratio: 1.2
   max_retries: 16
   refresh_index_cache: false
-  index_cache_dir: /home/jovyan/pfs/users/zhanqian.wu/exp/giga_exp_image/stage_1_5b_qwen35_4b_20261124/dataset_index_cache
+  # 索引缓存从 9b 实验完整复制到本实验 output_dir (数据源/路径一致 → 签名相同), 直接冻结复用。
+  freeze_index_signature: true
+  tar_io_concurrency_per_node: 8
+  index_cache_dir: /home/jovyan/pfs/users/zhanqian.wu/exp/giga_exp_image/stage_1_5b_qwen35_4b_tar/dataset_index_cache
   buckets:
     - 256_square
     - 256x192
@@ -133,16 +149,19 @@ dataset:
     512_square: 0.315
     512x384: 0.1925
     384x512: 0.1925
-  # dim 2048→4096 后文本/图像激活翻倍: 256 桶 b=2 (4×2048 text token x 2x dim OOM 风险),
-  # 全局有效 batch 靠 grad_accum 2 补回 (与 XL b=2 等价)
+  # 覆盖 training.batch_size_per_device; 256×8=8192 img tok, 512×3=12288 img tok (ratio 0.8)
+  # 实测: (8,2)+0.5 稳定 ~78.5GiB 峰值; (8,4)+0.75 OOM; (8,3)+0.8 激活比 (8,2)+0.5 低 ~24%
   bucket_batch_sizes:
-    256_square: 2
-    256x192: 2
-    192x256: 2
+    256_square: 8
+    256x192: 8
+    192x256: 8
+    512_square: 3
+    512x384: 3
+    384x512: 3
 
 validation:
   enabled: true
-  every_n_steps: 1000
+  every_n_steps: 5000
   per_rank: true
   use_next_batch: true
   num_inference_steps: 20
@@ -150,7 +169,7 @@ validation:
   guidance_scale: 3.0
   fixed:
     enabled: true
-    every_n_steps: 1000
+    every_n_steps: 5000
     seed: 42
     image_size: [512, 512]
     prompts:
@@ -183,10 +202,14 @@ training:
   enabled: true
   t2v_only: true
   cfg_dropout: 0.1
-  # dim 4096: 激活 ~2x, b=2 打不满 (XL b=2 已 ~78GB), 降为 b=1 + grad_accum=2
-  # (有效 batch = 8 卡 x 1 x 2 与 XL 8 卡 x 2 x 1 一致)
-  batch_size_per_device: 1
-  num_workers: 8
+  batch_size_per_device: 4
+  cpu_cfg_dropout: true
+  prefetch_text_encoding: false
+  num_workers: 2
+  ready_data_pipeline: true
+  dataloader_prefetch_factor: 4
+  ready_min_batches: 2
+  ready_warmup_timeout_seconds: 180
   max_epochs: 2
   mixed_precision: bf16
   optimizer: adamw
@@ -201,19 +224,16 @@ training:
     enabled: true
     betas: [0.9, 0.95]
     epsilon: 1.0e-8
-    # 必须写在此处: build_optimizer 只读 adam_cfg.get("weight_decay"), 顶层 weight_decay 不会被读取
     weight_decay: 0.005
-  # 编码器切换适配：继承 DiT，重新 warmup；峰值 LR 先用 3e-5。
-  learning_rate: 3e-5
+  learning_rate: 8.0e-5
   weight_decay: 0.005
   lr_scheduler: cosine
-  lr_warmup_steps: 1500
+  lr_warmup_steps: 500
   gradient_accumulation_steps: 2
   checkpointing_steps: 5000
   state_checkpoints_keep: 1
-  # 首次启动严格加载 initialization 的冻结快照；分支 step 从 0 warmup。
-  # 后续 auto 恢复本分支 checkpoints/weights，不覆盖当前主训练。
-  init_from: /home/jovyan/pfs/users/zhanqian.wu/exp/giga_exp_image/stage_1_5b_qwen35_4b_20261124/initialization
+  # 直接从 dense checkpoint 文件初始化 (非 mHC transfer 流程, 无需 initialization 目录)
+  init_from: /home/jovyan/pfs/users/zhanqian.wu/exp/giga_exp_image/stage_1_5b/checkpoints/weights/step-00125000.safetensors
   init_from_strict: true
   resume_mode: auto
   resume_optimizer: false
@@ -221,14 +241,14 @@ training:
 
 logging:
   report_to: [console, swanlab]
-  log_every_n_steps: 1
+  log_every_n_steps: 20
   save_samples: true
   swanlab:
     enabled: true
-    project: giga-exp-image
-    name: giga_exp_image_stage_1_5b_qwen35_4b_20261124
     api_key: Dit2ngq8iuiGfUkI88e5b
+    project: giga-exp-image
+    name: giga_exp_image_stage_1_5b_qwen35_4b_tar
   wandb:
     enabled: false
     project: giga-exp-image
-    name: giga_exp_image_stage_1_5b_qwen35_4b_20261124
+    name: giga_exp_image_stage_1_5b_qwen35_4b_tar

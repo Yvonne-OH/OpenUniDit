@@ -5,7 +5,7 @@ seed: 42
 
 distributed:
   backend: deepspeed
-  config: configs/zero1_qwen35_fast.json
+  config: configs/zero2.json
   world_size: 32
   timeout_seconds: 14400
 
@@ -24,7 +24,9 @@ monitoring:
   per_layer: [0, 17, 35]
 
 model:
-  activation_checkpointing: false
+  # 选择性 AC: (8,3)+0.8 激活比 (8,2)+0.5 还低 ~24%; (8,4)+0.75 已实测 OOM
+  activation_checkpointing: true
+  activation_checkpointing_ratio: 0.8
   adaln_type: basis
   adaln_rank: 64
   text_trans:
@@ -85,15 +87,15 @@ dataset:
     - Poster100K
     - anime_captions
     - bg_photo_concepts
-    # - blip3o-long-caption-wds  # TODO: PFS 传输未完成, 完成后取消注释
+    - blip3o-long-caption-wds
     - blip3o-long-caption
     - caption3o-xl-v4
     - ffhq_captioned_1024
-    # - fine_t2i  # TODO: PFS 传输未完成, 完成后取消注释
+    - fine_t2i
     - pexels-advertisement-photography
     - pexels_aesth_2_1024
     - qwen-synth-characters-fused
-    # - sa1b_en  # TODO: PFS 传输未完成, 完成后取消注释
+    - sa1b_en
     - anyword_3m
     - pixelprose_cc12m
     - pixelprose_commonpool
@@ -105,11 +107,11 @@ dataset:
     - Text-Render-2M
     - moss_synth_sa1b_10h
     - FLUX-Reason-6M
-    # - JourneyDB  # TODO: PFS 传输未完成, 完成后取消注释
+    - JourneyDB
     - moss_synth
     - moss_synth_eval100k
     - h3image_synth_webcap_10h
-    # - moss_synth_300k_48h  # TODO: PFS 传输未完成, 完成后取消注释
+    - moss_synth_300k_48h
   t2i_edit_database_path: /home/jovyan/pfs/data/public/image_data
   t2i_edit_sources_t2i_mode:
     - HQ-Edit
@@ -146,14 +148,15 @@ dataset:
     512_square: 0.315
     512x384: 0.1925
     384x512: 0.1925
-  # 每卡 micro-batch 按分辨率设置，统一累积 2 次。
+  # 覆盖 training.batch_size_per_device; 256×8=8192 img tok, 512×3=12288 img tok (ratio 0.8)
+  # 实测: (8,2)+0.5 稳定 ~78.5GiB 峰值; (8,4)+0.75 OOM; (8,3)+0.8 激活比 (8,2)+0.5 低 ~24%
   bucket_batch_sizes:
-    256_square: 2
-    256x192: 2
-    192x256: 2
-    512_square: 1
-    512x384: 1
-    384x512: 1
+    256_square: 8
+    256x192: 8
+    192x256: 8
+    512_square: 3
+    512x384: 3
+    384x512: 3
 
 validation:
   enabled: true
@@ -198,9 +201,9 @@ training:
   enabled: true
   t2v_only: true
   cfg_dropout: 0.1
-  batch_size_per_device: 1
+  batch_size_per_device: 4
   cpu_cfg_dropout: true
-  prefetch_text_encoding: true
+  prefetch_text_encoding: false
   num_workers: 2
   ready_data_pipeline: true
   dataloader_prefetch_factor: 4

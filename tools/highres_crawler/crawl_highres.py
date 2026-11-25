@@ -182,6 +182,7 @@ class Crawler:
                                     "file": path, "ext": ext}) + "\n")
 
     def enqueue(self, url):
+        url = url.replace("&amp;", "&")  # 统一解码HTML实体, 保证小图预筛/去重对所有入口生效
         with self.slock:
             if url in self.seen or url in self.done: return
             self.seen.add(url)

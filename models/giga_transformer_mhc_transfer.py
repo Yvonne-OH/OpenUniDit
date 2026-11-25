@@ -171,7 +171,7 @@ class GigaExpTransformerMHC(GigaExpTransformer):
         use_ckpt=self.activation_checkpointing and self.training and torch.is_grad_enabled() and feature_layers is None
         from torch.utils.checkpoint import checkpoint
         for i,block in enumerate(self.blocks):
-            if use_ckpt:
+            if use_ckpt and i in self._ac_block_ids:
                 hidden=checkpoint(block,hidden,cond,cos,sin,attention_mask,pack,n_img,
                                   denoising_step=self._moe_denoising_step,use_reentrant=False)
             else:

@@ -20,7 +20,8 @@ import tempfile
 import time
 from types import SimpleNamespace
 import uuid
-from unittest.mock import patch
+from contextlib import ExitStack, nullcontext
+from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT), str(ROOT/'tests')]
@@ -92,9 +93,11 @@ class ToyEngine:
         self.ddp = DistributedDataParallel(model)
         self.global_steps = self.micro_steps = 0
         self.forward_losses, self.checkpoints = [], []
+        self.text_ids = []
         self.giga_ready_pipeline_enabled = True
         self._norm=0.
     def __call__(self, value, timestep, text, mask):
+        self.text_ids.append(text[:, 0, 0].tolist())
         prediction=self.ddp(value,timestep,text,mask)
         # Sigma is fixed at .75; the identity VAE returns unit latents.
         noise=(value.detach().float()-.25)/.75
@@ -186,7 +189,8 @@ def main():
             vae=SimpleNamespace(encode=lambda pixels:SimpleNamespace(latent_dist=SimpleNamespace(sample=lambda:pixels))),
             latents_mean=0.,latents_std_inv=1.,text_encoder=None,tokenizer=tokenizer,tc={},
             chat_format_prompts=lambda tok,prompts,flag,enable_thinking=True:prompts,
-            encode_text=lambda enc,inputs,layer:torch.zeros(len(inputs.prompts),2,4),
+            encode_text=lambda enc,inputs,layer:torch.tensor(
+                [sum(p.encode()) for p in inputs.prompts], dtype=torch.float32)[:, None, None].expand(-1, 2, 4),
             progress=SimpleNamespace(update=lambda *a:None,set_postfix=lambda **kwargs:None),
             log_every=1,logger=logging.getLogger('ready-loop'),wandb_run=None,swanlab_run=True,
             swanlab=SimpleNamespace(log=lambda payload,step:payloads.append((step,dict(payload)))),
@@ -194,12 +198,26 @@ def main():
             prune_state_checkpoints=lambda *a:None)
         train_main=next(node for node in TREE.body if isinstance(node,ast.FunctionDef) and node.name=='main')
         loop=next(node for node in train_main.body if isinstance(node,ast.While))
+        helpers = [node for node in train_main.body if isinstance(node, ast.FunctionDef)
+                   and node.name in {"encode_captions", "fetch_microbatch"}]
+        lookahead = "--text-lookahead" in sys.argv
+        train_stream, encode_stream = Mock(), Mock()
+        ns["text_stream"] = encode_stream if lookahead else None
         original_rand=torch.rand
         def fixed_sigma(*shape,**kwargs):
             if kwargs.get('generator') is not None:return original_rand(*shape,**kwargs)
             return torch.full(shape,.5,**kwargs)
-        with patch.object(torch,'rand',side_effect=fixed_sigma):
-            exec(compile(ast.Module(body=[loop],type_ignores=[]),str(SOURCE),'exec'),ns)
+        with ExitStack() as patches:
+            patches.enter_context(patch.object(torch, "rand", side_effect=fixed_sigma))
+            if lookahead:
+                patches.enter_context(patch.object(torch.cuda, "stream", return_value=nullcontext()))
+                patches.enter_context(patch.object(torch.cuda, "current_stream", return_value=train_stream))
+                patches.enter_context(patch.object(torch.Tensor, "record_stream", autospec=True))
+            exec(compile(ast.Module(body=[*helpers, loop], type_ignores=[]), str(SOURCE), "exec"), ns)
+        if lookahead:
+            assert 3 <= train_stream.wait_stream.call_count <= 4
+        assert len(tokenizer.prompts) == len(valid)
+        assert engine.text_ids == [[sum(p.encode()) for p in prompts] for prompts in tokenizer.prompts]
         assert engine.global_steps==4 and engine.micro_steps==8
         assert len(valid)==8 and len(requested)==9 and sum(skipped for _,skipped in requested)==1,requested
         assert lr_steps==[1,2,3,4] and [entry['step'] for entry in engine.checkpoints]==[2,4]

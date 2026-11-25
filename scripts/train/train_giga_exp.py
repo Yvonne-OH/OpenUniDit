@@ -909,6 +909,21 @@ def sigma_bucket_loss_stats(sigma, per_sample_loss):
 
 
 @torch.no_grad()
+def _safe_log(tracker, run, payload, step, logger=None):
+    """云端 tracker 单次 log 失败只降级告警, 不中断训练 (实验被删/网络抖动等)。"""
+    if not run:
+        return run
+    try:
+        tracker.log(payload, step=step)
+    except Exception as exc:
+        message = f"tracker log 失败, 本次跳过 (训练继续): {repr(exc)}"
+        if logger is not None:
+            logger.warning("⚠️ %s", message)
+        else:
+            print(f"⚠️ {message}", file=sys.stderr)
+    return run
+
+
 def run_next_batch_validation(engine, vae, tokenizer, text_encoder, device, dtype, batch, step, rank, cfg, output_dir, logger, wandb_run, swanlab_run=None,
                               group="next_batch", fixed_seed=None, case_id=None):
     """每卡对 next batch 做真实推理: flow ODE 采样 → VAE 解码 → 黑底黄字 prompt 对比图 + JSON 信息."""
@@ -1009,7 +1024,7 @@ def run_next_batch_validation(engine, vae, tokenizer, text_encoder, device, dtyp
                 if swanlab_run:
                     payload = {f"val_moe/{png.stem}": swanlab.Image(str(png)) for png in sorted(moe_dir.glob("*.png"))}
                     if payload:
-                        swanlab.log(payload, step=step)
+                        _safe_log(swanlab, swanlab_run, payload, step, logger)
         except Exception as exc:
             logger.warning("⚠️ step=%d MoE 统计/绘图失败 (训练继续): %s", step, repr(exc))
     if ode_error is not None:
@@ -1069,9 +1084,9 @@ def run_next_batch_validation(engine, vae, tokenizer, text_encoder, device, dtyp
     logger.info("🖼️ step=%d rank=%d %s 推理完成: %d samples → %s", step, rank,
                 "next-batch" if group == "next_batch" else group, b, val_dir / f"{stem}.png")
     if wandb_run and rank == 0:
-        wandb.log({"val/grid": wandb.Image(grid)}, step=step)
+        _safe_log(wandb, wandb_run, {"val/grid": wandb.Image(grid)}, step, logger)
     if swanlab_run and rank == 0:
-        swanlab.log({"val/grid": swanlab.Image(grid)}, step=step)
+        _safe_log(swanlab, swanlab_run, {"val/grid": swanlab.Image(grid)}, step, logger)
 
 
 def fixed_validation_plan(cfg):
@@ -1128,7 +1143,7 @@ def run_fixed_validation(engine, vae, tokenizer, text_encoder, device, dtype, st
                 payload = {f"val_fixed/{case['id']}": tracker.Image(str(val_dir / f"{case['id']}.png"))
                            for case in plan if (val_dir / f"{case['id']}.png").is_file()}
                 if payload:
-                    tracker.log(payload, step=step)
+                    _safe_log(tracker, run, payload, step, logger)
 
 
 def print_banner(cfg, rank):
@@ -1376,29 +1391,39 @@ def main():
 
     wandb_run = None
     if rank == 0 and cfg["logging"]["wandb"]["enabled"]:
-        wandb_dir = output_dir / "wandb"
-        wandb_dir.mkdir(exist_ok=True)
-        run_file = wandb_dir / "run.json"
-        # 策略: 同一 output 永远复用同一个 wandb run —— id 持久化在 run.json, 所有重启以
-        # resume="allow" 续写; 显式 step= 与云端曲线保持训练 step 对齐。
-        # 已知边界: 从 ckpt 回滚恢复时本地 step 可能小于服务端已记录 step, wandb 会按单调性
-        # 丢弃更早日志 (库的公开行为); 如需重建曲线, 删除 run.json 换新 run, 禁止改 wandb
-        # 内部状态 (_starting_step/_local_step) 或重定义指标轴。
-        # 新版 wandb 移除了 wandb.util.generate_id, uuid4().hex (32位) 满足 wandb run id 要求
-        run_id = json.loads(run_file.read_text())["id"] if run_file.exists() else uuid.uuid4().hex
-        run_file.write_text(json.dumps({"id": run_id}))
-        wandb_run = wandb.init(project=cfg["logging"]["wandb"]["project"], name=cfg["logging"]["wandb"]["name"], id=run_id, resume="allow", dir=str(wandb_dir), config=cfg)
+        try:
+            wandb_dir = output_dir / "wandb"
+            wandb_dir.mkdir(exist_ok=True)
+            run_file = wandb_dir / "run.json"
+            # 策略: 同一 output 永远复用同一个 wandb run —— id 持久化在 run.json, 所有重启以
+            # resume="allow" 续写; 显式 step= 与云端曲线保持训练 step 对齐。
+            # 已知边界: 从 ckpt 回滚恢复时本地 step 可能小于服务端已记录 step, wandb 会按单调性
+            # 丢弃更早日志 (库的公开行为); 如需重建曲线, 删除 run.json 换新 run, 禁止改 wandb
+            # 内部状态 (_starting_step/_local_step) 或重定义指标轴。
+            # 新版 wandb 移除了 wandb.util.generate_id, uuid4().hex (32位) 满足 wandb run id 要求
+            run_id = json.loads(run_file.read_text())["id"] if run_file.exists() else uuid.uuid4().hex
+            run_file.write_text(json.dumps({"id": run_id}))
+            wandb_run = wandb.init(project=cfg["logging"]["wandb"]["project"], name=cfg["logging"]["wandb"]["name"], id=run_id, resume="allow", dir=str(wandb_dir), config=cfg)
+        except Exception as exc:
+            # 云端被删/网络故障只降级为 console 日志, 训练不因此中断
+            logger.warning("⚠️ wandb init 失败, 本次运行降级为 console 日志: %s", repr(exc))
+            wandb_run = None
 
     swanlab_run = None
     if rank == 0 and cfg["logging"].get("swanlab", {}).get("enabled"):
-        sl_cfg = cfg["logging"]["swanlab"]
-        swanlab_dir = output_dir / "swanlab"
-        swanlab_dir.mkdir(exist_ok=True)
-        run_file = swanlab_dir / "run.json"
-        # 与 wandb 同一持久化策略: 同一 output 重启复用同一 SwanLab 实验 id, resume="allow" 续写
-        run_id = json.loads(run_file.read_text())["id"] if run_file.exists() else uuid.uuid4().hex[:20]
-        run_file.write_text(json.dumps({"id": run_id}))
-        swanlab_run = swanlab.init(project=sl_cfg["project"], name=sl_cfg["name"], id=run_id, resume="allow", log_dir=str(swanlab_dir), config=cfg)
+        try:
+            sl_cfg = cfg["logging"]["swanlab"]
+            swanlab_dir = output_dir / "swanlab"
+            swanlab_dir.mkdir(exist_ok=True)
+            run_file = swanlab_dir / "run.json"
+            # 与 wandb 同一持久化策略: 同一 output 重启复用同一 SwanLab 实验 id, resume="allow" 续写
+            run_id = json.loads(run_file.read_text())["id"] if run_file.exists() else uuid.uuid4().hex[:20]
+            run_file.write_text(json.dumps({"id": run_id}))
+            swanlab_run = swanlab.init(project=sl_cfg["project"], name=sl_cfg["name"], id=run_id, resume="allow", log_dir=str(swanlab_dir), config=cfg)
+        except Exception as exc:
+            # 云端被删/网络故障只降级为 console 日志, 训练不因此中断
+            logger.warning("⚠️ swanlab init 失败, 本次运行降级为 console 日志: %s", repr(exc))
+            swanlab_run = None
 
     sigma_bucket_ema = [float("nan")] * SIGMA_BUCKETS  # rank0: 各 sigma 桶 loss 的 EMA (α=0.1)
     log_every = int(cfg["logging"].get("log_every_n_steps", 1))
@@ -1499,15 +1524,18 @@ def main():
     text_stream = None
     if cfg["training"].get("prefetch_text_encoding", False):
         # With CUDA CFG dropout, encoding early would reorder the training RNG draws.
+        # cpu_cfg_dropout 的种子绑定 batch_offset, 与调用顺序无关, 因此预取可跨 step 边界:
+        # 最后一个 micro 取出的下一 step 首个 batch, 在本步 backward/optimizer 期间完成文本编码。
         cpu_dropout = cfg["training"].get("cpu_cfg_dropout", False)
-        if grad_accum > 1 and (cpu_dropout or not cfg["training"].get("cfg_dropout", 0.0)):
+        if cpu_dropout or not cfg["training"].get("cfg_dropout", 0.0):
             text_stream = torch.cuda.Stream(device=device)
-            logger.info("Text encoder lookahead enabled within each accumulation window")
+            logger.info("Text encoder lookahead enabled (grad_accum=%d, 预取跨 step 边界)", grad_accum)
         else:
-            logger.info("Text encoder running serially (single microbatch or CUDA CFG dropout)")
+            logger.info("Text encoder running serially (CUDA CFG dropout)")
 
     progress = tqdm(total=max_steps, initial=step, disable=rank != 0, dynamic_ncols=True, desc="🚂 stage_1")
     throughput_window = collections.deque()  # (时刻, 累计样本), 60s 滑动窗口算 samples/s
+    lookahead = None  # 跨 step 预取缓存: ((batch, fetch_s, read_s), prepared_text), step 边界保持
     while step < max_steps:
         next_step = step + 1
         monitoring_step = monitor.begin_update(next_step)
@@ -1525,7 +1553,6 @@ def main():
         if getattr(engine.module, "has_moe", False):
             engine.module.set_moe_routing_step(next_step)
         micro_idx = 0
-        lookahead = None
         while micro_idx < grad_accum:
             if lookahead is None:
                 batch, fetch_seconds, read_seconds = fetch_microbatch(micro_idx, pending_batch)
@@ -1569,7 +1596,9 @@ def main():
             # Admit the next batch collectively before launching DiT. The data
             # check synchronizes ranks, so doing it after forward would drain the GPU.
             next_request = None
-            if text_stream is not None and micro_idx + 1 < grad_accum:
+            if text_stream is not None:
+                # 下一个 micro (或跨 step 边界的下一 step 首个 micro) 的取数+编码,
+                # 与本 micro 的 DiT forward/backward/optimizer 重叠。
                 next_request = fetch_microbatch(micro_idx + 1)
                 text_stream.wait_stream(torch.cuda.current_stream(device))
             with monitor.phase("dit_forward"):
@@ -1643,10 +1672,15 @@ def main():
             throughput_window.append((now, samples_seen))
             while len(throughput_window) > 2 and (now - throughput_window[0][0]) > 60.0:
                 throughput_window.popleft()
+            throughput_value = None
             if len(throughput_window) >= 2:
                 dt = now - throughput_window[0][0]
                 ds = samples_seen - throughput_window[0][1]
-                throughput = f"{ds / dt:.1f}" if dt > 1e-6 else "--"
+                if dt > 1e-6:
+                    throughput_value = ds / dt
+                    throughput = f"{throughput_value:.1f}"
+                else:
+                    throughput = "--"
             else:
                 throughput = "--"
             progress.set_postfix(loss=f"{loss_value:.5f}", lr=f"{lr_now:.2e}", samples=samples_seen, samples_per_s=throughput)
@@ -1655,6 +1689,9 @@ def main():
             logger.info("rank=%d step=%d loss=%.6f data=%s lr=%.3e time=%s sigma_mean=%.5f", rank, step, loss_value, data_hash, lr_now, time.strftime("%H:%M:%S"), sigma_mean)
             if rank == 0 and (wandb_run or swanlab_run):
                 payload = {"train/loss": loss_value, "train/lr": lr_now, "train/sigma_mean": sigma_mean, "train/samples": samples_seen}
+                # 全局吞吐 (samples_seen 是 all_reduce 后的全局计数, 多机多卡直接正确)
+                if throughput_value is not None:
+                    payload["train/samples_per_s"] = round(throughput_value, 2)
                 payload.update(perf_payload)
                 # MoE router aux (只记本 rank 均值; 跨 rank 一致性靠 validation collector 全量统计)
                 if micro_moe_aux:
@@ -1674,10 +1711,13 @@ def main():
                         sigma_bucket_ema[i] = bucket_loss if not math.isfinite(prev) else 0.9 * prev + 0.1 * bucket_loss
                     payload[f"train/loss_sigma_{i / 10:.1f}-{(i + 1) / 10:.1f}"] = sigma_bucket_ema[i]
                 if wandb_run:
-                    wandb.log(payload, step=step)
+                    _safe_log(wandb, wandb_run, payload, step)
                 if swanlab_run:
-                    swanlab.log(payload, step=step)
+                    _safe_log(swanlab, swanlab_run, payload, step)
         if cfg["validation"].get("enabled", True) and step % int(cfg["validation"].get("every_n_steps", 1000)) == 0:
+            # 验证是独立的 20 步扩散推理: 先把训练碎片还回去, 防止验证阶段 OOM (每 5000 步一次, 代价可忽略)
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             pending_batch = next_training_batch(data_stream, device, logger, step, "validation")
             if pending_batch is not None:
                 if rank == 0:
@@ -1695,11 +1735,16 @@ def main():
             run_fixed_validation(engine, vae, tokenizer, text_encoder, device, dtype, step, rank,
                                  cfg, output_dir, logger, wandb_run, swanlab_run)
         if step % cfg["training"].get("checkpointing_steps", 1000) == 0 or step == max_steps:
+            # 跨 step 预取可能持有一个已出队但未消费的 batch; checkpoint 游标必须把它记回去,
+            # 否则恢复后该 batch 会被永久跳过 (数据整体前移一格)。
+            unconsumed = [lookahead[0][0]] if lookahead is not None and lookahead[0][0] is not None else []
             if cfg["training"].get("ready_data_pipeline", False):
                 from optimizations.ready_data_stream import gather_data_state
-                engine.giga_data_cursor = gather_data_state(data_stream, pending_batch=pending_batch)
+                engine.giga_data_cursor = gather_data_state(data_stream, pending_batch=pending_batch,
+                                                            unconsumed_batches=unconsumed)
             else:
-                engine.giga_data_cursor = data_stream.state_dict(pending_batch=pending_batch is not None)
+                engine.giga_data_cursor = data_stream.state_dict(
+                    pending_batch=int(pending_batch is not None) + len(unconsumed))
             engine.save_checkpoint(str(checkpoint_dir), tag=f"step-{step}", client_state={
                 "step": step, "samples_seen": samples_seen, "data_cursor": engine.giga_data_cursor,
                 "giga_semantic_metadata": _semantic_metadata(engine.module),
@@ -1715,7 +1760,10 @@ def main():
     if wandb_run:
         wandb.finish()
     if swanlab_run:
-        swanlab.finish()
+        try:
+            swanlab.finish()
+        except Exception as exc:  # 收尾失败不影响退出状态
+            print(f"⚠️ swanlab finish 失败 (忽略): {repr(exc)}", file=sys.stderr)
 
 
 if __name__ == "__main__":

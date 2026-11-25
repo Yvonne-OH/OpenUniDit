@@ -16,7 +16,7 @@ export PYTHON_EXEC="$gwp/bin/python"
 config="${CONFIG:-${1:-configs/stage_1_5b_qwen35_4b_mhc_tar.yaml}}"
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 TOKENIZERS_PARALLELISM=false
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}" MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
-export NCCL_DEBUG="${NCCL_DEBUG:-WARN}" PYTORCH_ALLOC_CONF="${PYTORCH_ALLOC_CONF:-expandable_segments:True}"
+export NCCL_DEBUG="${NCCL_DEBUG:-WARN}" PYTORCH_ALLOC_CONF="${PYTORCH_ALLOC_CONF:-expandable_segments:True,garbage_collection_threshold:0.6}"
 export YISU_IMAGE_TIMEOUT_SECONDS=48 YISU_IMAGE_SAMPLE_TIMEOUT_SECONDS=120 YISU_IMAGE_PERSISTENT_DECODER=0
 
 # 与 stage_1_5b_tar.sh 一致：百度注入的 RANK 表示节点编号，WORLD_SIZE 表示节点数。
