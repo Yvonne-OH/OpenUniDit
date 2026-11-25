@@ -87,7 +87,7 @@ dataset:
   dataset_type: tar_parquet
   image_training_enabled: true
   edit_training_enabled: false
-  database_path: /mnt/nfs/data/zhanqian.wu/unified_images_tar
+  database_path: /home/jovyan/pfs/data/public/image_data
   image_sources:
     - 4KLSDB
     - Aesthetic-4K
@@ -96,15 +96,15 @@ dataset:
     - Poster100K
     - anime_captions
     - bg_photo_concepts
-    - blip3o-long-caption-wds
+    # - blip3o-long-caption-wds  # TODO: PFS 传输未完成, 完成后取消注释
     - blip3o-long-caption
     - caption3o-xl-v4
     - ffhq_captioned_1024
-    - fine_t2i
+    # - fine_t2i  # TODO: PFS 传输未完成, 完成后取消注释
     - pexels-advertisement-photography
     - pexels_aesth_2_1024
     - qwen-synth-characters-fused
-    - sa1b_en
+    # - sa1b_en  # TODO: PFS 传输未完成, 完成后取消注释
     - anyword_3m
     - pixelprose_cc12m
     - pixelprose_commonpool
@@ -116,22 +116,22 @@ dataset:
     - Text-Render-2M
     - moss_synth_sa1b_10h
     - FLUX-Reason-6M
-    - JourneyDB
+    # - JourneyDB  # TODO: PFS 传输未完成, 完成后取消注释
     - moss_synth
     - moss_synth_eval100k
     - h3image_synth_webcap_10h
-    - moss_synth_300k_48h
+    # - moss_synth_300k_48h  # TODO: PFS 传输未完成, 完成后取消注释
   # edit 库 7 个单图对源的 t2i_caption 模式: before 原图 + Qwen3-VL 描述 caption 作普通
   # image 样本 (~741 万行); parquet_t2i 由 tools/build_tar_parquet_t2i.py 生成。
-  t2i_edit_database_path: /mnt/nfs/data/zhanqian.wu/unified_edit_images_tar
+  t2i_edit_database_path: /home/jovyan/pfs/data/public/image_data
   t2i_edit_sources_t2i_mode:
     - HQ-Edit
     - GPT-UltraEdit
-    - GPT-HQEdit
-    - pico-banana-400k
-    - GPT-OmniEdit
-    - CrispEdit
-    - SEED-Data-Edit
+    # - GPT-HQEdit  # TODO: PFS 传输未完成, 完成后取消注释
+    # - pico-banana-400k  # TODO: PFS 传输未完成, 完成后取消注释
+    # - GPT-OmniEdit  # TODO: PFS 传输未完成, 完成后取消注释
+    # - CrispEdit  # TODO: PFS 传输未完成, 完成后取消注释
+    # - SEED-Data-Edit  # TODO: PFS 传输未完成, 完成后取消注释
   contract: "[B,C,T,H,W]"
   num_frames: 1
   preprocess_style: cover
@@ -254,6 +254,7 @@ logging:
     enabled: true
     project: giga-exp-image
     name: giga_exp_image_stage_1_5b_qwen35_9b_mhc_20261124
+    api_key: Dit2ngq8iuiGfUkI88e5b
   wandb:
     enabled: false
     project: giga-exp-image

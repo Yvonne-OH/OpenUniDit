@@ -42,6 +42,7 @@ from models.giga_transformer import (GigaExpTransformer, apply_adaln_basis_migra
 from models.wan5b_single_stream import Wan5BSingleStream
 from models.model_factory import build_diffusion_model, mhc_config
 from optimizations.mhc_monitoring import TrainingMonitor
+from optimizations.mhc_readout_monitoring import capture_readout_before_step, readout_update_metrics
 from models.moe import apply_dense_to_moe_migration
 import models.giga_transformer as _giga_transformer
 
@@ -215,6 +216,17 @@ def _ckpt_dir_size_gib(tag_dir):
         return total / 1024 ** 3
     except OSError:
         return 0.0
+
+
+def _load_size_gib(path):
+    """统计待加载权重的体量 (文件/目录, 只读元数据), 供加载进度心跳显示总量 GiB。"""
+    p = Path(path)
+    try:
+        if p.is_file():
+            return p.stat().st_size / 1024 ** 3
+    except OSError:
+        return 0.0
+    return _ckpt_dir_size_gib(p)
 
 
 @contextmanager
@@ -1174,6 +1186,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="configs/stage_1.yaml")
     args = parser.parse_args()
+    # 开启 TF32: Tensor Core matmul 加速 fp32 计算 (2026-11-25 实测 GPU 功率仅 50%)
+    torch.set_float32_matmul_precision("high")
     cfg = yaml.safe_load((ROOT / args.config).read_text()) if not Path(args.config).is_absolute() else yaml.safe_load(Path(args.config).read_text())
     swanlab_key = cfg.get("logging", {}).get("swanlab", {}).pop("api_key", None)
     if swanlab_key and cfg["logging"]["swanlab"].get("enabled"):
@@ -1199,10 +1213,15 @@ def main():
     tokenizer = build_tokenizer(tc)
     if len(tokenizer) <= 1:
         raise ValueError(f"tokenizer 词表异常: {tc['tokenizer_path']}")
-    text_encoder = build_text_encoder(tc, dtype, device)
+    with _loud_phase(rank, logger, f"🧮 加载文本编码器 ({_load_size_gib(tc['pretrained_path']):.1f} GiB): {tc['pretrained_path']}",
+                     hint="(safetensors 分片读取 + 权重上卡)", every_s=30):
+        text_encoder = build_text_encoder(tc, dtype, device)
     # VAE bf16 推理: encode 每 micro step 都跑, fp32 全程无必要; 归一化 mean/std 仍 fp32,
     # sample bf16 → 减 fp32 mean 自动升回 fp32, 下游 latents/xt 精度不变
-    vae = AutoencoderKLWan.from_pretrained(dc["pretrained_path"], subfolder=dc.get("subfolder", "vae"), torch_dtype=torch.bfloat16, local_files_only=True).eval().to(device)
+    vae_dir = Path(dc["pretrained_path"]) / dc.get("subfolder", "vae")
+    with _loud_phase(rank, logger, f"🎞️ 加载 VAE ({_load_size_gib(vae_dir):.1f} GiB): {vae_dir}",
+                     hint="(单文件 safetensors 读取 + 上卡)", every_s=30):
+        vae = AutoencoderKLWan.from_pretrained(dc["pretrained_path"], subfolder=dc.get("subfolder", "vae"), torch_dtype=torch.bfloat16, local_files_only=True).eval().to(device)
     # model.type 分发 (缺省 giga = GigaExpTransformer): wan5b_ss 为 Wan2.2 5B 单流化结构
     model = build_diffusion_model(cfg).to(device, dtype=dtype)
     model.giga_text_encoder_metadata = text_encoder_metadata(tc)
@@ -1236,7 +1255,9 @@ def main():
     # 初始化基底先于 optimizer 创建；若存在本分支 checkpoint，后面的恢复会覆盖基底。
     init_from = cfg["training"].get("init_from")
     if init_from:
-        resolved = load_init_weights(model, init_from, strict=bool(cfg["training"].get("init_from_strict", False)))
+        with _loud_phase(rank, logger, f"🎓 加载初始化权重 ({_load_size_gib(init_from):.1f} GiB): {init_from}",
+                         hint="(纯权重 safetensors 读取, 软链接会解析到真实 checkpoint)", every_s=30):
+            resolved = load_init_weights(model, init_from, strict=bool(cfg["training"].get("init_from_strict", False)))
         if rank == 0:
             logger.info("🎓 SFT 初始化: 从 %s 加载纯权重 (step 从 0 开始)", resolved)
 
@@ -1442,6 +1463,7 @@ def main():
     while step < max_steps:
         next_step = step + 1
         monitoring_step = monitor.begin_update(next_step)
+        readout_payload = {}
         skipped_this_update = 0
         data_wait_seconds = data_wait_max = data_read_seconds = data_read_max = 0.0
         data_requests = 0
@@ -1527,9 +1549,14 @@ def main():
             per_sample_loss = diff_sq.flatten(1).mean(1)
             with monitor.phase("backward"):
                 engine.backward(loss)
+            # Gather on all ranks, only at the sampled accumulation boundary.
+            sample_readout = monitoring_step and engine.is_gradient_accumulation_boundary()
+            readout_before = capture_readout_before_step(engine.module.readout) if sample_readout else None
             # Advance DeepSpeed's micro-step counter after every successful backward.
             with monitor.phase("optimizer"):
                 engine.step()
+            if sample_readout:
+                readout_payload = readout_update_metrics(engine.module.readout, readout_before)
             monitor.record_micro(latents.shape[0], math.prod(latents.shape[-3:]) // math.prod(engine.module.patch_size), mask, text.shape[1])
             micro_idx += 1
             micro_metrics[0] += per_sample_loss.detach().sum()
@@ -1559,6 +1586,10 @@ def main():
             skipped_batches=skipped_this_update, data_requests=data_requests,
             data_wait_seconds=data_wait_seconds, data_wait_max_seconds=data_wait_max,
             data_read_seconds=data_read_seconds, data_read_max_seconds=data_read_max)
+        perf_payload.update(readout_payload)
+        if readout_payload:
+            logger.info("readout step=%d diagnostics=%s", step,
+                        json.dumps(readout_payload, sort_keys=True, allow_nan=False))
         if rank == 0:
             progress.update(1)
             progress.set_postfix(loss=f"{loss_value:.5f}", lr=f"{lr_now:.2e}", samples=samples_seen)
