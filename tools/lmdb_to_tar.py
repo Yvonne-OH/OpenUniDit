@@ -22,7 +22,7 @@ lmdb_to_tar.py — unified_edit_images_lmdb → tar 分片 + sidecar 偏移索�
       写于每个 shard 构建之前（原子替换）；崩溃后丢弃当前半成品，从断点重建整个 shard
     - 每数据集完成后写 staging/{dataset}/_DONE，重跑直接跳过
 
-进度: 每 60s 打一行 [dataset] shard-XXXXX n/N (xx.x%) speed；结束打印汇总。
+进度: 每 60s 打一行 [dataset] shard-XXXXX n/N (xx.x%) speed；n 为全数据集累计（跨重启保留）；结束打印汇总。
 
 用法:
     python3 lmdb_to_tar.py                          # 全量
@@ -455,6 +455,14 @@ def convert_dataset(ds: str, args):
     if os.path.exists(state_path) and not args.force:
         with open(state_path) as f:
             state = json.load(f)
+    # 累计已发布记录数：从独立 sidecar 恢复，不依赖进程内 n_records，重启不清零
+    progress_path = os.path.join(stg_ds, "progress.json")
+    if state is not None and "done_records" not in state and os.path.exists(progress_path):
+        try:
+            with open(progress_path) as f:
+                state["done_records"] = int(json.load(f).get("done_records", 0))
+        except Exception:
+            pass
     if state is None or state.get("mode") != mode:
         pub = list_published(dst_ds)
         seq = len(pub)
@@ -473,7 +481,8 @@ def convert_dataset(ds: str, args):
                     key_int = int(name.split("__")[0].rsplit("_", 1)[1])
                     env_idx = next(i for i, e in enumerate(envs)
                                    if os.path.splitext(os.path.basename(e))[0] == env_stem)
-        state = {"mode": mode, "shard_seq": seq, "env_idx": env_idx, "key_int": key_int}
+        state = {"mode": mode, "shard_seq": seq, "env_idx": env_idx, "key_int": key_int,
+                 "done_records": 0}
         atomic_json(state_path, state)
         say(f"[{ds}] 断点恢复: shard={seq} env_idx={env_idx} key={key_int}")
     else:
@@ -486,9 +495,18 @@ def convert_dataset(ds: str, args):
         for p in glob.glob(os.path.join(dst_ds, "*.part")):
             os.remove(p)
 
+    # 兜底：state 为重建时同样从 sidecar 恢复累计记录数
+    if "done_records" not in state and os.path.exists(progress_path):
+        try:
+            with open(progress_path) as f:
+                state["done_records"] = int(json.load(f).get("done_records", 0))
+        except Exception:
+            pass
+
     key_width = 8
     seen = rebuild_seen(dst_ds, mode) if mode == "PATHS" else {}
-    n_records = 0
+    # n_records 为全数据集累计（跨重启从 state/progress.json 恢复），百分比才是真实总进度
+    n_records = int(state.get("done_records", 0))
     n_nopath = 0
     last_log = time.time()
     shard_seq = state["shard_seq"]
@@ -505,7 +523,8 @@ def convert_dataset(ds: str, args):
         # ---- 写断点：本 shard 从 (env_idx, key_int+1) 开始 ----
         shard_seq += 1
         state = {"mode": mode, "shard_seq": shard_seq - 1,
-                 "env_idx": env_idx, "key_int": key_int}
+                 "env_idx": env_idx, "key_int": key_int,
+                 "done_records": n_records}
         atomic_json(state_path, state)
         stem = os.path.join(stg_ds, f"shard-{shard_seq - 1:05d}")
         w = ShardWriter(stem + ".tar", stem + ".idx", stem + ".meta.jsonl",
@@ -577,6 +596,8 @@ def convert_dataset(ds: str, args):
         publish(ds_dir=dst_ds, stem=stem)
         for suffix in (".tar", ".idx", ".meta.jsonl", ".parquet"):
             os.remove(stem + suffix)
+        # 每个分片发布后把累计记录数落盘，重启后进度百分比不再归零
+        atomic_json(progress_path, {"done_records": n_records})
         pct = 100.0 * min(n_records, total) / max(total, 1)
         dt = time.time() - t0
         say(f"[{ds}] shard-{shard_seq-1:05d} 发布  records={n_records}/{total} "

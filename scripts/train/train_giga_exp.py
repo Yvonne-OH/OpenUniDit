@@ -43,6 +43,7 @@ from models.giga_transformer import (GigaExpTransformer, apply_adaln_basis_migra
 from models.wan5b_single_stream import Wan5BSingleStream
 from models.model_factory import build_diffusion_model, mhc_config
 from optimizations.mhc_monitoring import TrainingMonitor
+from optimizations.sigma_monitoring import SigmaMonitor
 from optimizations.mhc_readout_monitoring import capture_readout_before_step, readout_update_metrics
 from models.moe import apply_dense_to_moe_migration
 import models.giga_transformer as _giga_transformer
@@ -382,6 +383,9 @@ class MuonAdamW(torch.optim.Optimizer):
             self.muon.load_state_dict(state_dict["muon"])
         if self.adam and state_dict.get("adam"):
             self.adam.load_state_dict(state_dict["adam"])
+        # PyTorch replaces the inner optimizers' group dictionaries when loading.
+        self.param_groups = [group for opt in (self.muon, self.adam) if opt is not None
+                             for group in opt.param_groups]
 
 
 def build_optimizer(model, cfg):
@@ -394,6 +398,13 @@ def build_optimizer(model, cfg):
         (rest if head or parameter.ndim != 2 else matrix).append(parameter)
     lr = float(cfg.get("learning_rate", 1e-4))
     return MuonAdamW(matrix, rest, cfg.get("muon", {}), cfg.get("adam", {}), lr)
+
+
+def sample_loss_scale(local_samples, grad_accum, device):
+    """Scale a local sum so DeepSpeed's GAS and DP averages give the global sample mean."""
+    count = torch.tensor(local_samples, device=device, dtype=torch.int64)
+    dist.all_reduce(count)
+    return (grad_accum * dist.get_world_size()) / count.float()
 
 
 def set_lr(optimizer, engine_optimizer, step, training_cfg):
@@ -924,6 +935,7 @@ def _safe_log(tracker, run, payload, step, logger=None):
     return run
 
 
+@torch.no_grad()
 def run_next_batch_validation(engine, vae, tokenizer, text_encoder, device, dtype, batch, step, rank, cfg, output_dir, logger, wandb_run, swanlab_run=None,
                               group="next_batch", fixed_seed=None, case_id=None):
     """每卡对 next batch 做真实推理: flow ODE 采样 → VAE 解码 → 黑底黄字 prompt 对比图 + JSON 信息."""
@@ -976,7 +988,7 @@ def run_next_batch_validation(engine, vae, tokenizer, text_encoder, device, dtyp
         # 注意 torch 2.10 的 compiler.disable 只支持装饰器用法: context manager 会在
         # __enter__ 直接 raise (曾导致 36000/37000/38000 验证全部静默跳过)。故在循环外
         # 把 engine 包成禁编译版本, ODE 循环全程 eager。
-        # Fixed cases are sharded across ranks; replicated ZeRO-1 weights need no engine collectives.
+        # Fixed cases are sharded across ranks; replicated ZeRO-0/1/2 weights need no engine collectives.
         eager_engine = torch.compiler.disable(module if group == "fixed" else engine)
         for i in range(num_steps):  # σ: 1(噪声) → 0(数据), v = noise - data
             if collector is not None:
@@ -1116,8 +1128,8 @@ def fixed_validation_plan(cfg):
 
 
 def run_fixed_validation(engine, vae, tokenizer, text_encoder, device, dtype, step, rank, cfg, output_dir, logger, wandb_run, swanlab_run=None):
-    if engine.zero_optimization_stage() > 1:
-        raise ValueError("Sharded fixed validation requires replicated model weights (ZeRO-0/1)")
+    if engine.zero_optimization_stage() >= 3:
+        raise ValueError("Sharded fixed validation requires replicated model weights (ZeRO-0/1/2)")
     plan = fixed_validation_plan(cfg)
     world = dist.get_world_size() if checkpoint_distributed() else 1
     fixed_cfg = dict(cfg, moe_metrics={"enabled": False})
@@ -1352,7 +1364,10 @@ def main():
     if rank == 0:
         _blue_print(f"📦 dataset ready: records={len(data.records)}")
         logger.info("dataset ready: records=%d buckets=%s", len(data.records), {key: len(value) for key, value in data.bucket_indices.items()})
-    batch_sampler = BucketBatchSampler(data.bucket_indices, cfg["training"]["batch_size_per_device"], weights=cfg["dataset"].get("bucket_sampling_weights"), bucket_batch_sizes=cfg["dataset"].get("bucket_batch_sizes"), seed=int(cfg.get("seed", 42)), rank=rank, world_size=dist.get_world_size(), randomize_order_on_start=True, drop_last=True)
+    # 批内按 (源, shard, offset) 排序: 同 shard 读盘 offset 单调递增 → 顺序读,
+    # batch 是无序集合, 不改变采样分布; 旧索引/其他后端无 read_keys 时静默跳过。
+    _sort_keys = getattr(getattr(data, "records", None), "read_keys", None)
+    batch_sampler = BucketBatchSampler(data.bucket_indices, cfg["training"]["batch_size_per_device"], weights=cfg["dataset"].get("bucket_sampling_weights"), bucket_batch_sizes=cfg["dataset"].get("bucket_batch_sizes"), seed=int(cfg.get("seed", 42)), rank=rank, world_size=dist.get_world_size(), randomize_order_on_start=True, drop_last=True, sort_keys_fn=_sort_keys)
     steps_per_epoch = len(batch_sampler)
     if steps_per_epoch <= 0:
         raise ValueError("数据集没有可训练的完整 batch")
@@ -1427,7 +1442,15 @@ def main():
 
     sigma_bucket_ema = [float("nan")] * SIGMA_BUCKETS  # rank0: 各 sigma 桶 loss 的 EMA (α=0.1)
     log_every = int(cfg["logging"].get("log_every_n_steps", 1))
-    monitor = TrainingMonitor(cfg, device, engine.module, mhc_enabled=mhc_config(cfg)["enabled"])
+    monitor = TrainingMonitor(cfg, device, engine.module, mhc_enabled=mhc_config(cfg)["enabled"],
+                              grad_clip_threshold=ds_config.get("gradient_clipping", 0.))
+    sigma_monitor = SigmaMonitor(cfg, device)
+    if rank == 0:
+        logger.info("training monitoring enabled=%s mhc_diagnostics=%s every_n_steps=%d phase_timings=%s",
+                    monitor.enabled, monitor.enabled and monitor.mhc_enabled, monitor.interval,
+                    bool(cfg.get("monitoring", {}).get("phase_timings", False)))
+        logger.info("sigma diagnostics enabled=%s every_n_steps=%d tensor_every_n_steps=%d",
+                    sigma_monitor.enabled, sigma_monitor.interval, sigma_monitor.tensor_interval)
     pending_batch = None
     consecutive_batch_skips = 0
     max_consecutive_batch_skips = int(os.environ.get("GIGA_MAX_CONSECUTIVE_BATCH_SKIPS", "64"))
@@ -1486,9 +1509,10 @@ def main():
             warm_stop.set()
         logger.info("✅ compile warmup 结束 (耗时 %.0fs)", time.time() - warm_state["t0"])
     @torch.no_grad()
-    def encode_captions(captions):
+    def encode_captions(captions, cursor):
         with monitor.phase("text_encode"):
             prompts = [str(c).strip() or tokenizer.eos_token for c in captions]
+            drop = [False] * len(prompts)
             cfg_dropout = float(cfg["training"].get("cfg_dropout", 0.0))
             if cfg_dropout > 0:
                 empty_prompt = tokenizer.eos_token or " "
@@ -1498,8 +1522,7 @@ def main():
                     # Seed from the requested data cursor so restarts and
                     # globally skipped batches do not shift this decision.
                     drop_seed = (int(cfg.get("seed", 42)) + rank * 1_000_003
-                                 + data_stream.epoch * 1_000_000_007
-                                 + data_stream.batch_offset)
+                                 + cursor[0] * 1_000_000_007 + cursor[1])
                     generator = torch.Generator(device="cpu").manual_seed(drop_seed)
                     drop = (torch.rand(len(prompts), generator=generator) < cfg_dropout).tolist()
                 else:
@@ -1514,12 +1537,13 @@ def main():
             if text.shape[1] < 2:
                 text = torch.nn.functional.pad(text, (0, 0, 0, 2 - text.shape[1]))
                 mask = torch.nn.functional.pad(mask, (0, 2 - mask.shape[1]))
-        return text, mask
+        return text, mask, drop
 
     def fetch_microbatch(index, pending=None):
         started = time.perf_counter()
         batch = next_training_batch(data_stream, device, logger, next_step, index, pending)
-        return batch, time.perf_counter() - started, data_stream.last_fetch_seconds
+        cursor = (data_stream.epoch, data_stream.batch_offset)
+        return batch, cursor, time.perf_counter() - started, data_stream.last_fetch_seconds
 
     text_stream = None
     if cfg["training"].get("prefetch_text_encoding", False):
@@ -1539,6 +1563,7 @@ def main():
     while step < max_steps:
         next_step = step + 1
         monitoring_step = monitor.begin_update(next_step)
+        sigma_monitor.begin_update(next_step)
         readout_payload = {}
         skipped_this_update = 0
         data_wait_seconds = data_wait_max = data_read_seconds = data_read_max = 0.0
@@ -1552,14 +1577,17 @@ def main():
         lr_now = set_lr(client_optimizer, ds_optimizer, next_step, cfg["training"])
         if getattr(engine.module, "has_moe", False):
             engine.module.set_moe_routing_step(next_step)
-        micro_idx = 0
-        while micro_idx < grad_accum:
+        # Count admitted examples before backward. Only decoded CPU batches are buffered.
+        window = []
+        prepared_text = None
+        local_samples = 0
+        while len(window) < grad_accum:
             if lookahead is None:
-                batch, fetch_seconds, read_seconds = fetch_microbatch(micro_idx, pending_batch)
-                prepared_text = None
+                request = fetch_microbatch(len(window), pending_batch)
             else:
-                (batch, fetch_seconds, read_seconds), prepared_text = lookahead
+                request, prepared_text = lookahead
                 lookahead = None
+            batch, cursor, fetch_seconds, read_seconds = request
             data_wait_seconds += fetch_seconds
             data_wait_max = max(data_wait_max, fetch_seconds)
             data_read_seconds += read_seconds
@@ -1574,6 +1602,13 @@ def main():
                 # Refill this slot without consuming an optimizer/LR step.
                 continue
             consecutive_batch_skips = 0
+            window.append((batch, cursor))
+            local_samples += len(batch["pixel_values"])
+
+        loss_scale = sample_loss_scale(local_samples, grad_accum, device)
+        validation_due = (cfg["validation"].get("enabled", True) and
+                          next_step % int(cfg["validation"].get("every_n_steps", 1000)) == 0)
+        for micro_idx, (batch, cursor) in enumerate(window):
             pixels = torch.from_numpy(batch["pixel_values"]).to(device)
             captions = batch["captions"]
             last_captions = captions
@@ -1582,30 +1617,32 @@ def main():
                 with monitor.phase("vae"):
                     latents = (vae.encode(pixels.to(dtype)).latent_dist.sample() - latents_mean) * latents_std_inv
                 if prepared_text is None:
-                    text, mask = encode_captions(captions)
+                    text, mask, cfg_dropped = encode_captions(captions, cursor)
                 else:
                     train_stream = torch.cuda.current_stream(device)
                     train_stream.wait_stream(text_stream)
-                    text, mask = prepared_text
+                    text, mask, cfg_dropped = prepared_text
                     text.record_stream(train_stream)
                     mask.record_stream(train_stream)
             sigma = torch.rand(latents.shape[0], device=device)
             sigma = sigma * cfg["scheduler"]["shift"] / (1 + (cfg["scheduler"]["shift"] - 1) * sigma)
             noise = torch.randn_like(latents)
             xt = (1 - sigma[:, None, None, None, None]) * latents + sigma[:, None, None, None, None] * noise
-            # Admit the next batch collectively before launching DiT. The data
-            # check synchronizes ranks, so doing it after forward would drain the GPU.
             next_request = None
+            next_input = None
             if text_stream is not None:
-                # 下一个 micro (或跨 step 边界的下一 step 首个 micro) 的取数+编码,
-                # 与本 micro 的 DiT forward/backward/optimizer 重叠。
-                next_request = fetch_microbatch(micro_idx + 1)
-                text_stream.wait_stream(torch.cuda.current_stream(device))
+                if micro_idx + 1 < grad_accum:
+                    next_input = window[micro_idx + 1]
+                elif next_step < max_steps and not validation_due:
+                    next_request = fetch_microbatch(grad_accum)
+                    next_input = next_request[:2]
+                if next_input is not None:
+                    text_stream.wait_stream(torch.cuda.current_stream(device))
             with monitor.phase("dit_forward"):
                 pred = engine(xt.to(dtype), sigma * 1000, text, mask)
             diff_sq = (pred.float() - (noise - latents).float()).square()
-            # DeepSpeed 会在 gradient_accumulation_steps > 1 时自动缩放 backward loss；这里不要再次除以 grad_accum。
-            loss = diff_sq.mean()
+            per_sample_loss = diff_sq.flatten(1).mean(1)
+            loss = per_sample_loss.sum() * loss_scale
             # MoE router aux loss (load_balance/z_loss 等, 各层权重已在 MoEFFN 内乘好):
             # 加入总 loss 一起 backward, aux 权重相对主 loss 很小 (~1e-2 量级), 不影响主任务收敛
             moe_aux_list = getattr(engine.module, "moe_aux_losses", None)
@@ -1613,20 +1650,18 @@ def main():
                 moe_aux_total = torch.stack(moe_aux_list).mean()
                 loss = loss + moe_aux_total
                 micro_moe_aux.append(moe_aux_total.detach())
-            per_sample_loss = diff_sq.flatten(1).mean(1)
+            prepared_text = None
+            if next_input is not None and next_input[0] is not None:
+                next_batch, next_cursor = next_input
+                with torch.cuda.stream(text_stream):
+                    prepared_text = encode_captions(next_batch["captions"], next_cursor)
             if next_request is not None:
-                next_batch = next_request[0]
-                next_text = None
-                if next_batch is not None:
-                    # The queued DiT kernels and the upcoming backward may overlap this encode.
-                    # All encoder invocations are ordered, including its mutable GDN graph cache.
-                    with torch.cuda.stream(text_stream):
-                        next_text = encode_captions(next_batch["captions"])
-                lookahead = next_request, next_text
+                lookahead = next_request, prepared_text
             with monitor.phase("backward"):
                 engine.backward(loss)
             # Gather on all ranks, only at the sampled accumulation boundary.
-            sample_readout = monitoring_step and engine.is_gradient_accumulation_boundary()
+            sample_readout = (monitor.mhc_enabled and monitoring_step
+                              and engine.is_gradient_accumulation_boundary())
             readout_before = capture_readout_before_step(engine.module.readout) if sample_readout else None
             # Advance DeepSpeed's micro-step counter after every successful backward.
             with monitor.phase("optimizer"):
@@ -1634,7 +1669,9 @@ def main():
             if sample_readout:
                 readout_payload = readout_update_metrics(engine.module.readout, readout_before)
             monitor.record_micro(latents.shape[0], math.prod(latents.shape[-3:]) // math.prod(engine.module.patch_size), mask, text.shape[1])
-            micro_idx += 1
+            sigma_monitor.record_micro(sigma, per_sample_loss, mask, cfg_dropped,
+                                       (pixels.shape[-1], pixels.shape[-2]),
+                                       prediction=pred, latents=latents, noise=noise)
             micro_metrics[0] += per_sample_loss.detach().sum()
             micro_metrics[1] += sigma.detach().sum()
             micro_metrics[2] += latents.shape[0]
@@ -1657,12 +1694,17 @@ def main():
         engine.giga_samples_seen = samples_seen
         loss_value = metric_loss / metric_samples
         sigma_mean = metric_sigma / metric_samples
-        perf_payload = monitor.end_update(step, lr=lr_now,
+        perf_payload = monitor.end_update(step, lr=lr_now, loss=loss_value,
             grad_norm=engine.get_global_grad_norm() if monitoring_step else None,
             skipped_batches=skipped_this_update, data_requests=data_requests,
             data_wait_seconds=data_wait_seconds, data_wait_max_seconds=data_wait_max,
             data_read_seconds=data_read_seconds, data_read_max_seconds=data_read_max)
         perf_payload.update(readout_payload)
+        sigma_payload = sigma_monitor.end_update(step)
+        perf_payload.update(sigma_payload)
+        if rank == 0 and sigma_payload:
+            logger.info("sigma_diagnostics step=%d metrics=%s", step,
+                        json.dumps(sigma_payload, sort_keys=True, allow_nan=False))
         if readout_payload:
             logger.info("readout step=%d diagnostics=%s", step,
                         json.dumps(readout_payload, sort_keys=True, allow_nan=False))
@@ -1714,7 +1756,7 @@ def main():
                     _safe_log(wandb, wandb_run, payload, step)
                 if swanlab_run:
                     _safe_log(swanlab, swanlab_run, payload, step)
-        if cfg["validation"].get("enabled", True) and step % int(cfg["validation"].get("every_n_steps", 1000)) == 0:
+        if validation_due:
             # 验证是独立的 20 步扩散推理: 先把训练碎片还回去, 防止验证阶段 OOM (每 5000 步一次, 代价可忽略)
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()

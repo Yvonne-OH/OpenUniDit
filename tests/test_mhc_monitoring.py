@@ -127,12 +127,58 @@ class MonitorTests(unittest.TestCase):
         class Poison:
             def named_modules(self):raise AssertionError('must not traverse disabled model')
         with patch('optimizations.mhc_monitoring.torch.zeros',side_effect=AssertionError('allocation forbidden')):
-            monitor=TrainingMonitor({'monitoring':{'enabled':True}},'cpu',Poison(),False)
+            monitor=TrainingMonitor({'monitoring':{'enabled':False}},'cpu',Poison(),False)
             self.assertFalse(monitor.begin_update(50))
             with monitor.phase('vae'):pass
             monitor.record_micro(2,10,None)
             self.assertEqual(monitor.end_update(50,data_wait_seconds=object(),data_read_seconds=object()),{})
         self.assertFalse(TrainingMonitor({},'cpu',Poison(),True).enabled)
+
+    def test_dense_has_no_mhc_contract_and_reports_general_metrics(self):
+        class Dense(torch.nn.Linear):
+            def named_modules(self, *args, **kwargs):
+                raise AssertionError('dense monitor must not inspect mHC sites')
+        model=Dense(2,2)
+        clock=iter([0.,2.,2.])
+        monitor=TrainingMonitor({'monitoring':{'enabled':True,'every_n_steps':2}},
+                                'cpu',model,False,lambda:next(clock))
+        for step in (1,2):
+            monitor.begin_update(step)
+            model(torch.ones(2,2)).square().mean().backward()
+            monitor.record_micro(2,4,torch.tensor([[1,1,0],[1,0,0]],dtype=torch.bool))
+            payload=monitor.end_update(step,grad_norm=3.,loss=float('nan') if step==1 else .2,
+                                       data_requests=1,data_read_seconds=.1)
+            if step==1:self.assertEqual(payload,{})
+        self.assertEqual(payload['train/grad_norm'],3.)
+        self.assertEqual(payload['health/grad_norm_missing'],0.)
+        self.assertEqual(payload['health/nonfinite_loss_updates_window'],1.)
+        self.assertEqual(payload['performance/samples_per_sec'],2.)
+        self.assertEqual(payload['performance/text_padding_fraction'],.5)
+        self.assertAlmostEqual(payload['data/read_wait_seconds_global_sum'],.2)
+        self.assertIn('memory/gpu_peak_allocated_gib',payload)
+        self.assertFalse(any(key.startswith('mhc/') for key in payload))
+
+    def test_dense_uses_two_nonempty_collectives_and_excludes_mhc_flops(self):
+        config={'monitoring':{'enabled':True,'every_n_steps':1,'peak_tflops_per_gpu':1},
+            'model':{'dim':4,'ffn_dim':8,'layers':2,'text_dim':3,'in_channels':1,'out_channels':1,
+                     'patch_size':[1,1,1],'text_trans':{'enabled':True,'layers':1}}}
+        model=torch.nn.Linear(1,1);clock=iter([0.,2.,2.])
+        monitor=TrainingMonitor(config,'cpu',model,False,lambda:next(clock))
+        monitor.begin_update(1)
+        monitor.record_micro(2,2,torch.tensor([[1,1,1],[1,0,0]],dtype=torch.bool))
+        def reduce(tensor,op):
+            self.assertGreater(tensor.numel(),0)
+            if op==torch.distributed.ReduceOp.SUM:tensor.mul_(2)
+        with patch('optimizations.mhc_monitoring.dist.is_available',return_value=True),\
+             patch('optimizations.mhc_monitoring.dist.is_initialized',return_value=True),\
+             patch('optimizations.mhc_monitoring.dist.get_world_size',return_value=2),\
+             patch('optimizations.mhc_monitoring.dist.all_reduce',side_effect=reduce) as collective:
+            payload=monitor.end_update(1)
+        self.assertEqual(collective.call_count,2)
+        self.assertEqual(payload['health/grad_norm_missing'],1)
+        self.assertNotIn('train/grad_norm',payload)
+        # Same tiny architecture as the mHC test, minus its 15360 mapping FLOPs.
+        self.assertAlmostEqual(payload['performance/dit_tflops_per_gpu'],25312/2/1e12,places=15)
 
     def test_data_cpu_accumulation_before_report_and_window_reset(self):
         model=Model();clock=iter([0.,2.,2.,4.,4.])
@@ -197,6 +243,18 @@ class MonitorTests(unittest.TestCase):
     def test_mfu_absent_without_explicit_peak(self):
         _,payload=self.exercise()
         self.assertNotIn('performance/mfu_dit_estimate',payload)
+
+    def test_sampled_clipping_scale_estimate(self):
+        monitor=TrainingMonitor({'monitoring':{'enabled':True,'every_n_steps':1}},
+                                'cpu',torch.nn.Linear(1,1),grad_clip_threshold=1.)
+        monitor.begin_update(1)
+        payload=monitor.end_update(1,grad_norm=4.)
+        self.assertEqual(payload['train/grad_clip_active'],1)
+        self.assertAlmostEqual(payload['train/grad_clip_scale_estimate'],.25,places=6)
+        monitor.begin_update(2)
+        payload=monitor.end_update(2,grad_norm=.5)
+        self.assertEqual(payload['train/grad_clip_active'],0)
+        self.assertEqual(payload['train/grad_clip_scale_estimate'],1)
 
 
 if __name__=='__main__':unittest.main()

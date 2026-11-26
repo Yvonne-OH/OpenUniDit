@@ -116,8 +116,8 @@ dataset:
   t2i_edit_sources_t2i_mode:
     - HQ-Edit
     - GPT-UltraEdit
-    # - GPT-HQEdit  # TODO: PFS 传输未完成, 完成后取消注释
-    # - pico-banana-400k  # TODO: PFS 传输未完成, 完成后取消注释
+    - GPT-HQEdit
+    - pico-banana-400k
     # - GPT-OmniEdit  # TODO: PFS 传输未完成, 完成后取消注释
     # - CrispEdit  # TODO: PFS 传输未完成, 完成后取消注释
     # - SEED-Data-Edit  # TODO: PFS 传输未完成, 完成后取消注释

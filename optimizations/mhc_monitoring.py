@@ -1,7 +1,7 @@
-"""Sampled mHC diagnostics and distributed training throughput.
+"""Distributed training health/throughput with optional sampled mHC diagnostics.
 
 No CPU reads or collective operations occur in ``record_micro``. At reporting
-boundaries three fixed-shape all-reduces are followed by one host transfer. CUDA
+boundaries two (dense) or three (mHC) all-reduces precede one host transfer. CUDA
 phase events are queried later; this module never synchronizes an accelerator.
 Stage event durations are sampled GPU-stream intervals, not exclusive kernel time.
 """
@@ -54,9 +54,10 @@ def _reducer(key):
 
 
 class TrainingMonitor:
-    """Opt-in monitor for a model exposing the mHC diagnostics contract.
+    """Opt-in general monitor, with an additional mHC diagnostics contract.
 
-    ``config.monitoring.enabled`` and ``mhc_enabled`` must both be true.
+    ``config.monitoring.enabled`` enables dense and mHC monitoring alike.
+    Only the residual/readout diagnostics require ``mhc_enabled``.
     ``every_n_steps`` defaults to 50, ``cuda_phase_timing`` to false.
     ``per_layer`` may be a list of selected layer indices or true (all layers).
 
@@ -73,9 +74,11 @@ class TrainingMonitor:
     They are accumulated on CPU and transferred only at reporting boundaries.
     """
 
-    def __init__(self, config, device, model, mhc_enabled=False, clock=None):
+    def __init__(self, config, device, model, mhc_enabled=False, clock=None, grad_clip_threshold=0.):
         options = config.get('monitoring', {})
-        self.enabled = bool(mhc_enabled and options.get('enabled', False))
+        self.enabled = bool(options.get('enabled', False))
+        self.mhc_enabled = bool(mhc_enabled)
+        self.grad_clip_threshold = float(grad_clip_threshold or 0.)
         self.model = model
         self.device = torch.device(device)
         self.clock = clock or time.perf_counter
@@ -87,24 +90,27 @@ class TrainingMonitor:
         self._cuda_timing = bool(options.get('phase_timings', options.get('cuda_phase_timing', False))) and self.device.type == 'cuda'
         if not self.enabled:
             return
-        if not callable(getattr(model, 'mhc_stats', None)) or not callable(getattr(model, 'set_mhc_collect_stats', None)):
-            raise ValueError('mHC monitoring requires mhc_stats() and set_mhc_collect_stats()')
-        keys = tuple(model.mhc_stat_keys)
-        sites = [name for name, module in model.named_modules()
-                 if name and hasattr(module, 'collect_stats') and hasattr(module, 'last_stats')]
-        if not sites:
-            raise ValueError('mHC monitoring found no residual sites')
-        self._schema = [(site + '/' + key, key, site) for site in sites for key in keys]
-        self._schema += [('readout/' + key, key, 'readout') for key in READOUT_KEYS]
+        self._schema = []
+        if self.mhc_enabled:
+            if not callable(getattr(model, 'mhc_stats', None)) or not callable(getattr(model, 'set_mhc_collect_stats', None)):
+                raise ValueError('mHC monitoring requires mhc_stats() and set_mhc_collect_stats()')
+            keys = tuple(model.mhc_stat_keys)
+            sites = [name for name, module in model.named_modules()
+                     if name and hasattr(module, 'collect_stats') and hasattr(module, 'last_stats')]
+            if not sites:
+                raise ValueError('mHC monitoring found no residual sites')
+            self._schema = [(site + '/' + key, key, site) for site in sites for key in keys]
+            self._schema += [('readout/' + key, key, 'readout') for key in READOUT_KEYS]
         self._size = len(self._schema)
         self._peak_tflops = float(options.get('peak_tflops_per_gpu') or 0.)
         if not math.isfinite(self._peak_tflops) or self._peak_tflops < 0:
             raise ValueError('peak_tflops_per_gpu must be a finite positive dense-BF16 peak')
-        self._flop_coefficients = dit_flop_coefficients(config, int(getattr(model, 'n_streams', 4))) if self._peak_tflops else None
+        streams = int(getattr(model, 'n_streams', 4)) if self.mhc_enabled else 0
+        self._flop_coefficients = dit_flop_coefficients(config, streams) if self._peak_tflops else None
         self._zero = torch.zeros((), device=self.device, dtype=torch.float64)
         self._zero_stat = torch.zeros((), device=self.device, dtype=torch.float32)
         self._one = torch.ones((), device=self.device, dtype=torch.float64)
-        self._sum_mask = torch.tensor([_reducer(key) == 'sum' for _, key, _ in self._schema], device=self.device)
+        self._sum_mask = torch.tensor([_reducer(key) == 'sum' for _, key, _ in self._schema], device=self.device, dtype=torch.bool)
         self._groups = {'all': [], 'attn': [], 'ffn': [], 'readout': []}
         selected = options.get('per_layer', False)
         for i, (_, key, site) in enumerate(self._schema):
@@ -135,6 +141,7 @@ class TrainingMonitor:
         self._data_wait = self._data_read = 0.
         self._data_wait_max = self._data_read_max = 0.
         self._data_requests = 0
+        self._nonfinite_loss_updates = 0
 
     def begin_update(self, step):
         if not self.enabled:
@@ -142,7 +149,7 @@ class TrainingMonitor:
         if self._window_start is None:
             self._window_start = self.clock()
         self.should_report = int(step) % self.interval == 0
-        if self._collecting != self.should_report:
+        if self.mhc_enabled and self._collecting != self.should_report:
             self.model.set_mhc_collect_stats(self.should_report)
             self._collecting = self.should_report
         return self.should_report
@@ -181,7 +188,7 @@ class TrainingMonitor:
             self._linear_flops += batch_size*((image+padded_text_length)*c['main_linear']
                 + padded_text_length*c['text_linear']+image*c['image_linear'])
             self._sample_image_lengths.extend([image]*batch_size)
-        if not self.should_report:
+        if not self.should_report or not self.mhc_enabled:
             return
         stats = self.model.mhc_stats()
         present = [name in stats for name, _, _ in self._schema]
@@ -227,7 +234,7 @@ class TrainingMonitor:
 
     def end_update(self, step, lr=None, grad_norm=None, skipped_batches=0,
                    data_wait_seconds=0., data_wait_max_seconds=0., data_requests=0,
-                   data_read_seconds=0., data_read_max_seconds=0.):
+                   data_read_seconds=0., data_read_max_seconds=0., loss=None):
         if not self.enabled:
             return {}
         self._updates += 1
@@ -237,6 +244,8 @@ class TrainingMonitor:
         self._data_wait_max = max(self._data_wait_max, float(data_wait_max_seconds))
         self._data_read_max = max(self._data_read_max, float(data_read_max_seconds))
         self._data_requests += int(data_requests)
+        # The caller already has the globally reduced Python loss; no GPU read.
+        self._nonfinite_loss_updates += int(loss is not None and not math.isfinite(loss))
         if not self.should_report:
             return {}
         # Existing training metrics already require a host read at this boundary.
@@ -259,14 +268,16 @@ class TrainingMonitor:
             self._data_wait, self._data_read, self._data_wait_max, self._data_read_max],
             device=self.device, dtype=torch.float64)
         maximum = torch.cat((self._maxs, cpu_maximum,
-            torch.stack((torch.where(grad_valid, grad, -math.inf), bad_grad))))
+            torch.stack((torch.where(grad_valid, grad, -math.inf), bad_grad)),
+            torch.tensor([self._nonfinite_loss_updates, int(grad_norm is None)], device=self.device, dtype=torch.float64)))
         minimum = self._mins.clone()
         distributed = dist.is_available() and dist.is_initialized()
         world = dist.get_world_size() if distributed else 1
         if distributed:
             dist.all_reduce(summed, op=dist.ReduceOp.SUM)
             dist.all_reduce(maximum, op=dist.ReduceOp.MAX)
-            dist.all_reduce(minimum, op=dist.ReduceOp.MIN)
+            if self._size:
+                dist.all_reduce(minimum, op=dist.ReduceOp.MIN)
         # A single host transfer, not one .item() per metric/site.
         host = torch.cat((summed, maximum, minimum)).cpu().tolist()
         n = self._size
@@ -280,7 +291,8 @@ class TrainingMonitor:
         text_tokens, invalid, flops = host[offset:offset+3]; offset += 3
         maxima = host[offset:offset+n]; offset += n
         (seconds, updates, skipped, peak, allocated, data_wait_slowest, data_read_slowest,
-            data_wait_max, data_read_max, grad_value, bad_grad) = host[offset:offset+11]; offset += 11
+            data_wait_max, data_read_max, grad_value, bad_grad, nonfinite_loss,
+            missing_grad) = host[offset:offset+13]; offset += 13
         minima = host[offset:offset+n]
         updates = max(updates, 1.)
         payload = {
@@ -298,6 +310,8 @@ class TrainingMonitor:
             'memory/gpu_allocated_gib': allocated,
             'health/nonfinite_monitor_values': invalid,
             'health/nonfinite_grad_norm': bad_grad,
+            'health/grad_norm_missing': missing_grad,
+            'health/nonfinite_loss_updates_window': nonfinite_loss,
             'data/requests_global_sum': data_requests,
             'data/requests_mean_per_rank': data_requests / world,
         }
@@ -313,6 +327,11 @@ class TrainingMonitor:
             })
         if math.isfinite(grad_value):
             payload['train/grad_norm'] = grad_value
+            if self.grad_clip_threshold > 0:
+                # Sampled pre-clip global norm. This is an estimated clipping
+                # coefficient, not a measured parameter update/weight ratio.
+                payload['train/grad_clip_scale_estimate'] = min(1., self.grad_clip_threshold / (grad_value + 1e-6))
+                payload['train/grad_clip_active'] = float(grad_value > self.grad_clip_threshold)
         if lr is not None:
             payload['train/lr'] = float(lr)
         if self._flop_coefficients is not None:
@@ -345,7 +364,8 @@ class TrainingMonitor:
                     value = sum(totals[i] for i in valid_positions) / sum(counts[i] for i in valid_positions)
                 if math.isfinite(value):
                     payload[f'mhc/{group}/{key}'] = value
-        self.model.set_mhc_collect_stats(False)
+        if self.mhc_enabled:
+            self.model.set_mhc_collect_stats(False)
         self._collecting = False
         self.should_report = False
         self._reset_window()

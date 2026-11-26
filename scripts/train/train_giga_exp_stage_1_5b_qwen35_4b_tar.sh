@@ -56,14 +56,19 @@ def check_dense(path):
         if weights.get_slice("text_in.weight").get_shape() != [cfg["model"]["dim"], width]:
             raise ValueError(f"Unexpected text projection in {path}")
 
-# 非 mHC: 直接从 dense checkpoint 文件初始化, 不做 validation 目录回溯与符号链接。
-init_from = Path(training["init_from"])
-assert init_from.is_file(), f"init_from 必须是已存在的权重文件: {init_from}"
-try:
-    check_dense(init_from)
-except (FileNotFoundError, SafetensorError) as exc:
-    raise RuntimeError(f"init_from checkpoint unreadable: {exc}") from exc
-print(f"Non-mHC initialization from dense checkpoint: {init_from}", file=sys.stderr)
+# 非 mHC: init_from 可选 —— 设置时校验 dense 权重文件; 未设置时依赖 resume_mode=auto
+# 从 output 目录自动继承最新 checkpoint。
+init_from = training.get("init_from")
+if init_from:
+    init_from = Path(init_from)
+    assert init_from.is_file(), f"init_from 必须是已存在的权重文件: {init_from}"
+    try:
+        check_dense(init_from)
+    except (FileNotFoundError, SafetensorError) as exc:
+        raise RuntimeError(f"init_from checkpoint unreadable: {exc}") from exc
+    print(f"Non-mHC initialization from dense checkpoint: {init_from}", file=sys.stderr)
+else:
+    print("init_from 未设置; 依赖 resume_mode=auto 从 output 目录继承最新 checkpoint", file=sys.stderr)
 
 cache = Path(cfg["dataset"]["index_cache_dir"]).resolve(strict=True)
 assert all(any(cache.glob(f"signature_{kind}_*.json")) for kind in ("tar", "t2i")), cache

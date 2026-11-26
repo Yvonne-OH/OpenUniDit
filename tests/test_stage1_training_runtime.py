@@ -24,7 +24,7 @@ import torch.distributed as dist
 SOURCE = Path(os.environ.get("GIGA_TRAIN_SOURCE", Path(__file__).resolve().parents[1] / "scripts/train/train_giga_exp.py"))
 sys.path.insert(0, str(SOURCE.parents[2]))
 TREE = ast.parse(SOURCE.read_text())
-HELPERS = {"_data_error_category", "TrainingDataStream", "next_training_batch", "set_lr",
+HELPERS = {"_safe_log", "_data_error_category", "TrainingDataStream", "next_training_batch", "sample_loss_scale", "set_lr",
            "_read_checkpoint_metadata", "_read_weight_metadata", "save_pure_weights", "load_pure_weights",
            "atomic_write", "save_torch_weights", "sampler_signature", "restore_data_cursor",
            "checkpoint_distributed", "load_weight_candidates", "fixed_validation_plan",
@@ -241,12 +241,17 @@ class RuntimeTests(unittest.TestCase):
     def test_fixed_validation_repeats_pixels_across_steps(self):
         ns = helper_namespace()
         class Module(torch.nn.Module):
-            def forward(self, x, *args): return torch.zeros_like(x)
+            def __init__(self):
+                super().__init__()
+                self.scale = torch.nn.Parameter(torch.zeros(()))
+            def forward(self, x, *args):
+                return x * self.scale
             def set_moe_metrics_collector(self, value): pass
             def set_moe_denoising_step(self, value): pass
         class Engine(torch.nn.Module):
             def __init__(self): super().__init__(); self.module=Module()
-            def zero_optimization_stage(self): return 1
+            zero_stage = 1
+            def zero_optimization_stage(self): return self.zero_stage
         class Tokens:
             attention_mask=torch.ones(2,2,dtype=torch.bool)
             def to(self, device): return self
@@ -265,7 +270,8 @@ class RuntimeTests(unittest.TestCase):
         engine=Engine()
         with tempfile.TemporaryDirectory() as tmp:
             rng=torch.random.get_rng_state().clone()
-            for step in [100,200]:
+            for step, stage in [(100, 1), (200, 2)]:
+                engine.zero_stage = stage
                 ns["run_fixed_validation"](engine,vae,Tokenizer(),None,"cpu",torch.float32,step,0,cfg,Path(tmp),logging.getLogger("test"),None)
             torch.testing.assert_close(torch.random.get_rng_state(),rng)
             for case in ["count","text"]:
@@ -276,6 +282,10 @@ class RuntimeTests(unittest.TestCase):
                 meta=json.loads(b.with_suffix(".json").read_text())
                 self.assertEqual(meta["group"],"fixed")
             self.assertTrue(engine.training)
+            engine.zero_stage = 3
+            with self.assertRaisesRegex(ValueError, "replicated model weights"):
+                ns["run_fixed_validation"](engine, vae, Tokenizer(), None, "cpu", torch.float32,
+                                           1, 0, cfg, Path(tmp), logging.getLogger("test"), None)
 
 
 def run_deepspeed_loop():
@@ -302,6 +312,9 @@ def run_deepspeed_loop():
         def to(self, device): return self
 
     class ToyStream:
+        epoch = 0
+        @property
+        def batch_offset(self): return self.attempts
         def __init__(self): self.attempts = 0
         def state_dict(self, pending_batch=False):
             return {"epoch":0,"batch_offset":self.attempts-int(pending_batch),"sampler_signature":"test"}
@@ -379,7 +392,11 @@ def run_deepspeed_loop():
     main = next(n for n in TREE.body if isinstance(n, ast.FunctionDef) and n.name == "main")
     loop = next(n for n in main.body if isinstance(n, ast.While))
     with patch.object(torch, "rand", side_effect=lambda *shape, **kw: torch.full(shape, 0.5, **kw)):
-        exec(compile(ast.Module(body=[loop], type_ignores=[]), str(SOURCE), "exec"), ns)
+        helpers = [node for node in main.body if isinstance(node, ast.FunctionDef)
+                   and node.name in {"fetch_microbatch", "encode_captions"}]
+        from collections import deque
+        ns.update(lookahead=None, text_stream=None, throughput_window=deque())
+        exec(compile(ast.Module(body=[*helpers, loop], type_ignores=[]), str(SOURCE), "exec"), ns)
     assert engine.global_steps == 4, engine.global_steps
     assert engine.micro_steps == 8, engine.micro_steps
     assert ns["step"] == 4

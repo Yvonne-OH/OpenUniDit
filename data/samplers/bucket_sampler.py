@@ -11,7 +11,8 @@ class BucketBatchSampler(Sampler[list[int]]):
                  drop_last: bool = False, rank: int = 0, world_size: int = 1,
                  randomize_order_on_start: bool = True,
                  bucket_batch_sizes: dict[str, int] | None = None,
-                 max_repeat_per_epoch: float | None = None):
+                 max_repeat_per_epoch: float | None = None,
+                 sort_keys_fn=None):
         # mmap 列式后端传入 numpy CSR 切片 (truth 值有歧义), 统一转 python int 列表;
         # .tolist() 比 list(ndarray) 快 ~5x 且元素为原生 int, 后续索引转换零开销。
         self.bucket_indices = {key: value if isinstance(value, list) else value.tolist()
@@ -37,6 +38,10 @@ class BucketBatchSampler(Sampler[list[int]]):
         if max_repeat_per_epoch is not None and max_repeat_per_epoch < 1.0:
             raise ValueError(f"max_repeat_per_epoch 必须 >= 1.0, 当前: {max_repeat_per_epoch}")
         self.max_repeat_per_epoch = max_repeat_per_epoch
+        # 批内顺序读排序: 可选回调 idx -> 可比较键 (如 (数据源, shard, tar offset))。
+        # batch 是无序集合, 重排不改变采样分布/配额/游标记账, 仅让同一 shard 内
+        # 的 tar 读 offset 单调递增 (顺序流, 吃满 PFS/NFS readahead)。
+        self.sort_keys_fn = sort_keys_fn
         self.start_batch = 0
         self.epoch = 0
         self._start_epoch = 0
@@ -263,7 +268,16 @@ class BucketBatchSampler(Sampler[list[int]]):
             if step < self.start_batch:
                 continue
             start = self.rank * batch_size
-            yield global_batch[start:start + batch_size]
+            yield self._sort_batch(global_batch[start:start + batch_size])
+
+    def _sort_batch(self, batch: list) -> list:
+        """批内按 sort_keys_fn 排序 (借图条目按其 idx 排, target 仅影响降采样不影响读盘)。"""
+        if self.sort_keys_fn is None:
+            return batch
+        def key(entry):
+            idx = entry[0] if isinstance(entry, tuple) else entry
+            return self.sort_keys_fn([idx])[0]
+        return sorted(batch, key=key)
 
     def __len__(self) -> int:
         # 返回完整 epoch 的 batch 数 (start_batch 跳过只影响 __iter__, 不影响长度)。

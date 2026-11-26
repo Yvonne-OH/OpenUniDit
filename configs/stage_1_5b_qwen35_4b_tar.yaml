@@ -20,6 +20,11 @@ mhc:
   routing_backend: fused
 
 monitoring:
+  # Extra diagnostics only; existing sigma EMA and training objective are unchanged.
+  sigma:
+    enabled: true
+    every_n_steps: 100
+    tensor_every_n_steps: 10
   enabled: true
   every_n_steps: 10
   phase_timings: true
@@ -118,8 +123,8 @@ dataset:
   t2i_edit_sources_t2i_mode:
     - HQ-Edit
     - GPT-UltraEdit
-    # - GPT-HQEdit  # TODO: PFS 传输未完成, 完成后取消注释
-    # - pico-banana-400k  # TODO: PFS 传输未完成, 完成后取消注释
+    - GPT-HQEdit
+    - pico-banana-400k
     # - GPT-OmniEdit  # TODO: PFS 传输未完成, 完成后取消注释
     # - CrispEdit  # TODO: PFS 传输未完成, 完成后取消注释
     # - SEED-Data-Edit  # TODO: PFS 传输未完成, 完成后取消注释
@@ -131,8 +136,9 @@ dataset:
   max_upscale_ratio: 1.2
   max_retries: 16
   refresh_index_cache: false
-  # 索引缓存从 9b 实验完整复制到本实验 output_dir (数据源/路径一致 → 签名相同), 直接冻结复用。
-  freeze_index_signature: true
+  # 新增 GPT-HQEdit/pico-banana-400k 后首次运行放开冻结以重建签名/索引,
+  # 日志出现"数据集索引加载 完成"后改回 true。
+  freeze_index_signature: false
   tar_io_concurrency_per_node: 8
   index_cache_dir: /home/jovyan/pfs/users/zhanqian.wu/exp/giga_exp_image/stage_1_5b_qwen35_4b_tar/dataset_index_cache
   buckets:
@@ -155,13 +161,13 @@ dataset:
     256_square: 8
     256x192: 8
     192x256: 8
-    512_square: 3
-    512x384: 3
-    384x512: 3
+    512_square: 6
+    512x384: 6
+    384x512: 6
 
 validation:
   enabled: true
-  every_n_steps: 5000
+  every_n_steps: 2000
   per_rank: true
   use_next_batch: true
   num_inference_steps: 20
@@ -169,7 +175,7 @@ validation:
   guidance_scale: 3.0
   fixed:
     enabled: true
-    every_n_steps: 5000
+    every_n_steps: 2000
     seed: 42
     image_size: [512, 512]
     prompts:
@@ -225,23 +231,23 @@ training:
     betas: [0.9, 0.95]
     epsilon: 1.0e-8
     weight_decay: 0.005
-  learning_rate: 8.0e-5
+  learning_rate: 1.0e-4
   weight_decay: 0.005
   lr_scheduler: cosine
   lr_warmup_steps: 500
   gradient_accumulation_steps: 2
   checkpointing_steps: 5000
   state_checkpoints_keep: 1
-  # 直接从 dense checkpoint 文件初始化 (非 mHC transfer 流程, 无需 initialization 目录)
-  init_from: /home/jovyan/pfs/users/zhanqian.wu/exp/giga_exp_image/stage_1_5b/checkpoints/weights/step-00125000.safetensors
-  init_from_strict: true
+  # 已有本实验 checkpoint: resume_mode=auto 每次重启自动继承最新权重, 不再从外部 dense 初始化
+  # init_from: /home/jovyan/pfs/users/zhanqian.wu/exp/giga_exp_image/stage_1_5b/checkpoints/weights/step-00125000.safetensors
+  # init_from_strict: true
   resume_mode: auto
   resume_optimizer: false
   resume_lr_scheduler: true
 
 logging:
   report_to: [console, swanlab]
-  log_every_n_steps: 20
+  log_every_n_steps: 5
   save_samples: true
   swanlab:
     enabled: true

@@ -34,6 +34,7 @@ optimizations.__path__=[str(ROOT/'optimizations'),*list(optimizations.__path__)]
 from optimizations.ready_data_stream import (ReadyDataStream, REQUEST_KEY,
     select_data_state)
 from optimizations.mhc_monitoring import TrainingMonitor
+from optimizations.sigma_monitoring import SigmaMonitor
 
 SOURCE = Path(os.environ.get('GIGA_TRAIN_SOURCE', ROOT/'scripts/train/train_giga_exp.py'))
 TREE = ast.parse(SOURCE.read_text())
@@ -96,17 +97,26 @@ class ToyEngine:
         self.text_ids = []
         self.giga_ready_pipeline_enabled = True
         self._norm=0.
+        self.expected_grad_sum = 0.
+        self.sample_count = 0
     def __call__(self, value, timestep, text, mask):
         self.text_ids.append(text[:, 0, 0].tolist())
         prediction=self.ddp(value,timestep,text,mask)
         # Sigma is fixed at .75; the identity VAE returns unit latents.
         noise=(value.detach().float()-.25)/.75
         self.forward_losses.append((prediction.detach().float()-(noise-1)).square().flatten(1).mean(1).tolist())
+        self.expected_grad_sum += float((2 * value * (prediction.detach() - (noise - 1))).sum())
+        self.sample_count += len(value)
         return prediction
     def backward(self, loss): (loss/2).backward()
     def step(self):
         self.micro_steps += 1
         if self.micro_steps%2 == 0:
+            reference = torch.tensor([self.expected_grad_sum, self.sample_count])
+            dist.all_reduce(reference)
+            torch.testing.assert_close(self.module.weight.grad, reference[0] / reference[1])
+            self.expected_grad_sum = 0.
+            self.sample_count = 0
             self._norm=float(torch.linalg.vector_norm(torch.stack([p.grad.norm() for p in self.module.parameters()])))
             self.optimizer.step(); self.optimizer.zero_grad(set_to_none=True)
             self.global_steps += 1
@@ -134,6 +144,7 @@ class Tokenizer:
 class InspectMonitor:
     def __init__(self,cfg,model):
         self.actual=TrainingMonitor(cfg,'cpu',model,mhc_enabled=False)
+        self.mhc_enabled=self.actual.mhc_enabled
         self.updates=[]
     def begin_update(self,step):return self.actual.begin_update(step)
     def phase(self,name):return self.actual.phase(name)
@@ -144,7 +155,7 @@ class InspectMonitor:
 
 
 def namespace(rank):
-    names={'_data_error_category','next_training_batch','set_lr','sampler_signature',
+    names={'_safe_log','_data_error_category','next_training_batch','sample_loss_scale','set_lr','sampler_signature',
            'atomic_write','save_torch_weights','save_pure_weights','_read_checkpoint_metadata',
            '_semantic_metadata','restore_data_cursor','checkpoint_distributed'}
     ns=dict(torch=torch,dist=dist,time=time,logging=logging,Path=Path,json=json,re=re,
@@ -171,7 +182,9 @@ def main():
         streams.append(stream)
         cfg={'seed':42,'training':{'learning_rate':.01,'lr_warmup_steps':2,'total_steps':4,
             'cfg_dropout':.5,'cpu_cfg_dropout':True,'checkpointing_steps':2,'ready_data_pipeline':True},
-            'scheduler':{'shift':3},'validation':{'enabled':False}}
+            'scheduler':{'shift':3},'validation':{'enabled':False},
+            'monitoring':{'enabled':True,'every_n_steps':2,
+                          'sigma':{'enabled':True,'every_n_steps':2,'tensor_every_n_steps':1}}}
         monitor=InspectMonitor(cfg,model);payloads=[];valid=[];requested=[];lr_steps=[]
         actual_next,actual_lr=ns['next_training_batch'],ns['set_lr']
         def tracked_next(data_stream,device,logger,step,micro,pending=None):
@@ -183,6 +196,7 @@ def main():
         def tracked_lr(*args):lr_steps.append(args[2]);return actual_lr(*args)
         ns.update(next_training_batch=tracked_next,set_lr=tracked_lr,engine=engine,
             ds_optimizer=optimizer,client_optimizer=optimizer,cfg=cfg,monitor=monitor,
+            sigma_monitor=SigmaMonitor(cfg,'cpu'),
             device=torch.device('cpu'),dtype=torch.float32,rank=rank,step=0,max_steps=4,
             grad_accum=2,SIGMA_BUCKETS=10,samples_seen=0,pending_batch=None,
             consecutive_batch_skips=0,max_consecutive_batch_skips=4,data_stream=stream,
@@ -202,6 +216,8 @@ def main():
                    and node.name in {"encode_captions", "fetch_microbatch"}]
         lookahead = "--text-lookahead" in sys.argv
         train_stream, encode_stream = Mock(), Mock()
+        from collections import deque
+        ns.update(lookahead=None, throughput_window=deque())
         ns["text_stream"] = encode_stream if lookahead else None
         original_rand=torch.rand
         def fixed_sigma(*shape,**kwargs):
@@ -215,7 +231,7 @@ def main():
                 patches.enter_context(patch.object(torch.Tensor, "record_stream", autospec=True))
             exec(compile(ast.Module(body=[*helpers, loop], type_ignores=[]), str(SOURCE), "exec"), ns)
         if lookahead:
-            assert 3 <= train_stream.wait_stream.call_count <= 4
+            assert train_stream.wait_stream.call_count >= 4
         assert len(tokenizer.prompts) == len(valid)
         assert engine.text_ids == [[sum(p.encode()) for p in prompts] for prompts in tokenizer.prompts]
         assert engine.global_steps==4 and engine.micro_steps==8
@@ -239,7 +255,7 @@ def main():
         assert sum(entry['data_requests'] for _,entry in monitor.updates)==9
         local=[]
         for update in range(1,5):
-            items=[i for i,entry in enumerate(valid) if entry['step']==update]
+            items=range(2 * (update - 1), 2 * update)
             local.append({'samples':sum(len(valid[i]['captions']) for i in items),
                           'loss_sum':sum(sum(engine.forward_losses[i]) for i in items)})
         all_expected=[None]*world;dist.all_gather_object(all_expected,local)
@@ -252,6 +268,13 @@ def main():
                 assert abs(payload['train/sigma_mean']-.75)<1e-7
                 loss=sum(values[update]['loss_sum'] for values in all_expected)/count
                 assert math.isclose(payload['train/loss'],loss,rel_tol=2e-6,abs_tol=2e-6),(payload,loss)
+                if step % 2 == 0:
+                    window_count=sum(values[j]['samples'] for values in all_expected for j in (update-1,update))
+                    window_sum=sum(values[j]['loss_sum'] for values in all_expected for j in (update-1,update))
+                    assert payload['diagnostics/samples']==window_count
+                    assert payload['diagnostics/all/sigma_0.7-0.8/samples']==window_count
+                    assert math.isclose(payload['diagnostics/all/sigma_0.7-0.8/loss_mean'],
+                                        window_sum/window_count,rel_tol=2e-6)
         assert ns['samples_seen']==samples
         saved=engine.checkpoints[-1]['data_cursor']
         assert saved['world_size']==2 and saved['stream_kind']=='ready_first_distributed'

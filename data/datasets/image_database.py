@@ -851,6 +851,14 @@ class _KeptRecordView:
     def is_edit_flags(self):
         return self._store.is_edit[self._kept_rows]
 
+    def read_keys(self, indices):
+        """批内顺序读排序键: (数据源, shard, tar 内 offset)。
+        供 BucketBatchSampler 批内排序, 让同一 shard 的读盘 offset 单调递增。"""
+        rows = self._kept_rows[np.asarray(indices, dtype=np.int64)]
+        return list(zip(self._store.src[rows].tolist(),
+                        self._store.stem[rows].tolist(),
+                        self._store.blob_off[rows].tolist()))
+
 
 class LmdbParquetDataset(ImageDatabaseDataset):
     # v3: kind 列 (t2i_caption 行) + t2i_edit_sources_t2i_mode 配置进指纹
