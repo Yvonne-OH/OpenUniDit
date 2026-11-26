@@ -55,8 +55,8 @@ components:
   text_encoder:
     type: qwen3_5
     revision: c202236235762e1c871ad0ccb60c8ee5ba337b9a
-    pretrained_path: /home/jovyan/pfs/users/zhanqian.wu/exp/giga_exp_image/stage_1_5b_qwen35_9b_mhc_20261124/pretrained/Qwen3.5-9B
-    tokenizer_path: /home/jovyan/pfs/users/zhanqian.wu/exp/giga_exp_image/stage_1_5b_qwen35_9b_mhc_20261124/pretrained/Qwen3.5-9B
+    pretrained_path: /home/jovyan/pfs/users/zhanqian.wu/ckpt/Qwen3.5-9B
+    tokenizer_path: /home/jovyan/pfs/users/zhanqian.wu/ckpt/Qwen3.5-9B
     local_files_only: true
     layer: -1  # 最后一个 full-attention block 后经最终 RMSNorm 的特征，训练/验证/推理共用
     padding_side: right

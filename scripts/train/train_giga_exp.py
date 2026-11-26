@@ -537,12 +537,24 @@ def save_torch_weights(state, target, metadata):
     atomic_write(target, publish)
 
 
+def swanlab_run_identity(run_file, options, step):
+    previous = json.loads(run_file.read_text()).get("id") if run_file.exists() else None
+    fresh = bool(options.get("new_run_on_restart", False))
+    run_id = uuid.uuid4().hex[:20] if fresh or not previous else previous
+    name = options["name"] + (f"-s{step}-{run_id[:6]}" if fresh else "")
+    record = {"id": run_id, "resume_step": int(step), "previous_id": previous}
+    atomic_write(run_file, lambda path: path.write_text(json.dumps(record)))
+    return run_id, name
+
+
 def sampler_signature(sampler):
     steps = len(sampler)
     spec = {key: getattr(sampler, key, None) for key in
             ("seed", "world_size", "batch_size", "bucket_batch_sizes", "weights", "randomize_order_on_start", "max_repeat_per_epoch")}
     spec["bucket_counts"] = {key: len(value) for key, value in getattr(sampler, "bucket_indices", {}).items()}
     spec["steps_per_epoch"] = steps
+    if getattr(sampler, "tar_locality_order", None) is not None:
+        spec["tar_locality_order"] = sampler.tar_locality_order
     return hashlib.sha256(json.dumps(spec, sort_keys=True).encode()).hexdigest()
 
 
@@ -1364,8 +1376,7 @@ def main():
     if rank == 0:
         _blue_print(f"📦 dataset ready: records={len(data.records)}")
         logger.info("dataset ready: records=%d buckets=%s", len(data.records), {key: len(value) for key, value in data.bucket_indices.items()})
-    # 批内按 (源, shard, offset) 排序: 同 shard 读盘 offset 单调递增 → 顺序读,
-    # batch 是无序集合, 不改变采样分布; 旧索引/其他后端无 read_keys 时静默跳过。
+    # Locality policy is restored below before constructing worker iterators.
     _sort_keys = getattr(getattr(data, "records", None), "read_keys", None)
     batch_sampler = BucketBatchSampler(data.bucket_indices, cfg["training"]["batch_size_per_device"], weights=cfg["dataset"].get("bucket_sampling_weights"), bucket_batch_sizes=cfg["dataset"].get("bucket_batch_sizes"), seed=int(cfg.get("seed", 42)), rank=rank, world_size=dist.get_world_size(), randomize_order_on_start=True, drop_last=True, sort_keys_fn=_sort_keys)
     steps_per_epoch = len(batch_sampler)
@@ -1383,7 +1394,36 @@ def main():
     if step > max_steps:
         raise ValueError(f"恢复 step={step} 超过 {max_epochs} epoch 的总步数 {max_steps}")
     engine.giga_ready_pipeline_enabled = bool(cfg["training"].get("ready_data_pipeline", False))
+    locality_cfg = cfg["dataset"].get("tar_locality", {})
+    locality_enabled = bool(locality_cfg.get("enabled", False))
+    from optimizations.tar_locality_state import saved_tar_order, locality_activation
+    saved_order = saved_tar_order(getattr(engine, "giga_data_cursor", None))
+    if saved_order is not None and not locality_enabled:
+        raise ValueError("Checkpoint uses TAR locality; keep dataset.tar_locality.enabled=true to resume exactly")
+    if locality_enabled:
+        if not engine.giga_ready_pipeline_enabled or _sort_keys is None:
+            raise ValueError("TAR locality requires ready_data_pipeline and columnar TAR indices")
+        if saved_order is not None:
+            if int(saved_order["block_samples"]) != int(locality_cfg.get("block_samples", 128)):
+                raise ValueError("Do not change TAR locality block_samples while resuming an existing order")
+            batch_sampler.configure_tar_locality(saved_order, read_columns_fn=data.records.read_columns)
     epoch, batch_offset = restore_data_cursor(engine, batch_sampler, step, grad_accum, logger)
+    if locality_enabled and (saved_order is None or getattr(engine, "giga_ready_resume_state", None) is None):
+        # Legacy requests already delivered out of order retain their identities.
+        # The new permutation starts after the latest consumed request on any rank.
+        exact_cursor = (getattr(engine, "giga_data_cursor", None)
+                        if getattr(engine, "giga_ready_resume_state", None) is not None else None)
+        activation_epoch, activation_batch = locality_activation(
+            exact_cursor, epoch, batch_offset, steps_per_epoch)
+        policy = {"version": 1, "block_samples": int(locality_cfg.get("block_samples", 128)),
+                  "activation_epoch": activation_epoch, "activation_batch": activation_batch}
+        batch_sampler.configure_tar_locality(policy, read_columns_fn=data.records.read_columns)
+        if getattr(engine, "giga_ready_resume_state", None) is not None:
+            engine.giga_ready_resume_state = dict(engine.giga_ready_resume_state,
+                sampler_signature=sampler_signature(batch_sampler), tar_locality_order=policy)
+    if locality_enabled:
+        logger.info("TAR locality order: %s; legacy prefix retained, bucket quotas unchanged",
+                    batch_sampler.tar_locality_order)
     batch_sampler.set_start_batch(batch_offset, epoch=epoch)
     if rank == 0:
         logger.info("📅 max_epochs=%d steps_per_epoch=%d total_steps=%d grad_accum=%d; 从 epoch=%d batch=%d step=%d 继续", max_epochs, steps_per_epoch, max_steps, grad_accum, epoch, batch_offset, step)
@@ -1393,6 +1433,13 @@ def main():
     # timeout 到点抛 RuntimeError → skip 机制接住并重建 iterator, fail-fast 优于挂死。
     data_stream = make_training_data_stream(data, batch_sampler, cfg["training"], logger,
         epoch=epoch, batch_offset=batch_offset, resume_state=getattr(engine, "giga_ready_resume_state", None))
+    tar_usage = None
+    if locality_enabled:
+        from optimizations.tar_usage import TarUsageTracker
+        usage_reference = (getattr(engine, "giga_ready_resume_state", None) or {}).get("tar_usage_reference")
+        tar_usage = TarUsageTracker.load(usage_reference) if usage_reference else TarUsageTracker()
+        logger.info("TAR consumption table enabled; restored=%s samples=%d",
+                    bool(usage_reference), tar_usage.consumed_samples)
     if engine.giga_ready_pipeline_enabled:
         ready_status = data_stream.wait_ready(int(cfg["training"].get("ready_min_batches", 8)),
             float(cfg["training"].get("ready_warmup_timeout_seconds", 180)))
@@ -1431,10 +1478,9 @@ def main():
             swanlab_dir = output_dir / "swanlab"
             swanlab_dir.mkdir(exist_ok=True)
             run_file = swanlab_dir / "run.json"
-            # 与 wandb 同一持久化策略: 同一 output 重启复用同一 SwanLab 实验 id, resume="allow" 续写
-            run_id = json.loads(run_file.read_text())["id"] if run_file.exists() else uuid.uuid4().hex[:20]
-            run_file.write_text(json.dumps({"id": run_id}))
-            swanlab_run = swanlab.init(project=sl_cfg["project"], name=sl_cfg["name"], id=run_id, resume="allow", log_dir=str(swanlab_dir), config=cfg)
+            run_id, run_name = swanlab_run_identity(run_file, sl_cfg, step)
+            logger.info("SwanLab run=%s name=%s resume_step=%d", run_id, run_name, step)
+            swanlab_run = swanlab.init(project=sl_cfg["project"], name=run_name, id=run_id, resume="allow", log_dir=str(swanlab_dir), config=cfg)
         except Exception as exc:
             # 云端被删/网络故障只降级为 console 日志, 训练不因此中断
             logger.warning("⚠️ swanlab init 失败, 本次运行降级为 console 日志: %s", repr(exc))
@@ -1666,6 +1712,8 @@ def main():
             # Advance DeepSpeed's micro-step counter after every successful backward.
             with monitor.phase("optimizer"):
                 engine.step()
+            if tar_usage is not None:
+                tar_usage.record_batch(batch)
             if sample_readout:
                 readout_payload = readout_update_metrics(engine.module.readout, readout_before)
             monitor.record_micro(latents.shape[0], math.prod(latents.shape[-3:]) // math.prod(engine.module.patch_size), mask, text.shape[1])
@@ -1782,6 +1830,8 @@ def main():
             unconsumed = [lookahead[0][0]] if lookahead is not None and lookahead[0][0] is not None else []
             if cfg["training"].get("ready_data_pipeline", False):
                 from optimizations.ready_data_stream import gather_data_state
+                if tar_usage is not None:
+                    data_stream.tar_usage_reference = tar_usage.save(output_dir / "tar_usage", step, rank)
                 engine.giga_data_cursor = gather_data_state(data_stream, pending_batch=pending_batch,
                                                             unconsumed_batches=unconsumed)
             else:
@@ -1796,6 +1846,8 @@ def main():
                 prune_state_checkpoints(checkpoint_dir, int(cfg["training"].get("state_checkpoints_keep", 2)))
             dist.barrier()
 
+    if tar_usage is not None:
+        tar_usage.save(output_dir / "tar_usage", step, rank)
     data_stream.close()
     if rank == 0:
         progress.close()

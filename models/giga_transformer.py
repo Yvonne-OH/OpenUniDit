@@ -259,6 +259,15 @@ class TextRefiner(nn.Module):
         return text_hidden
 
 
+class TextModulation(nn.Linear):
+    """Keep the checkpoint layout while allowing the last image-only block to use two heads."""
+    def forward(self, x, attention_input_only=False):
+        if attention_input_only:
+            rows = self.out_features // 3
+            return F.linear(x, self.weight[:rows], self.bias[:rows])
+        return super().forward(x)
+
+
 class GigaBlock(nn.Module):
     def __init__(self, dim, heads, ffn_dim, mod_adaln=False, adaln_rank=None, moe=None):
         super().__init__()
@@ -286,7 +295,7 @@ class GigaBlock(nn.Module):
             # 旧全秩 ckpt 由 apply_adaln_basis_migration 做 W_i ≈ (W_i Pᵀ)·P 低秩转换后加载。
             mod_in = dim if self.adaln_rank is None else self.adaln_rank
             self.mod_img = nn.Linear(mod_in, dim * 6)
-            self.mod_txt = nn.Linear(mod_in, dim * 6)
+            self.mod_txt = TextModulation(mod_in, dim * 6)
         else:
             self.mod = nn.Linear(dim, dim * 6)
 
@@ -333,11 +342,11 @@ class GigaBlock(nn.Module):
             a = F.scaled_dot_product_attention(q, k, v, attn_mask=attention_mask).transpose(1, 2).reshape(b, n, -1)
         return a
 
-    def forward(self, x, cond, cos, sin, attention_mask=None, pack=None, n_img=None, denoising_step=None):
+    def forward(self, x, cond, cos, sin, attention_mask=None, pack=None, n_img=None, denoising_step=None, image_output_only=False):
         if self.mod_adaln:
             if n_img is None or not 0 < n_img < x.shape[1]:
                 raise ValueError(f"mod_adaln 需要 0 < n_img < seq_len, got n_img={n_img}, seq_len={x.shape[1]}")
-            return self._forward_dual(x, cond, cos, sin, attention_mask, pack, n_img, denoising_step)
+            return self._forward_dual(x, cond, cos, sin, attention_mask, pack, n_img, denoising_step, image_output_only)
         # shared AdaLN 路径 (与原实现逐行等价)
         shift_a, scale_a, gate_a, shift_f, scale_f, gate_f = self.mod(cond).chunk(6, -1)
         y = self.norm1(x) * (1 + scale_a[:, None]) + shift_a[:, None]
@@ -365,15 +374,24 @@ class GigaBlock(nn.Module):
                           torch.ones(n_total - n_img, dtype=torch.long, device=gate.device)))
         return tags.repeat(gate.shape[0])
 
-    def _forward_dual(self, x, cond, cos, sin, attention_mask, pack, n_img, denoising_step=None):
+    def _forward_dual(self, x, cond, cos, sin, attention_mask, pack, n_img, denoising_step=None, image_output_only=False):
         """dual-branch AdaLN: image 前缀用 mod_img, text 后缀用 mod_txt, 两分支梯度独立。"""
         b = x.shape[0]
         sa_i, sca_i, ga_i, sf_i, scf_i, gf_i = self.mod_img(cond).chunk(6, -1)
-        sa_t, sca_t, ga_t, sf_t, scf_t, gf_t = self.mod_txt(cond).chunk(6, -1)
+        if image_output_only:
+            sa_t, sca_t = self.mod_txt(cond, attention_input_only=True).chunk(2, -1)
+        else:
+            sa_t, sca_t, ga_t, sf_t, scf_t, gf_t = self.mod_txt(cond).chunk(6, -1)
         img, txt = x[:, :n_img], x[:, n_img:]
         y = torch.cat((self.norm1(img) * (1 + sca_i[:, None]) + sa_i[:, None],
                        self.norm1(txt) * (1 + sca_t[:, None]) + sa_t[:, None]), 1)
-        a = self.out(self._attend(y, cos, sin, attention_mask, pack))
+        attended = self._attend(y, cos, sin, attention_mask, pack)
+        if image_output_only:
+            # All keys/values have contributed. The remaining dense operations are token-wise.
+            img = img + self.out(attended[:, :n_img]) * ga_i[:, None]
+            y = self.norm2(img) * (1 + scf_i[:, None]) + sf_i[:, None]
+            return img + self.ff(y) * gf_i[:, None]
+        a = self.out(attended)
         x = torch.cat((img + a[:, :n_img] * ga_i[:, None],
                        txt + a[:, n_img:] * ga_t[:, None]), 1)
         img, txt = x[:, :n_img], x[:, n_img:]
@@ -394,7 +412,7 @@ class GigaExpTransformer(nn.Module):
                  ffn_dim=4864, heads=14, layers=24, rope_theta=10000.0,
                  rope_axes_dims=(32, 32, 32, 32), patch_size=(1, 1, 1), mod_adaln=False,
                  text_trans=False, adaln_type=None, adaln_rank=64, moe=None,
-                 activation_checkpointing=False, activation_checkpointing_ratio=1.0):
+                 activation_checkpointing=False, activation_checkpointing_ratio=1.0, final_image_only=False):
         super().__init__()
         # 激活检查点: 高分辨率桶 (720p/1024/1080p) 训练必需, 见 forward 内 use_ckpt 注释
         self.activation_checkpointing = bool(activation_checkpointing)
@@ -422,6 +440,9 @@ class GigaExpTransformer(nn.Module):
         self.adaln_type = adaln_type
         self.adaln_rank = int(adaln_rank) if adaln_type == "basis" else None
         self.mod_adaln = adaln_type in ("dual", "basis")
+        self.final_image_only = final_image_only
+        if final_image_only and (not self.mod_adaln or moe):
+            raise ValueError("final_image_only requires a dense dual/basis model")
         self.adaln_basis = (nn.Linear(dim, self.adaln_rank, bias=False)
                             if adaln_type == "basis" else None)
         # Text Refiner (MOSS-Image 风格): text_in 投影后的文本 token 先过恒等初始化的残差
@@ -628,11 +649,14 @@ class GigaExpTransformer(nn.Module):
                     and torch.is_grad_enabled() and feature_layers is None)
         from torch.utils.checkpoint import checkpoint as _ckpt
         for block_idx, block in enumerate(self.blocks):
+            options = {}
+            if self.final_image_only and features is None and block_idx == len(self.blocks) - 1:
+                options["image_output_only"] = True
             if use_ckpt and block_idx in self._ac_block_ids:
                 x = _ckpt(block, x, cond, cos, sin, attention_mask, pack, n_img,
-                          denoising_step=self._moe_denoising_step, use_reentrant=False)
+                          denoising_step=self._moe_denoising_step, use_reentrant=False, **options)
             else:
-                x = block(x, cond, cos, sin, attention_mask, pack, n_img, denoising_step=self._moe_denoising_step)
+                x = block(x, cond, cos, sin, attention_mask, pack, n_img, denoising_step=self._moe_denoising_step, **options)
             if block.last_moe_aux is not None:
                 self.moe_aux_losses.append(block.last_moe_aux)
             if features is not None and block_idx in feature_layers:

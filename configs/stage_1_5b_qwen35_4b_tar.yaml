@@ -140,6 +140,11 @@ dataset:
   # 日志出现"数据集索引加载 完成"后改回 true。
   freeze_index_signature: false
   tar_io_concurrency_per_node: 8
+  # Keep each rank on a shard-local run across multiple batches; preserve quotas.
+  # The activation boundary and order policy are saved in the data cursor.
+  tar_locality:
+    enabled: true
+    block_samples: 128
   index_cache_dir: /home/jovyan/pfs/users/zhanqian.wu/exp/giga_exp_image/stage_1_5b_qwen35_4b_tar/dataset_index_cache
   buckets:
     - 256_square
@@ -250,6 +255,7 @@ logging:
   log_every_n_steps: 5
   save_samples: true
   swanlab:
+    new_run_on_restart: true  # Keep rolled-back steps separate from earlier sessions.
     enabled: true
     api_key: Dit2ngq8iuiGfUkI88e5b
     project: giga-exp-image

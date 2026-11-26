@@ -32,7 +32,6 @@ export PYTHONPATH={TOOL}/pylibs:${{PYTHONPATH:-}}
 python3 -u crawl_highres.py --mode both \\
   --urls "$OUT/inputs/urls.txt" --sites "$OUT/inputs/sites.txt" \\
   --out "$OUT" --seconds {SECS} --pages-per-site {PAGES} \
-  --wm-model {TOOL}/wm_model.onnx \\
   --bos-prefix users/zhanqian.wu/highres_images/fleet-{TS}-s{i}
 rc=$?
 printf "%s\\n" "$rc" > "$OUT/exit_code"

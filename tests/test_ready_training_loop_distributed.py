@@ -196,7 +196,7 @@ def main():
         def tracked_lr(*args):lr_steps.append(args[2]);return actual_lr(*args)
         ns.update(next_training_batch=tracked_next,set_lr=tracked_lr,engine=engine,
             ds_optimizer=optimizer,client_optimizer=optimizer,cfg=cfg,monitor=monitor,
-            sigma_monitor=SigmaMonitor(cfg,'cpu'),
+            sigma_monitor=SigmaMonitor(cfg,'cpu'), tar_usage=None,
             device=torch.device('cpu'),dtype=torch.float32,rank=rank,step=0,max_steps=4,
             grad_accum=2,SIGMA_BUCKETS=10,samples_seen=0,pending_batch=None,
             consecutive_batch_skips=0,max_consecutive_batch_skips=4,data_stream=stream,

@@ -21,11 +21,15 @@ REQUEST_KEY = "__ready_request__"
 
 
 def sampler_signature(sampler):
+    # len() may initialize data-proportional weights; match training's ordering.
+    steps = len(sampler)
     spec = {key: getattr(sampler, key, None) for key in
         ("seed", "world_size", "batch_size", "bucket_batch_sizes", "weights",
          "randomize_order_on_start", "max_repeat_per_epoch")}
     spec["bucket_counts"] = {key: len(value) for key, value in getattr(sampler, "bucket_indices", {}).items()}
-    spec["steps_per_epoch"] = len(sampler)
+    spec["steps_per_epoch"] = steps
+    if getattr(sampler, "tar_locality_order", None) is not None:
+        spec["tar_locality_order"] = sampler.tar_locality_order
     return hashlib.sha256(json.dumps(spec, sort_keys=True).encode()).hexdigest()
 
 
@@ -275,9 +279,14 @@ class ReadyDataStream:
                 cursor.unconsume(offset)
                 states[epoch] = cursor.state_dict()
         first = min(states)
-        return {**states.pop(first), "version": 2, "stream_kind": "ready_first",
+        result = {**states.pop(first), "version": 2, "stream_kind": "ready_first",
                 "sampler_signature": self.signature, "epoch_length": len(self.sampler),
                 "future_epochs": [states[epoch] for epoch in sorted(states)]}
+        if getattr(self.sampler, "tar_locality_order", None) is not None:
+            result["tar_locality_order"] = dict(self.sampler.tar_locality_order)
+        if getattr(self, "tar_usage_reference", None) is not None:
+            result["tar_usage_reference"] = self.tar_usage_reference
+        return result
 
     def wait_ready(self, min_batches, timeout_seconds):
         """Verify decoded payloads without marking any request consumed.

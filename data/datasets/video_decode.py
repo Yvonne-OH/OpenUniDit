@@ -28,6 +28,86 @@ _STAGE_CONTEXT = None
 _STAGE_STARTED = 0.0
 _REQUEST_DEADLINE = float('inf')
 _TAR_IO_SLOT_CACHE = {}
+_TAR_FILE_READER = None
+
+
+class _TarFileReader:
+    """Bounded, process-local descriptors for immutable, published TAR shards.
+
+    A cached shard must never be replaced or modified in place. This deliberately
+    does not stat the source path on every image or issue speculative read-ahead.
+    Only the killable decoder child owns these descriptors.
+    """
+    def __init__(self, max_open_files=0, buffer_bytes=-1):
+        self.max_open_files = int(max_open_files)
+        self.buffer_bytes = int(buffer_bytes)
+        if self.max_open_files < 0 or self.buffer_bytes < -1 or self.buffer_bytes == 1:
+            raise ValueError('Invalid TAR descriptor count or read buffer size')
+        self.handles = OrderedDict()
+
+    def close(self):
+        while self.handles:
+            _, (handle, _) = self.handles.popitem(last=False)
+            handle.close()
+
+    def _discard(self, path):
+        item = self.handles.pop(path, None)
+        if item is not None:
+            item[0].close()
+
+    def read(self, path, offset, size):
+        if not isinstance(offset, int) or not isinstance(size, int) or offset < 0 or size <= 0:
+            raise MediaInvalidInputError('TAR offset must be nonnegative and size must be positive integers')
+        blob_limit = int(os.environ.get('YISU_MEDIA_MAX_FILE_BYTES', str(512 * 1024**2)))
+        if blob_limit <= 0:
+            raise ValueError('YISU_MEDIA_MAX_FILE_BYTES must be positive')
+        if size > blob_limit:
+            raise MediaCapacityError(f'TAR image payload exceeds {blob_limit} bytes')
+        handle = None
+        try:
+            item = self.handles.get(path)
+            if item is None:
+                handle = open(path, 'rb', buffering=self.buffer_bytes)
+                info = os.fstat(handle.fileno())
+                if not stat.S_ISREG(info.st_mode):
+                    raise MediaInvalidInputError('TAR source must be a regular file')
+                file_size = info.st_size
+                if self.max_open_files:
+                    self.handles[path] = (handle, file_size)
+                    while len(self.handles) > self.max_open_files:
+                        _, (old, _) = self.handles.popitem(last=False)
+                        old.close()
+            else:
+                handle, file_size = item
+                self.handles.move_to_end(path)
+            if offset > file_size or size > file_size - offset:
+                raise MediaCorruptError(f'TAR payload range exceeds shard size: offset={offset} size={size} shard={file_size}')
+            handle.seek(offset)
+            blob = handle.read(size)
+            if len(blob) != size:
+                raise MediaCorruptError(f'Short TAR read: expected={size} actual={len(blob)} offset={offset}')
+            return blob
+        except BaseException:
+            self._discard(path)
+            if handle is not None and not handle.closed:
+                handle.close()
+            raise
+        finally:
+            if not self.max_open_files and handle is not None and not handle.closed:
+                handle.close()
+
+
+def _read_tar_blob(path, offset, size):
+    global _TAR_FILE_READER
+    # Changing options or forking invalidates cached descriptors and offsets.
+    options = (os.getpid(), int(os.environ.get('YISU_TAR_MAX_OPEN_FILES', '0')),
+               int(os.environ.get('YISU_TAR_READ_BUFFER_BYTES', '-1')))
+    if _TAR_FILE_READER is None or _TAR_FILE_READER[0] != options:
+        if _TAR_FILE_READER is not None:
+            _TAR_FILE_READER[1].close()
+        _TAR_FILE_READER = (options, _TarFileReader(*options[1:]))
+    with _tar_io_lease():
+        return _TAR_FILE_READER[1].read(path, offset, size)
 
 
 def _tar_io_slot_paths(concurrency):
@@ -250,7 +330,8 @@ def _stage_call(name, function, *args, **kwargs):
 def _reap_stranded():
     for proc, directory in list(_STRANDED):
         if proc.poll() is not None:
-            shutil.rmtree(directory, ignore_errors=True)
+            if directory is not None:
+                shutil.rmtree(directory, ignore_errors=True)
             _STRANDED.remove((proc, directory))
 
 
@@ -655,10 +736,7 @@ def read_image(path, records=None, target_width=None, target_height=None):
         off_part, size_part = rest.rsplit(':', 1)
         shard_dir, off_s = off_part.rsplit('/', 1)
         off, size = int(off_s), int(size_part)
-        with _tar_io_lease():
-            with open(shard_dir + '.tar', 'rb') as handle:
-                handle.seek(off)
-                blob = handle.read(size)
+        blob = _read_tar_blob(shard_dir + '.tar', off, size)
         with _stage_call('pil_open', Image.open, io.BytesIO(blob)) as image:
             if image.width * image.height > 150_000_000:
                 raise ValueError('image exceeds pixel limit')
@@ -1026,59 +1104,108 @@ def _child_env(**overrides):
 class _PersistentDecoderClient:
     def __init__(self):
         self.proc = None
+        self._request_directory = None
 
     def _start(self):
+        _reap_stranded()
+        if len(_STRANDED) >= _MAX_STRANDED:
+            raise MediaResourceError('isolated I/O stranded process limit reached')
         self.proc = subprocess.Popen(
             [sys.executable, os.path.abspath(__file__), '--persistent'],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
             text=True, bufsize=1,
-            env=_child_env(YISU_MEDIA_LMDB_CACHE='0'),
+            env=_child_env(YISU_MEDIA_LMDB_CACHE='0', OPENBLAS_NUM_THREADS='1',
+                           OMP_NUM_THREADS='1', MKL_NUM_THREADS='1'),
         )
 
     def close(self):
-        if self.proc is not None:
-            self.proc.kill()
+        proc, self.proc = self.proc, None
+        directory, self._request_directory = self._request_directory, None
+        if proc is not None:
             try:
-                # 存储 stall 时子进程处于 D 状态, SIGKILL 排队但不生效;
-                # 无限 wait() 会阻塞到 IO 完成, 把样本预算烧穿
-                # (实测 16s select 超时后 close() 仍多阻塞 ~24s, 后续候选只剩 0.5s 必死)。
-                self.proc.wait(timeout=0.2)
-            except subprocess.TimeoutExpired:
-                pass  # 交给后续 Popen cleanup 收尸, 不阻塞当前请求
-            for stream in (self.proc.stdin, self.proc.stdout):
-                if stream is not None:
-                    stream.close()
-            self.proc = None
+                if proc.poll() is None:
+                    try:
+                        proc.kill()
+                    except ProcessLookupError:
+                        pass
+                try:
+                    # A D-state process can retain its source I/O and output
+                    # directory after SIGKILL. Keep both until its actual exit.
+                    proc.wait(timeout=0.2)
+                except subprocess.TimeoutExpired:
+                    pass
+            finally:
+                for stream in (proc.stdin, proc.stdout, proc.stderr):
+                    if stream is not None:
+                        try:
+                            stream.close()
+                        except OSError:
+                            pass
+                if proc.poll() is None and not any(item[0] is proc for item in _STRANDED):
+                    _STRANDED.append((proc, directory))
 
     def request(self, request, timeout):
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError('isolated I/O timeout must be finite and positive')
+        # A 64 MiB source metadata record can expand when JSON-encoded. Match
+        # the historical 512 MiB one-shot output ceiling unless overridden.
+        response_limit = int(os.environ.get('YISU_MEDIA_MAX_RESPONSE_BYTES', str(512 * 1024**2)))
+        if response_limit <= 0:
+            raise ValueError('YISU_MEDIA_MAX_RESPONSE_BYTES must be positive')
+        started = time.monotonic()
         if self.proc is None or self.proc.poll() is not None:
             self.close()
             self._start()
+        request = dict(request, _deadline=started + timeout)
+        self._request_directory = (os.path.dirname(request['_output_path'])
+                                   if request.get('_output_path') else None)
         try:
             self.proc.stdin.write(json.dumps(request) + '\n')
             self.proc.stdin.flush()
-            # 不用 select.select: 1024 fd 硬顶, 64 rank × 16 worker 场景下常驻通道管道
-            # fd 号超限 → ValueError: filedescriptor out of range → 通道永久失效,
-            # 全部样本退化 one-shot 拖慢 batch (2026-11-20 copy12 团灭诱因)。poll 无此限制。
+            # Readiness guarantees some bytes, not a full line. Never follow
+            # select with blocking TextIO.readline: a partial response followed
+            # by a stalled child would escape the request deadline. No other
+            # code reads this stdout stream, so os.read owns its buffering.
+            chunks, received = [], 0
             with selectors.DefaultSelector() as sel:
                 sel.register(self.proc.stdout, selectors.EVENT_READ)
-                ready = sel.select(timeout)
-            if not ready:
-                self.close()
-                raise MediaDeadlineError(f'persistent decoder timeout {timeout}s', 'TimeoutExpired')
-            line = self.proc.stdout.readline()
-            if not line:
-                self.close()
-                raise MediaExecutorBugError('persistent decoder exited without response')
+                while True:
+                    remaining = timeout - (time.monotonic() - started)
+                    if remaining <= 0 or not sel.select(remaining):
+                        self.close()
+                        raise MediaDeadlineError(f'persistent decoder timeout {timeout}s', 'TimeoutExpired')
+                    chunk = os.read(self.proc.stdout.fileno(), min(64 * 1024, response_limit - received + 1))
+                    if not chunk:
+                        self.close()
+                        raise MediaExecutorBugError('persistent decoder exited without a complete response')
+                    end = chunk.find(b'\n')
+                    piece = chunk if end < 0 else chunk[:end]
+                    received += len(piece)
+                    if received > response_limit:
+                        self.close()
+                        raise MediaCapacityError(f'persistent response exceeds {response_limit} bytes')
+                    chunks.append(piece)
+                    if end >= 0:
+                        # A new request is not sent until this response returns;
+                        # extra bytes indicate stdout pollution / lost framing.
+                        if chunk[end + 1:]:
+                            self.close()
+                            raise MediaExecutorBugError('unexpected bytes after persistent response')
+                        break
+            line = b''.join(chunks)
             response = json.loads(line)
             if not response.get('ok'):
                 category = response.get('category', 'executor_bug')
                 error_class = _ERROR_CLASSES.get(category, MediaExecutorBugError)
                 raise error_class(response.get('error', 'persistent decoder failed'), response.get('type'))
             return response['result']
-        except (BrokenPipeError, EOFError, json.JSONDecodeError) as exc:
+        except MediaError:
+            raise
+        except (OSError, EOFError, ValueError) as exc:
             self.close()
             raise MediaExecutorBugError(str(exc)) from exc
+        finally:
+            self._request_directory = None
 
 
 _PERSISTENT_CLIENT = None
@@ -1097,6 +1224,8 @@ def _persistent_decode_request(request, timeout):
 def decode_isolated(request, timeout, context):
     """Use a resident LMDB decoder for metadata; isolate native media decoding."""
     global _PERSISTENT_DISABLED_UNTIL
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError('isolated I/O timeout must be finite and positive')
     persistent_images = (os.environ.get('YISU_IMAGE_PERSISTENT_DECODER', '0') == '1'
                          and request.get('kind') in ('image', 'images'))
     if (os.environ.get('YISU_MEDIA_PERSISTENT_DECODER', '0') == '1'
@@ -1113,20 +1242,26 @@ def decode_isolated(request, timeout, context):
         # 一次性路径扣除常驻已耗时间, 并给出权威的 categorized error, 保持候选重试语义。
         cap = float(os.environ.get('YISU_IMAGE_PERSISTENT_CAP_SECONDS', '8'))
         cooldown = float(os.environ.get('YISU_IMAGE_PERSISTENT_COOLDOWN_SECONDS', '600'))
+        if not math.isfinite(cap) or cap <= 0 or not math.isfinite(cooldown) or cooldown < 0:
+            raise ValueError('persistent decoder cap must be positive and cooldown nonnegative')
         request = dict(request)
         request.pop('_trace_context', None)
         # 回传临时文件目录可配置: 集群节点 /dev/shm 实际容量远小于申请值, 256 个解码进程
         # 轮番写直接 ENOSPC (2026-11-20 copy4 实测 44 万条 Errno 28)。用 YISU_IMAGE_TMP_DIR
         # 指到磁盘目录 (如 OUTPUT_DIR/decode_tmp, PFS), 父进程 finally unlink 用完即删。
-        # ⚠️ mkstemp 返回的 fd 必须立即关闭: 之前 [1] 丢弃 fd → 每次解码泄漏 1 个 fd,
-        # worker fd 号单调上涨撞 1024 (copy12 "filedescriptor out of range" 真根因,
-        # 亦是 unlink/Popen EMFILE 静默失败 → decode_tmp 47k 残留的元凶)。
-        _tmp_fd, output = tempfile.mkstemp(prefix='yisu-img-', suffix='.npy',
-                                           dir=os.environ.get('YISU_IMAGE_TMP_DIR', '/dev/shm'))
-        os.close(_tmp_fd)
+        # A private directory can be retained together with a stranded child;
+        # unlinking a live child's output early can otherwise leak a new file.
+        directory = tempfile.mkdtemp(prefix='yisu-img-',
+                                     dir=os.environ.get('YISU_IMAGE_TMP_DIR', '/dev/shm'))
+        output = os.path.join(directory, 'pixels.npy')
         persistent_started = time.monotonic()
         try:
             _persistent_decode_request(dict(request, _output_path=output), min(timeout, cap))
+            output_limit = int(os.environ.get('YISU_MEDIA_MAX_OUTPUT_BYTES', str(512 * 1024**2)))
+            if output_limit <= 0:
+                raise ValueError('media output limit must be positive')
+            if os.path.getsize(output) > output_limit:
+                raise MediaCapacityError('persistent output exceeds size limit')
             pixels = np.load(output, allow_pickle=False)
             _PERSISTENT_DISABLED_UNTIL = 0.0  # 成功 → 立即恢复常驻通道 (存储自愈场景)
             return pixels
@@ -1144,10 +1279,8 @@ def decode_isolated(request, timeout, context):
             print(f"[image] persistent decoder fallback: {type(exc).__name__}: {exc}; "
                   f"one-shot timeout reduced to {timeout:.3f}s", flush=True)
         finally:
-            try:
-                os.unlink(output)
-            except OSError:
-                pass
+            if not any(path == directory and proc.poll() is None for proc, path in _STRANDED):
+                shutil.rmtree(directory, ignore_errors=True)
     if not math.isfinite(timeout) or timeout <= 0:
         raise ValueError('isolated I/O timeout must be finite and positive')
     import socket
@@ -1242,12 +1375,20 @@ def persistent_main():
     # 与一次性 child 同源的资源护栏, 但 RLIMIT_AS 放宽: LMDB env 按 mdb 全尺寸 mmap,
     # 虚拟地址空间不等于物理占用 (touched pages 才计数), 2GB 会立刻爆掉。
     memory_limit = int(os.environ.get('YISU_MEDIA_PERSISTENT_MEMORY_BYTES', str(64 * 1024**3)))
+    output_limit = int(os.environ.get('YISU_MEDIA_MAX_OUTPUT_BYTES', str(512 * 1024**2)))
+    file_limit = int(os.environ.get('YISU_MEDIA_MAX_FILE_BYTES', str(512 * 1024**2)))
+    if output_limit <= 0 or file_limit <= 0:
+        raise ValueError('media file and output limits must be positive')
     if memory_limit > 0:
         _, hard = resource.getrlimit(resource.RLIMIT_AS)
         limit = min(memory_limit, hard) if hard != resource.RLIM_INFINITY else memory_limit
         resource.setrlimit(resource.RLIMIT_AS, (limit, hard))
+    _, hard = resource.getrlimit(resource.RLIMIT_FSIZE)
+    limit = max(file_limit, output_limit)
+    resource.setrlimit(resource.RLIMIT_FSIZE,
+                       (min(limit, hard) if hard != resource.RLIM_INFINITY else limit, hard))
     decoder = PersistentDecoder(os.environ.get('YISU_MEDIA_LMDB_MAX_ENVS', '8'))
-    global _PERSISTENT_DECODER
+    global _PERSISTENT_DECODER, _REQUEST_DEADLINE
     _PERSISTENT_DECODER = decoder
 
     class _LruRecords(dict):
@@ -1270,6 +1411,7 @@ def persistent_main():
     for line in sys.stdin:
         try:
             request = json.loads(line)
+            _REQUEST_DEADLINE = request.pop('_deadline', float('inf'))
             kind = request.pop('kind', 'record')
             if kind == 'record':
                 result = read_record(**request)
@@ -1280,7 +1422,11 @@ def persistent_main():
                 output_path = request.pop('_output_path')
                 request['records'] = record_cache
                 pixels = read_image(**request) if kind == 'image' else read_images(**request)
+                if pixels.nbytes > output_limit:
+                    raise MediaCapacityError('persistent output exceeds size limit')
                 np.save(output_path, pixels, allow_pickle=False)
+                if os.path.getsize(output_path) > output_limit:
+                    raise MediaCapacityError('persistent output exceeds size limit')
                 print(json.dumps({'ok': True, 'result': {'output': output_path}}), flush=True)
                 continue
             else:

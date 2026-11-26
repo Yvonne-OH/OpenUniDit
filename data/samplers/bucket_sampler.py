@@ -1,6 +1,7 @@
 """Weighted bucket batch sampler for image/video datasets."""
 import math
 import random
+import hashlib
 from collections.abc import Iterator
 from torch.utils.data import Sampler
 
@@ -39,14 +40,62 @@ class BucketBatchSampler(Sampler[list[int]]):
             raise ValueError(f"max_repeat_per_epoch 必须 >= 1.0, 当前: {max_repeat_per_epoch}")
         self.max_repeat_per_epoch = max_repeat_per_epoch
         # 批内顺序读排序: 可选回调 idx -> 可比较键 (如 (数据源, shard, tar offset))。
-        # batch 是无序集合, 重排不改变采样分布/配额/游标记账, 仅让同一 shard 内
-        # 的 tar 读 offset 单调递增 (顺序流, 吃满 PFS/NFS readahead)。
+        # 保持 batch 的样本集合/配额/游标记账, 改善同 shard 内访问局部性。
+        # 它本身不会合并读请求, 也不保证后续按位置生成的随机量逐样本相同。
         self.sort_keys_fn = sort_keys_fn
+        self.tar_locality_order = None
+        self._tar_read_columns_fn = None
         self.start_batch = 0
         self.epoch = 0
         self._start_epoch = 0
         # 同比例高分桶 → 低分桶借图来源表 (向下兼容: 纯降采样, 无裁剪)
         self.donor_buckets = self._compute_donor_buckets()
+
+    def configure_tar_locality(self, policy, read_columns_fn=None) -> None:
+        """Configure a checkpointed transition; already-consumed pool prefixes stay intact.
+
+        The training loop owns migration and saves this policy in its cursor.
+        An activation boundary must be after every rank's consumed request.
+        """
+        if policy is None:
+            self.tar_locality_order = None
+            self._tar_read_columns_fn = read_columns_fn
+            return
+        if not isinstance(policy, dict):
+            raise ValueError("TAR locality policy must be a dictionary")
+        normalized = {}
+        defaults = {"version": 1, "block_samples": 128,
+                    "activation_epoch": 0, "activation_batch": 0}
+        for key, default in defaults.items():
+            value = policy.get(key, default)
+            if isinstance(value, bool) or int(value) != value:
+                raise ValueError(f"Invalid TAR locality policy {key}={value!r}")
+            normalized[key] = int(value)
+        if normalized["version"] != 1 or normalized["block_samples"] <= 0:
+            raise ValueError("Unsupported TAR locality version or nonpositive block_samples")
+        if normalized["activation_epoch"] < 0 or normalized["activation_batch"] < 0:
+            raise ValueError("TAR locality activation cursor must be nonnegative")
+        if read_columns_fn is None and self.sort_keys_fn is None:
+            raise ValueError("TAR locality requires columnar or legacy TAR read keys")
+        self.tar_locality_order = normalized
+        self._tar_read_columns_fn = read_columns_fn
+
+    def _activate_tar_locality(self, pools, offsets, rng_seed):
+        from data.samplers.tar_locality import reorder_for_tar_locality
+        for key, pool in pools.items():
+            start = offsets[key]
+            if start >= len(pool):
+                continue
+            # Do not consume the legacy RNG: bucket order and the old prefix
+            # must remain reproducible across migration and resumed iterators.
+            seed_text = f"tar-locality-v1\0{rng_seed}\0{key}".encode()
+            block_seed = int.from_bytes(hashlib.sha256(seed_text).digest()[:8], "little")
+            pool[start:] = reorder_for_tar_locality(
+                pool[start:], self.sort_keys_fn,
+                rank_batch_size=self._batch_size_for_bucket(key),
+                world_size=self.world_size,
+                block_samples=self.tar_locality_order["block_samples"],
+                seed=block_seed, read_columns_fn=self._tar_read_columns_fn)
 
     def set_epoch(self, epoch: int) -> None:
         self.epoch = max(0, int(epoch))
@@ -246,7 +295,15 @@ class BucketBatchSampler(Sampler[list[int]]):
 
         steps = self._total_steps()
         bucket_order = self._weighted_bucket_order(rng, steps)
+        policy = self.tar_locality_order
+        activation = None
+        locality_active = False
+        if policy is not None and self.epoch >= policy["activation_epoch"]:
+            activation = policy["activation_batch"] if self.epoch == policy["activation_epoch"] else 0
         for step, bucket in enumerate(bucket_order):
+            if step == activation:
+                self._activate_tar_locality(pools, offsets, rng_seed)
+                locality_active = True
             result = build_batch(bucket)
             if result is None:
                 # 自动切换: 换到剩余量 (含其高分借图来源) 仍够一个整 batch 的桶, 整批按源桶分辨率
@@ -268,16 +325,21 @@ class BucketBatchSampler(Sampler[list[int]]):
             if step < self.start_batch:
                 continue
             start = self.rank * batch_size
-            yield self._sort_batch(global_batch[start:start + batch_size])
+            local_batch = global_batch[start:start + batch_size]
+            # The locality planner already keeps each rank's shard blocks in
+            # offset order.  Re-sorting a boundary batch would fragment two
+            # otherwise continuous blocks and perform redundant key reads.
+            yield local_batch if locality_active else self._sort_batch(local_batch)
 
     def _sort_batch(self, batch: list) -> list:
         """批内按 sort_keys_fn 排序 (借图条目按其 idx 排, target 仅影响降采样不影响读盘)。"""
         if self.sort_keys_fn is None:
             return batch
-        def key(entry):
-            idx = entry[0] if isinstance(entry, tuple) else entry
-            return self.sort_keys_fn([idx])[0]
-        return sorted(batch, key=key)
+        indices = [entry[0] if isinstance(entry, tuple) else entry for entry in batch]
+        keys = self.sort_keys_fn(indices)
+        if len(keys) != len(batch):
+            raise ValueError("TAR read keys must match the batch length")
+        return [entry for _, entry in sorted(zip(keys, batch), key=lambda item: item[0])]
 
     def __len__(self) -> int:
         # 返回完整 epoch 的 batch 数 (start_batch 跳过只影响 __iter__, 不影响长度)。

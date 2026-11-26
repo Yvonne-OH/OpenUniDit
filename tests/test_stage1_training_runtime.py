@@ -374,7 +374,7 @@ def run_deepspeed_loop():
     stream = ToyStream()
     from optimizations.mhc_monitoring import TrainingMonitor
     ns.update(monitor=TrainingMonitor(cfg, device, engine.module, mhc_enabled=False),
-              engine=engine, ds_optimizer=ds_optimizer, client_optimizer=optimizer,
+              engine=engine, ds_optimizer=ds_optimizer, client_optimizer=optimizer, tar_usage=None,
               cfg=cfg, device=device, dtype=torch.bfloat16, rank=rank, step=0, max_steps=4,
               grad_accum=2, SIGMA_BUCKETS=10, samples_seen=0, pending_batch=None,
               consecutive_batch_skips=0, max_consecutive_batch_skips=4, data_stream=stream,

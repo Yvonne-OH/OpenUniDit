@@ -859,6 +859,11 @@ class _KeptRecordView:
                         self._store.stem[rows].tolist(),
                         self._store.blob_off[rows].tolist()))
 
+    def read_columns(self, indices):
+        """Compact columns for chunked locality planning; no per-row dicts."""
+        rows = self._kept_rows[np.asarray(indices, dtype=np.int64)]
+        return self._store.src[rows], self._store.stem[rows], self._store.blob_off[rows]
+
 
 class LmdbParquetDataset(ImageDatabaseDataset):
     # v3: kind 列 (t2i_caption 行) + t2i_edit_sources_t2i_mode 配置进指纹
