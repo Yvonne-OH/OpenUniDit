@@ -411,13 +411,16 @@ def set_lr(optimizer, engine_optimizer, step, training_cfg):
     """Warmup + cosine; 同时写入 wrapper 与 DeepSpeed ZeroOptimizer 的 param_groups, 按 group 的 _lr_scale 缩放."""
     import math
     base = float(training_cfg.get("learning_rate", 1e-4))
+    minimum = float(training_cfg.get("min_learning_rate", 0.0))
+    if not 0.0 <= minimum <= base:
+        raise ValueError("min_learning_rate must be between 0 and learning_rate")
     warmup = int(training_cfg.get("lr_warmup_steps", 0))
     total = int(training_cfg["total_steps"])
     if warmup > 0 and step <= warmup:
         lr = base * step / warmup
     else:
         progress = min(1.0, (step - warmup) / max(1, total - warmup))
-        lr = base * 0.5 * (1 + math.cos(math.pi * progress))
+        lr = minimum + (base - minimum) * 0.5 * (1 + math.cos(math.pi * progress))
     for group in optimizer.param_groups:
         group["lr"] = lr * float(group.get("_lr_scale", 1.0))
     for group in engine_optimizer.param_groups:
