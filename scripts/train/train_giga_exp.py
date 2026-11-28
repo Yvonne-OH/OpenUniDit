@@ -15,7 +15,7 @@ import sys
 import threading
 import time
 import uuid
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -25,7 +25,6 @@ THIRDPARTY = ROOT / "thirdparty"  # fa3 copied here (no symlink)
 if str(THIRDPARTY) not in sys.path:
     sys.path.insert(0, str(THIRDPARTY))
 
-import deepspeed
 import torch
 import torch.distributed as dist
 import swanlab
@@ -44,6 +43,8 @@ from models.wan5b_single_stream import Wan5BSingleStream
 from models.model_factory import build_diffusion_model, mhc_config
 from optimizations.mhc_monitoring import TrainingMonitor
 from optimizations.sigma_monitoring import SigmaMonitor
+from optimizations.distributed_backend import backend_name, validate_backend, FSDP2Engine, validation_context
+from optimizations.training_profiler import TrainingProfiler
 from optimizations.mhc_readout_monitoring import capture_readout_before_step, readout_update_metrics
 from models.moe import apply_dense_to_moe_migration
 import models.giga_transformer as _giga_transformer
@@ -590,11 +591,12 @@ def restore_data_cursor(engine, sampler, step, grad_accum, logger):
 
 
 def save_pure_weights(engine, output_dir, step):
+    full_state = engine.full_weights() if hasattr(engine, "full_weights") else None
     if _dist_rank() != 0:
         return
     weight_dir = output_dir / "checkpoints" / "weights"
     weight_dir.mkdir(parents=True, exist_ok=True)
-    state = {key: value.detach().cpu() for key, value in engine.module.state_dict().items()}
+    state = full_state if full_state is not None else {key: value.detach().cpu() for key, value in engine.module.state_dict().items()}
     semantic = _semantic_metadata(engine.module)
     progress_metadata = {"step": step, "samples_seen": int(getattr(engine, "giga_samples_seen", 0)),
                          "data_cursor": getattr(engine, "giga_data_cursor", None),
@@ -864,12 +866,14 @@ def load_weight_candidates(engine, directory=None, explicit_file=None):
     return None, None, None
 
 
-def load_pure_weights(engine, output_dir, checkpoint_path=None):
+def load_pure_weights(engine, output_dir, checkpoint_path=None, fallback_path=None):
     """Directory/auto resumes fall back together; an explicit weight file fails strictly."""
     source = Path(checkpoint_path).expanduser() if checkpoint_path else output_dir / "checkpoints" / "weights"
     explicit_file = source if checkpoint_path and not source.is_dir() else None
     target, state, metadata = load_weight_candidates(engine, directory=source, explicit_file=explicit_file)
     if target is None:
+        if fallback_path is not None and checkpoint_path is None:
+            return load_pure_weights(engine, output_dir, checkpoint_path=fallback_path)
         if checkpoint_path:
             raise FileNotFoundError(f"指定目录没有 step-* 权重文件: {source}")
         return 0
@@ -881,8 +885,11 @@ def load_pure_weights(engine, output_dir, checkpoint_path=None):
         logging.getLogger("giga_exp").warning("旧权重未保存 samples_seen; 样本计数从本次恢复起重新累计")
     semantic = metadata.get("giga_semantic_metadata")
     _warn_semantic_mismatch(engine.module, semantic, str(target))
-    matched, missing, unexpected = load_compatible_state_dict(engine.module, state, semantic)
-    engine.optimizer.refresh_fp32_params()
+    if hasattr(engine, "load_full_weights"):
+        matched, missing, unexpected = engine.load_full_weights(state)
+    else:
+        matched, missing, unexpected = load_compatible_state_dict(engine.module, state, semantic)
+        engine.optimizer.refresh_fp32_params()
     if _dist_rank() == 0:
         logging.getLogger("giga_exp").info("兼容恢复权重: %s, matched=%d, reinitialized=%d, ignored=%d", target, matched, missing, unexpected)
     return step
@@ -1241,7 +1248,15 @@ def main():
     # distributed.timeout_seconds 应用到 default PG (原裸调用用 torch/DS 默认 1800s,
     # yaml 里的 7200s 从未生效; 2026-11-19 数据挂起事故里 watchdog 提前到 30min 团灭)
     _pg_timeout = datetime.timedelta(seconds=int(cfg.get("distributed", {}).get("timeout_seconds", 1800)))
-    deepspeed.init_distributed(timeout=_pg_timeout)
+    validate_backend(cfg)
+    cfg.setdefault("distributed", {})
+    selected_backend = backend_name(cfg)
+    torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", 0)))
+    if selected_backend == "deepspeed":
+        import deepspeed
+        deepspeed.init_distributed(timeout=_pg_timeout)
+    else:
+        dist.init_process_group("nccl", timeout=_pg_timeout)
     rank = dist.get_rank()
     cfg["distributed"]["world_size"] = dist.get_world_size()
     print_banner(cfg, rank)
@@ -1309,20 +1324,26 @@ def main():
         if rank == 0:
             logger.info("🎓 SFT 初始化: 从 %s 加载纯权重 (step 从 0 开始)", resolved)
 
-    client_optimizer = build_optimizer(model, cfg["training"])
-    ds_config_path = Path(cfg["distributed"]["config"])
-    if not ds_config_path.is_absolute():
-        ds_config_path = ROOT / ds_config_path
-    ds_config = json.loads(ds_config_path.read_text())
-    ds_config["train_micro_batch_size_per_gpu"] = int(cfg["training"]["batch_size_per_device"])
-    ds_config["gradient_accumulation_steps"] = int(cfg["training"].get("gradient_accumulation_steps", 1))
-    ds_config["train_batch_size"] = ds_config["train_micro_batch_size_per_gpu"] * ds_config["gradient_accumulation_steps"] * dist.get_world_size()
-    with _loud_phase(rank, logger, f"⚙️ DeepSpeed 引擎初始化 (world_size={dist.get_world_size()}, ZeRO 权重分片)",
-                     hint="(静默数分钟属正常)"):
-        engine, ds_optimizer, _, _ = deepspeed.initialize(
-            model=model, model_parameters=model.parameters(), optimizer=client_optimizer,
-            config=ds_config,
-        )
+    if selected_backend == "deepspeed":
+        client_optimizer = build_optimizer(model, cfg["training"])
+        ds_config_path = Path(cfg["distributed"]["config"])
+        if not ds_config_path.is_absolute():
+            ds_config_path = ROOT / ds_config_path
+        ds_config = json.loads(ds_config_path.read_text())
+        ds_config["train_micro_batch_size_per_gpu"] = int(cfg["training"]["batch_size_per_device"])
+        ds_config["gradient_accumulation_steps"] = int(cfg["training"].get("gradient_accumulation_steps", 1))
+        ds_config["train_batch_size"] = ds_config["train_micro_batch_size_per_gpu"] * ds_config["gradient_accumulation_steps"] * dist.get_world_size()
+        with _loud_phase(rank, logger, f"⚙️ DeepSpeed 引擎初始化 (world_size={dist.get_world_size()}, ZeRO 权重分片)",
+                         hint="(静默数分钟属正常)"):
+            engine, ds_optimizer, _, _ = deepspeed.initialize(
+                model=model, model_parameters=model.parameters(), optimizer=client_optimizer,
+                config=ds_config,
+            )
+    else:
+        engine = FSDP2Engine(model, cfg, dtype)
+        client_optimizer = ds_optimizer = engine.optimizer
+        ds_config = {"gradient_clipping": engine.gradient_clipping}
+    logger.info("training backend=%s world_size=%d", selected_backend, dist.get_world_size())
     # 断点恢复策略 (2026-11-15 起默认反转):
     #   auto (默认) → 纯权重快照 (checkpoints/weights 最高 step): 秒级加载, 与保存时的
     #     world size 无关 (64 卡存的可被 48/32 卡续训), optimizer 重置 (step 保留)。
@@ -1346,6 +1367,8 @@ def main():
                 _blue_print(f"🔁 checkpoint {resume_tag} 恢复完成: 从 step={step} 继续训练")
             logger.info("🔁 已恢复完整 DeepSpeed checkpoint %s (含 optimizer), 从 step=%d 继续训练", resume_tag, step)
         except Exception as exc:
+            if selected_backend != "deepspeed":
+                raise  # Never silently reset FSDP optimizer state on failed exact resume.
             with _loud_phase(rank, logger, "🔄 完整恢复失败, 降级为纯权重恢复"):
                 step = load_pure_weights(engine, output_dir)
             if rank == 0:
@@ -1354,7 +1377,7 @@ def main():
         dist.barrier()
     elif resume_mode == "auto":
         with _loud_phase(rank, logger, "🔄 扫描并恢复纯权重快照"):
-            step = load_pure_weights(engine, output_dir)
+            step = load_pure_weights(engine, output_dir, fallback_path=cfg["training"].get("initial_resume_from"))
         if rank == 0:
             if step:
                 _blue_print(f"🔁 已恢复纯权重: 从 step={step} 继续训练 (optimizer 状态已重置)")
@@ -1499,6 +1522,8 @@ def main():
     monitor = TrainingMonitor(cfg, device, engine.module, mhc_enabled=mhc_config(cfg)["enabled"],
                               grad_clip_threshold=ds_config.get("gradient_clipping", 0.))
     sigma_monitor = SigmaMonitor(cfg, device)
+    training_profiler = TrainingProfiler(cfg, output_dir, engine.module)
+    monitor.profiler = training_profiler
     if rank == 0:
         logger.info("training monitoring enabled=%s mhc_diagnostics=%s every_n_steps=%d phase_timings=%s",
                     monitor.enabled, monitor.enabled and monitor.mhc_enabled, monitor.interval,
@@ -1622,6 +1647,8 @@ def main():
     lookahead = None  # 跨 step 预取缓存: ((batch, fetch_s, read_s), prepared_text), step 边界保持
     while step < max_steps:
         next_step = step + 1
+        if "training_profiler" in locals():
+            training_profiler.begin_update(next_step)
         monitoring_step = monitor.begin_update(next_step)
         sigma_monitor.begin_update(next_step)
         readout_payload = {}
@@ -1741,7 +1768,7 @@ def main():
             micro_bucket_sums.scatter_add_(0, bins, per_sample_loss.detach().float())
             micro_bucket_counts.scatter_add_(0, bins, torch.ones_like(per_sample_loss, dtype=torch.float32))
         if engine.global_steps != updates_before + 1:
-            raise RuntimeError("Expected exactly one DeepSpeed update per training step")
+            raise RuntimeError("Expected exactly one optimizer update per training step")
         step = next_step
         # One small collective/copy for loss, sigma and all diagnostic bins.
         # Per-bin .item() calls otherwise create a series of tiny CUDA launches
@@ -1825,26 +1852,33 @@ def main():
                     _safe_log(wandb, wandb_run, payload, step)
                 if swanlab_run:
                     _safe_log(swanlab, swanlab_run, payload, step)
-        if validation_due:
-            # 验证是独立的 20 步扩散推理: 先把训练碎片还回去, 防止验证阶段 OOM (每 5000 步一次, 代价可忽略)
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            pending_batch = next_training_batch(data_stream, device, logger, step, "validation")
-            if pending_batch is not None:
-                if rank == 0:
-                    logger.info("🔍 step=%d 每卡对 next batch 推理", step)
-                # 验证是纯前向、无集合通信, 单 rank 失败不影响其他 rank; 兜底避免 val OOM 带崩整个作业
-                try:
-                    run_next_batch_validation(engine, vae, tokenizer, text_encoder, device, dtype, pending_batch, step, rank, cfg, output_dir, logger, wandb_run, swanlab_run)
-                except Exception as exc:
-                    logger.warning("⏭️ step=%d 验证异常, 跳过本步验证 (训练继续): %s", step, repr(exc))
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-        fixed_cfg = cfg["validation"].get("fixed", {})
-        if (cfg["validation"].get("enabled", True) and fixed_cfg.get("enabled", False)
-                and step % int(fixed_cfg.get("every_n_steps", cfg["validation"].get("every_n_steps", 1000))) == 0):
-            run_fixed_validation(engine, vae, tokenizer, text_encoder, device, dtype, step, rank,
-                                 cfg, output_dir, logger, wandb_run, swanlab_run)
+        if "training_profiler" in locals():
+            training_profiler.end_update()
+        fixed_due = (cfg["validation"].get("enabled", True)
+                     and cfg["validation"].get("fixed", {}).get("enabled", False)
+                     and step % int(cfg["validation"]["fixed"].get("every_n_steps", cfg["validation"].get("every_n_steps", 1000))) == 0)
+        validation_scope = (validation_context(engine) if validation_due or fixed_due else nullcontext())
+        with validation_scope:
+            if validation_due:
+                # 验证是独立的 20 步扩散推理: 先把训练碎片还回去, 防止验证阶段 OOM (每 5000 步一次, 代价可忽略)
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                pending_batch = next_training_batch(data_stream, device, logger, step, "validation")
+                if pending_batch is not None:
+                    if rank == 0:
+                        logger.info("🔍 step=%d 每卡对 next batch 推理", step)
+                    # 验证是纯前向、无集合通信, 单 rank 失败不影响其他 rank; 兜底避免 val OOM 带崩整个作业
+                    try:
+                        run_next_batch_validation(engine, vae, tokenizer, text_encoder, device, dtype, pending_batch, step, rank, cfg, output_dir, logger, wandb_run, swanlab_run)
+                    except Exception as exc:
+                        logger.warning("⏭️ step=%d 验证异常, 跳过本步验证 (训练继续): %s", step, repr(exc))
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+            fixed_cfg = cfg["validation"].get("fixed", {})
+            if (cfg["validation"].get("enabled", True) and fixed_cfg.get("enabled", False)
+                    and step % int(fixed_cfg.get("every_n_steps", cfg["validation"].get("every_n_steps", 1000))) == 0):
+                run_fixed_validation(engine, vae, tokenizer, text_encoder, device, dtype, step, rank,
+                                     cfg, output_dir, logger, wandb_run, swanlab_run)
         if step % cfg["training"].get("checkpointing_steps", 1000) == 0 or step == max_steps:
             # 跨 step 预取可能持有一个已出队但未消费的 batch; checkpoint 游标必须把它记回去,
             # 否则恢复后该 batch 会被永久跳过 (数据整体前移一格)。
@@ -1867,6 +1901,7 @@ def main():
                 prune_state_checkpoints(checkpoint_dir, int(cfg["training"].get("state_checkpoints_keep", 2)))
             dist.barrier()
 
+    training_profiler.close()
     if tar_usage is not None:
         tar_usage.save(output_dir / "tar_usage", step, rank)
     data_stream.close()

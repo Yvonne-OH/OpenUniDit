@@ -1,0 +1,299 @@
+# Auto resume prefers this output; first launch falls back to step40000 weights. Adam state is reset.
+stage: stage_1
+output_dir: /home/jovyan/pfs/users/zhanqian.wu/exp/giga_exp_image/stage_1_5b_qwen35_9b_fsdp2_tar
+seed: 42
+distributed:
+  backend: fsdp2
+  world_size: 32
+  timeout_seconds: 14400
+  fsdp2:
+    shard_size: 4
+    reshard_after_forward: true
+    sync_each_micro: true
+    reduce_dtype: fp32
+    gradient_clipping: 1.0
+mhc:
+  enabled: false
+  n_streams: 4
+  sinkhorn_iters: 20
+  mhc_mapping_fp32: true
+  init_mode: transfer
+  routing_backend: fused
+monitoring:
+  sigma:
+    enabled: true
+    every_n_steps: 100
+    tensor_every_n_steps: 10
+  enabled: true
+  every_n_steps: 10
+  phase_timings: true
+  per_layer:
+  - 0
+  - 17
+  - 35
+  profiler:
+    enabled: false
+    wait_steps: 5
+    warmup_steps: 1
+    active_steps: 3
+    ranks: all
+    layer_hooks: true
+model:
+  activation_checkpointing: true
+  activation_checkpointing_ratio: 0.65
+  adaln_type: basis
+  adaln_rank: 64
+  text_trans:
+    enabled: true
+    layers: 2
+    heads: 30
+  in_channels: 48
+  out_channels: 48
+  text_dim: 4096
+  final_image_only: true
+  dim: 3840
+  ffn_dim: 11520
+  heads: 30
+  layers: 36
+  rope_theta: 10000.0
+  rope_axes_dims:
+  - 16
+  - 48
+  - 48
+  - 16
+  patch_size:
+  - 1
+  - 1
+  - 1
+components:
+  text_encoder:
+    type: qwen3_5
+    revision: c202236235762e1c871ad0ccb60c8ee5ba337b9a
+    pretrained_path: /home/jovyan/pfs/users/zhanqian.wu/ckpt/Qwen3.5-9B
+    tokenizer_path: /home/jovyan/pfs/users/zhanqian.wu/ckpt/Qwen3.5-9B
+    local_files_only: true
+    layer: -1
+    padding_side: right
+    enable_thinking: false
+    attn_implementation: sdpa
+    max_length: 1280
+    frozen_inference_mode: true
+    reference_gdn_cuda_graph: true
+    gdn_graph_max_entries: 8
+    gdn_graph_max_chunks: 8
+    use_chat_template: true
+  wan_vae:
+    type: AutoencoderKLWan
+    pretrained_path: /home/jovyan/pfs/users/zhanqian.wu/ckpt/Wan2.2-TI2V-5B-Diffusers
+    subfolder: vae
+    local_files_only: true
+scheduler:
+  type: flow_matching
+  num_train_timesteps: 1000
+  shift: 3.0
+  timestep_sampling: uniform
+  validation_shift: 3.0
+dataset:
+  dataset_type: tar_parquet
+  image_training_enabled: true
+  edit_training_enabled: false
+  database_path: /home/jovyan/pfs/data/public/image_data
+  image_sources:
+  - 4KLSDB
+  - Aesthetic-4K
+  - HumanCaption-10M
+  - LAION_Aesthetics_1024
+  - Poster100K
+  - anime_captions
+  - bg_photo_concepts
+  - blip3o-long-caption-wds
+  - blip3o-long-caption
+  - caption3o-xl-v4
+  - ffhq_captioned_1024
+  - fine_t2i
+  - pexels-advertisement-photography
+  - pexels_aesth_2_1024
+  - qwen-synth-characters-fused
+  - sa1b_en
+  - anyword_3m
+  - pixelprose_cc12m
+  - pixelprose_commonpool
+  - pixelprose_redcaps
+  - monet_cc12m
+  - monet_commoncatalog_cc_by
+  - monet_coyo
+  - GenPoster100K
+  - Text-Render-2M
+  - moss_synth_sa1b_10h
+  - FLUX-Reason-6M
+  - moss_synth
+  - moss_synth_eval100k
+  - h3image_synth_webcap_10h
+  - moss_synth_300k_48h
+  - moss_synth_mn
+  - aes525_575_part000
+  - aes525_575_part001
+  - aes525_575_part002
+  - aes525_575_part003
+  - aes525_575_part004
+  - aes525_575_part005
+  - aes525_575_part006
+  - aes525_575_part007
+  - aes525_575_part008
+  - aes525_575_part009
+  - aes575_part000
+  - aes575_part001
+  - aes575_part002
+  - aes575_part003
+  - aes575_part004
+  - aes575_part005
+  t2i_edit_database_path: /home/jovyan/pfs/data/public/image_data
+  t2i_edit_sources_t2i_mode:
+  - HQ-Edit
+  - GPT-UltraEdit
+  - GPT-HQEdit
+  - pico-banana-400k
+  - GPT-OmniEdit
+  - CrispEdit
+  - SEED-Data-Edit
+  contract: '[B,C,T,H,W]'
+  num_frames: 1
+  preprocess_style: cover
+  resolution: 512
+  long_edge: 512
+  max_upscale_ratio: 1.2
+  max_retries: 16
+  refresh_index_cache: false
+  freeze_index_signature: false
+  tar_io_concurrency_per_node: 8
+  tar_locality:
+    enabled: true
+    block_samples: 128
+  index_cache_dir: /home/jovyan/pfs/users/zhanqian.wu/exp/giga_exp_image/stage_1_5b_qwen35_9b_tar/dataset_index_cache
+  buckets:
+  - 256_square
+  - 256x192
+  - 192x256
+  - 512_square
+  - 512x384
+  - 384x512
+  bucket_sampling_weights:
+    256_square: 0.015
+    256x192: 0.02
+    192x256: 0.015
+    512_square: 0.4
+    512x384: 0.3
+    384x512: 0.25
+  bucket_batch_sizes:
+    256_square: 8
+    256x192: 8
+    192x256: 8
+    512_square: 8
+    512x384: 8
+    384x512: 8
+validation:
+  enabled: true
+  every_n_steps: 2000
+  per_rank: true
+  use_next_batch: true
+  num_inference_steps: 20
+  seed: 42
+  guidance_scale: 3.0
+  fixed:
+    enabled: true
+    every_n_steps: 2000
+    seed: 42
+    image_size:
+    - 512
+    - 512
+    prompts:
+    - id: portrait-01
+      category: people
+      prompt: A realistic portrait of a woman with curly brown hair wearing a red
+        coat, soft window light, natural skin texture, neutral background.
+    - id: portrait-02
+      category: people
+      prompt: A full-body photograph of a man walking along a city sidewalk, holding
+        a closed umbrella in his right hand, both hands visible, realistic anatomy.
+    - id: text-01
+      category: typography
+      prompt: A clean white poster with the exact words "HELLO WORLD" printed in large
+        black uppercase letters, centered, no other text.
+    - id: text-02
+      category: typography
+      prompt: A blue shop sign displaying the exact text "GIGA 2026" in crisp white
+        letters, straight-on view, no other text.
+    - id: count-01
+      category: counting
+      prompt: Exactly three red apples arranged in a row on a white table, all three
+        fully visible, no other fruit, studio photograph.
+    - id: count-02
+      category: counting
+      prompt: Exactly two yellow ducks swimming on a calm blue pond, both ducks fully
+        visible, no other animals.
+    - id: relation-01
+      category: spatial_relations
+      prompt: A red cube to the left of a blue sphere on a white table, both objects
+        fully visible, plain gray background.
+    - id: relation-02
+      category: spatial_relations
+      prompt: A small green cup inside a large transparent glass bowl, with a yellow
+        plate to the right of the bowl, all objects fully visible.
+training:
+  enabled: true
+  t2v_only: true
+  cfg_dropout: 0.1
+  batch_size_per_device: 4
+  cpu_cfg_dropout: true
+  prefetch_text_encoding: false
+  num_workers: 2
+  ready_data_pipeline: true
+  dataloader_prefetch_factor: 4
+  ready_min_batches: 2
+  ready_warmup_timeout_seconds: 180
+  max_epochs: 2
+  mixed_precision: bf16
+  optimizer: adamw
+  torch_compile: false
+  regional_compile: false
+  muon:
+    enabled: false
+    momentum: 0.95
+    learning_rate: 3x
+    adjust_lr_fn: match_rms_adamw
+    weight_decay: 0.0
+  adam:
+    enabled: true
+    betas:
+    - 0.9
+    - 0.95
+    epsilon: 1.0e-08
+    weight_decay: 0.005
+  learning_rate: 0.0001
+  min_learning_rate: 5.0e-05
+  weight_decay: 0.005
+  lr_scheduler: cosine
+  lr_warmup_steps: 500
+  gradient_accumulation_steps: 2
+  checkpointing_steps: 2000
+  state_checkpoints_keep: 1
+  resume_mode: auto
+  resume_optimizer: false
+  resume_lr_scheduler: true
+  initial_resume_from: /home/jovyan/pfs/users/zhanqian.wu/exp/giga_exp_image/stage_1_5b_qwen35_9b_tar/checkpoints/weights/step-00040000.safetensors
+logging:
+  report_to:
+  - console
+  - swanlab
+  log_every_n_steps: 5
+  save_samples: true
+  swanlab:
+    new_run_on_restart: true
+    enabled: true
+    project: giga-exp-image
+    name: stage_1_5b_qwen35_9b_fsdp2_tar
+  wandb:
+    enabled: false
+    project: giga-exp-image
+    name: stage_1_5b_qwen35_9b_fsdp2_tar
+    new_run_on_restart: true

@@ -61,7 +61,7 @@ training = cfg["training"]
 # The dense warm-start loader preserves uniformly shaped tensors. Check its only exception.
 # init_from is optional: once checkpoints/weights has a snapshot, it can be removed from the
 # config and resume_mode: auto takes over.
-init = training.get("init_from")
+init = training.get("init_from") or training.get("initial_resume_from")
 if init:
     init = Path(init)
     with torch.device("meta"):
@@ -71,10 +71,10 @@ if init:
             raise ValueError(f"Checkpoint tensor names differ from the target dense model: {init}")
         different = {k: weights.get_slice(k).get_shape() for k, p in expected.items()
                      if weights.get_slice(k).get_shape() != list(p.shape)}
-        if different != {"text_in.weight": [cfg["model"]["dim"], 2560]}:
+        if different not in ({}, {"text_in.weight": [cfg["model"]["dim"], 2560]}):
             raise ValueError(f"Unexpected warm-start shape changes: {different}")
-        print(f"Warm start {init.name}: inherit {len(expected)-1} tensors; initialize "
-              f"text_in.weight {list(expected['text_in.weight'].shape)}", file=sys.stderr)
+        print(f"Warm start {init.name}: inherit {len(expected)-len(different)} tensors; "
+              f"reinitialize {list(different)}", file=sys.stderr)
 
 cache = Path(cfg["dataset"]["index_cache_dir"]).resolve(strict=True)
 assert all(any(cache.glob(f"signature_{kind}_*.json")) for kind in ("tar", "t2i")), cache

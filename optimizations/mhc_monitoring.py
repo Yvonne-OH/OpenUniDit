@@ -7,7 +7,7 @@ Stage event durations are sampled GPU-stream intervals, not exclusive kernel tim
 """
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 import math
 import time
 
@@ -156,6 +156,13 @@ class TrainingMonitor:
 
     @contextmanager
     def phase(self, name):
+        profiler = getattr(self, "profiler", None)
+        with (profiler.phase(name) if profiler is not None else nullcontext()):
+            with self._phase_impl(name):
+                yield
+
+    @contextmanager
+    def _phase_impl(self, name):
         if not self.enabled or not self.should_report or not self._cuda_timing:
             yield
             return

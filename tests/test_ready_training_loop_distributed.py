@@ -21,6 +21,7 @@ import time
 from types import SimpleNamespace
 import uuid
 from contextlib import ExitStack, nullcontext
+from contextlib import nullcontext as validation_context
 from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -159,7 +160,7 @@ def namespace(rank):
            'atomic_write','save_torch_weights','save_pure_weights','_read_checkpoint_metadata',
            '_semantic_metadata','restore_data_cursor','checkpoint_distributed'}
     ns=dict(torch=torch,dist=dist,time=time,logging=logging,Path=Path,json=json,re=re,
-        os=os,uuid=uuid,hashlib=hashlib,math=math,_dist_rank=lambda:rank)
+        os=os,uuid=uuid,hashlib=hashlib,math=math,validation_context=validation_context,nullcontext=nullcontext,_dist_rank=lambda:rank)
     nodes=[node for node in TREE.body if isinstance(node,ast.FunctionDef) and node.name in names]
     exec(compile(ast.Module(body=nodes,type_ignores=[]),str(SOURCE),'exec'),ns)
     return ns

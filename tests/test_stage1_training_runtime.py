@@ -1,5 +1,6 @@
 """Regression tests for stage_1 accumulation, worker recovery and sample accounting."""
 import ast
+from contextlib import nullcontext
 import hashlib
 import json
 import logging
@@ -37,7 +38,7 @@ def identity_collate(batch):
 
 
 def helper_namespace(distributed=None):
-    namespace = dict(torch=torch, dist=distributed or SimpleNamespace(all_reduce=lambda *a, **k: None,
+    namespace = dict(nullcontext=nullcontext, validation_context=lambda engine: nullcontext(), torch=torch, dist=distributed or SimpleNamespace(all_reduce=lambda *a, **k: None,
                      ReduceOp=SimpleNamespace(MAX=None), is_available=lambda: False), time=time, logging=logging, Path=Path,
                      json=json, re=re, os=os, uuid=uuid, hashlib=hashlib, collate=identity_collate, _dist_rank=lambda: 0,
                      _semantic_metadata=lambda module: module.semantic_metadata(),
@@ -373,6 +374,8 @@ def run_deepspeed_loop():
            "scheduler": {"shift": 3}, "validation": {"enabled": False}}
     stream = ToyStream()
     from optimizations.mhc_monitoring import TrainingMonitor
+    from optimizations.sigma_monitoring import SigmaMonitor
+    ns["sigma_monitor"] = SigmaMonitor(cfg, device)
     ns.update(monitor=TrainingMonitor(cfg, device, engine.module, mhc_enabled=False),
               engine=engine, ds_optimizer=ds_optimizer, client_optimizer=optimizer, tar_usage=None,
               cfg=cfg, device=device, dtype=torch.bfloat16, rank=rank, step=0, max_steps=4,
