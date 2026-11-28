@@ -1220,6 +1220,8 @@ def print_banner(cfg, rank):
     sl = cfg["logging"].get("swanlab", {})
     if sl.get("enabled"):
         print(f"📊 SwanLab: project={sl['project']} name={sl['name']}", flush=True)
+    if cfg["training"].get("regional_compile", False):
+        print("⚡ DiT regional compile: norm/modulation, FFN, residual; guard misses use eager", flush=True)
     print("📋 Config:", flush=True)
     for key in ("model", "scheduler", "dataset", "training"):
         print(f"   [{key}] {json.dumps(cfg[key], ensure_ascii=False, default=str)}", flush=True)
@@ -1273,6 +1275,9 @@ def main():
         model.cast_router_fp32()
         if rank == 0:
             logger.info("MoE router gate 已回浮 fp32 (模型其余参数 bf16)")
+    regional_compile_requested = bool(cfg["training"].get("regional_compile", False))
+    if regional_compile_requested and cfg["training"].get("torch_compile"):
+        raise ValueError("regional_compile and whole-model torch_compile are mutually exclusive")
     if cfg["training"].get("torch_compile"):
         # nn.Module.compile 就地编译: 参数名/state_dict 结构不变, 与 DeepSpeed/优化器分组/断点恢复兼容。
         # 注意: 此处不能写 "import torch._dynamo" —— 函数内 import torch.* 会把 torch 绑定为 main 的局部变量,
@@ -1511,7 +1516,13 @@ def main():
     # 预热只为 torch.compile 预编译变体服务; compile 关闭时直接跳过 —— 大模型下 warmup
     # batch (b=2) 自身就可能 OOM, 被上方 except 吞掉后受损的 CUDA 上下文会让后续 NCCL
     # 集合通信连环失败 (2026-11-11 MoE XL 实测), 不允许这个无收益路径运行。
-    if not cfg["training"].get("torch_compile"):
+    if regional_compile_requested:
+        from optimizations.regional_compile import attach_regional_ops, warmup_regional_distributed
+        regional_ops = attach_regional_ops(engine.module)
+        # Isolated tensor-region backward: no DeepSpeed hooks, optimizer or RNG mutation.
+        # Errors are fatal; do not suppress OOM or claim successful warmup after a failure.
+        warmup_regional_distributed(engine.module, cfg, regional_ops, logger)
+    elif not cfg["training"].get("torch_compile"):
         logger.info("⏭️ torch_compile=false, 跳过 compile warmup")
     else:
         warm_b = 2
@@ -1750,6 +1761,13 @@ def main():
             skipped_batches=skipped_this_update, data_requests=data_requests,
             data_wait_seconds=data_wait_seconds, data_wait_max_seconds=data_wait_max,
             data_read_seconds=data_read_seconds, data_read_max_seconds=data_read_max)
+        regional_ops = getattr(engine.module, "_regional_ops", None)
+        if regional_ops is not None and perf_payload:
+            regional_payload = regional_ops.metrics()
+            perf_payload.update(regional_payload)
+            if rank == 0:
+                logger.info("regional_compile step=%d metrics=%s", step,
+                            json.dumps(regional_payload, sort_keys=True))
         perf_payload.update(readout_payload)
         sigma_payload = sigma_monitor.end_update(step)
         perf_payload.update(sigma_payload)

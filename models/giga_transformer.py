@@ -299,6 +299,18 @@ class GigaBlock(nn.Module):
         else:
             self.mod = nn.Linear(dim, dim * 6)
 
+    def _norm_mod(self, x, norm, scale, shift):
+        ops = getattr(self, "_regional_ops", None)
+        if ops is not None:
+            return ops.norm_mod(x, norm, scale, shift)
+        return norm(x) * (1 + scale[:, None]) + shift[:, None]
+
+    def _gated_residual(self, x, update, gate):
+        ops = getattr(self, "_regional_ops", None)
+        if ops is not None:
+            return ops.residual(x, update, gate)
+        return x + update * gate[:, None]
+
     def _attend(self, y, cos, sin, attention_mask, pack):
         """qkv -> RoPE -> attention, 返回 [b, n, dim]; shared/dual 两条路径共用。"""
         q, k, v = self.qkv(y).chunk(3, -1)
@@ -359,7 +371,8 @@ class GigaBlock(nn.Module):
         residual 是 FFN 分支的残差基线 x (仅 MoE 统计用)。"""
         if not isinstance(self.ff, MoEFFN):
             self.last_moe_aux = None
-            return self.ff(y)
+            ops = getattr(self, "_regional_ops", None)
+            return ops.ffn(y, self.ff) if ops is not None else self.ff(y)
         # valid mask: [B,1,1,S] bool → flatten; 模态 0=image / 1=text (与 moe_stats 对齐)
         f, aux = self.ff(y, valid_mask=attention_mask, modality=self._modality_tags(y.shape[1], n_img, gate),
                          denoising_step=denoising_step, residual_gate=gate, residual=residual)
@@ -383,27 +396,27 @@ class GigaBlock(nn.Module):
         else:
             sa_t, sca_t, ga_t, sf_t, scf_t, gf_t = self.mod_txt(cond).chunk(6, -1)
         img, txt = x[:, :n_img], x[:, n_img:]
-        y = torch.cat((self.norm1(img) * (1 + sca_i[:, None]) + sa_i[:, None],
-                       self.norm1(txt) * (1 + sca_t[:, None]) + sa_t[:, None]), 1)
+        y = torch.cat((self._norm_mod(img, self.norm1, sca_i, sa_i),
+                       self._norm_mod(txt, self.norm1, sca_t, sa_t)), 1)
         attended = self._attend(y, cos, sin, attention_mask, pack)
         if image_output_only:
             # All keys/values have contributed. The remaining dense operations are token-wise.
-            img = img + self.out(attended[:, :n_img]) * ga_i[:, None]
-            y = self.norm2(img) * (1 + scf_i[:, None]) + sf_i[:, None]
-            return img + self.ff(y) * gf_i[:, None]
+            img = self._gated_residual(img, self.out(attended[:, :n_img]), ga_i)
+            y = self._norm_mod(img, self.norm2, scf_i, sf_i)
+            return self._gated_residual(img, self._ff(y, None), gf_i)
         a = self.out(attended)
-        x = torch.cat((img + a[:, :n_img] * ga_i[:, None],
-                       txt + a[:, n_img:] * ga_t[:, None]), 1)
+        x = torch.cat((self._gated_residual(img, a[:, :n_img], ga_i),
+                       self._gated_residual(txt, a[:, n_img:], ga_t)), 1)
         img, txt = x[:, :n_img], x[:, n_img:]
-        y = torch.cat((self.norm2(img) * (1 + scf_i[:, None]) + sf_i[:, None],
-                       self.norm2(txt) * (1 + scf_t[:, None]) + sf_t[:, None]), 1)
+        y = torch.cat((self._norm_mod(img, self.norm2, scf_i, sf_i),
+                       self._norm_mod(txt, self.norm2, scf_t, sf_t)), 1)
         # per-token AdaLN gate 向量 (image 段 gf_i, text 段 gf_t), 供 MoE 统计/gating
         gate = torch.cat((gf_i[:, None, :].expand(b, n_img, -1),
                           gf_t[:, None, :].expand(b, x.shape[1] - n_img, -1)), 1) \
             if isinstance(self.ff, MoEFFN) else None
         f = self._ff(y, attention_mask, n_img, denoising_step, gate, residual=x)
-        return torch.cat((img + f[:, :n_img] * gf_i[:, None],
-                          txt + f[:, n_img:] * gf_t[:, None]), 1)
+        return torch.cat((self._gated_residual(img, f[:, :n_img], gf_i),
+                          self._gated_residual(txt, f[:, n_img:], gf_t)), 1)
 
 
 class GigaExpTransformer(nn.Module):

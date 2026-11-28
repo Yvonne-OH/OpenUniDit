@@ -31,7 +31,7 @@ monitoring:
 model:
   # 选择性 AC: (8,3)+0.8 激活比 (8,2)+0.5 还低 ~24%; (8,4)+0.75 已实测 OOM
   activation_checkpointing: true
-  activation_checkpointing_ratio: 0.8
+  activation_checkpointing_ratio: 0.65
   adaln_type: basis
   adaln_rank: 64
   text_trans:
@@ -245,6 +245,7 @@ training:
   mixed_precision: bf16
   optimizer: adamw
   torch_compile: false
+  regional_compile: false  # opt-in: tensor regions only; benchmark before enabling
   muon:
     enabled: false
     momentum: 0.95
